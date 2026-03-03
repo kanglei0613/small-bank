@@ -15,5 +15,5 @@ module.exports = app => {
   router.post('/accounts', controller.accounts.create);
   router.get('/accounts/:id', controller.accounts.show);
 
-  router.post('/transfers', controller.transfers.create);
+  router.post('/transfers', controller.transfers.index);
 };

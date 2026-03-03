@@ -13,8 +13,5 @@ run/
 *.un~
 typings/
 .nyc_output/
-<<<<<<< HEAD
-=======
 .env
 .env.*
->>>>>>> 884d9c3 (feat: implement small bank core with concurrent-safe transfer)

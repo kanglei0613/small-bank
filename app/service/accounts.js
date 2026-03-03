@@ -6,7 +6,7 @@ const UsersRepo = require('../repository/usersRepo');
 class AccountsService {
   constructor(ctx) {
     this.ctx = ctx;
-    this.accountsRepo = new AccountsRepo(ctx);
+    this.accountsRepo = new AccountsRepo(ctx.app);
     this.usersRepo = new UsersRepo(ctx);
   }
 
@@ -32,7 +32,7 @@ class AccountsService {
       throw err;
     }
 
-    return await this.accountsRepo.create({ userId: uid, initialBalance: bal });
+    return await this.accountsRepo.create({ initialBalance: bal });
   }
 
   async getAccountById(id) {

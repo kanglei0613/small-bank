@@ -8,9 +8,11 @@
   },
   "dependencies": {
     "egg": "^3.17.5",
-    "egg-scripts": "2"
+    "egg-scripts": "2",
+    "pg": "^8.19.0"
   },
   "devDependencies": {
+    "autocannon": "^8.0.0",
     "egg-bin": "6",
     "egg-mock": "5",
     "eslint": "8",
