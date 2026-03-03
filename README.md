@@ -137,4 +137,72 @@ Transaction + Row-Level Lock
 
 ⸻
 
+壓測結果（Benchmark）
+
+本專案使用 autocannon 進行壓力測試，測試環境為：
+	•	MacBook Air (M-series)
+	•	Node.js v20
+	•	PostgreSQL 16
+	•	單 worker（未開啟 cluster）
+
+⸻
+
+Health API（不經資料庫）
+
+測試指令：
+```bash
+autocannon -c 200 -d 15 http://127.0.0.1:7001/health
+```
+
+測試結果：
+	•	約 26,900 RPS
+	•	平均延遲：約 6.9ms
+
+說明：
+	•	此 API 不存取資料庫
+	•	可視為 Node/Egg.js 本身的極限吞吐能力
+	•	證明應用層並非主要瓶頸
+
+⸻
+
+熱點帳戶轉帳（高鎖競爭）
+
+測試情境：
+	•	所有請求集中於兩個帳戶間互轉
+
+測試結果：
+	•	約 1,800 RPS
+	•	平均延遲：約 55ms
+
+說明：
+	•	由於 row-level lock 競爭集中於相同帳戶
+	•	所有交易需序列化執行
+	•	PostgreSQL transaction 成為瓶頸
+
+⸻
+
+3️⃣ 多帳戶隨機轉帳（分散鎖競爭）
+
+測試情境：
+	•	多帳戶隨機互轉
+	•	分散 row-level lock 競爭
+
+測試結果：
+	•	約 5,200 RPS
+	•	平均延遲：約 38ms
+	•	0 error
+
+說明：
+	•	分散鎖競爭後吞吐量顯著提升
+	•	證明 bottleneck 來自 lock contention
+	•	資料庫 WAL 與 transaction commit 為主要成本
+
+⸻
+
+效能觀察
+	•	應用層最大可達 ~27k RPS
+	•	真正瓶頸在 PostgreSQL transaction + lock contention
+	•	單機單 worker 約可穩定達 5k RPS
+	•	若啟用 cluster + DB tuning，理論上可進一步提升
+
 Author: kanglei0613
