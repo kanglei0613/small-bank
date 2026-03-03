@@ -17,7 +17,6 @@
 •	POST /users 建立使用者  
 •	GET /users/:id 查詢使用者  
 
----
 
 #### 2. 帳戶（Account）  
 •	POST /accounts 建立帳戶  
@@ -25,7 +24,6 @@
 
 帳戶餘額不可直接修改，必須透過交易（transfer）改變。
 
----
 
 #### 3. 轉帳（Transfer）  
 •	POST /transfers 進行帳戶間轉帳
@@ -48,7 +46,6 @@ curl -X POST http://127.0.0.1:7001/users \
   -d '{"name":"Alice"}'
 ```
 
----
 
 #### 建立帳戶
 ```bash
@@ -57,7 +54,6 @@ curl -X POST http://127.0.0.1:7001/accounts \
   -d '{"userId":1,"initialBalance":100}'
 ```
 
----
 
 #### 轉帳
 ```bash
