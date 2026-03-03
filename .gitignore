@@ -15,3 +15,5 @@ typings/
 .nyc_output/
 .env
 .env.*
+node_modules/
+local DB dump
