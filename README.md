@@ -3,19 +3,19 @@ Small Bank (Node.js / Egg.js + PostgreSQL)
 專案說明
 
 本專案為一個簡化版銀行系統（Small Bank），使用 Node.js + Egg.js + PostgreSQL 實作，重點在：
-	- RESTful API 設計
-	- 高併發下資料一致性處理
-	- 帳戶餘額正確性保證
-	- 轉帳操作的併發安全控制
-	- Transaction + Row-level Lock 實作
+	- RESTful API 設計  
+	- 高併發下資料一致性處理  
+	- 帳戶餘額正確性保證  
+	- 轉帳操作的併發安全控制  
+	- Transaction + Row-level Lock 實作  
 
 ⸻
 
 功能實作
 
 1. 使用者（User）
-	•	POST /users 建立使用者
-	•	GET /users/:id 查詢使用者
+	•	POST /users 建立使用者  
+	•	GET /users/:id 查詢使用者  
 
 ⸻
 
