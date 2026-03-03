@@ -3,6 +3,7 @@
 ## 專案說明
 
 ### 本專案為一個簡化版銀行系統（Small Bank），使用 Node.js + Egg.js + PostgreSQL 實作，重點在：
+
 	- RESTful API 設計  
 	- 高併發下資料一致性處理  
 	- 帳戶餘額正確性保證  
