@@ -10,7 +10,7 @@ class AccountsService {
     this.usersRepo = new UsersRepo(ctx);
   }
 
-  async openAccount({ userId, initialBalance = 0 }) {
+  async openAccount({ userId, initialBalance, balance } = {}) {
     const uid = Number(userId);
     if (!Number.isInteger(uid) || uid <= 0) {
       const err = new Error('userId must be a positive integer');
@@ -18,21 +18,31 @@ class AccountsService {
       throw err;
     }
 
-    const bal = Number(initialBalance);
+    const bal = (initialBalance !== undefined)
+      ? Number(initialBalance)
+      : Number(balance ?? 0);
+
     if (!Number.isFinite(bal) || bal < 0) {
-      const err = new Error('initialBalance must be a number >= 0');
+      const err = new Error('balance must be a number >= 0');
       err.status = 400;
       throw err;
     }
 
-    const user = await this.usersRepo.getById(uid);
-    if (!user) {
-      const err = new Error('user not found');
-      err.status = 404;
-      throw err;
-    }
+    // Sharding mode:
+    // users 在 small_bank DB
+    // accounts 在 shard DB
+    // 所以先跳過 user existence check
+    // const user = await this.usersRepo.getById(uid);
+    // if (!user) {
+    //   const err = new Error('user not found');
+    //   err.status = 404;
+    //   throw err;
+    // }
 
-    return await this.accountsRepo.create({ initialBalance: bal });
+    return await this.accountsRepo.create({
+      userId: uid,
+      initialBalance: bal,
+    });
   }
 
   async getAccountById(id) {

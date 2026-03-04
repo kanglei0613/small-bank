@@ -14,18 +14,47 @@ module.exports = appInfo => {
     csrf: { enable: false },
   };
 
-  // 👇 加在這裡
+  // PostgreSQL connection pool
   config.pg = {
     host: 'localhost',
     port: 5432,
     database: 'small_bank',
-    // user: 'kanglei0613', // 如果連不上再打開
-    max: 50,
+    max: 10, // 每個 worker 最多 10 connections
   };
 
-  const userConfig = {
-    // myAppName: 'egg',
+  // Sharding: meta + shard pools
+  config.pgMeta = {
+    host: 'localhost',
+    port: 5432,
+    database: 'small_bank_meta',
+    max: 2,
   };
+
+  config.pgShards = [
+    {
+      host: 'localhost',
+      port: 5432,
+      database: 'small_bank_s0',
+      max: 4,
+    },
+    {
+      host: 'localhost',
+      port: 5432,
+      database: 'small_bank_s1',
+      max: 4,
+    },
+  ];
+
+  // 開啟 cluster workers
+  config.cluster = {
+    listen: {
+      port: 7001,
+      hostname: '127.0.0.1',
+    },
+    workers: 8,
+  };
+
+  const userConfig = {};
 
   return {
     ...config,
