@@ -9,7 +9,7 @@
 - 帳戶餘額正確性保證
 - 轉帳操作的併發安全控制
 - PostgreSQL Transaction + Row-level Lock
-- Database Sharding（水平擴展）
+- Lock Timeout Fail-Fast Strategy
 
 ---
 
@@ -18,159 +18,72 @@
 目前系統採用：
 
 - **Egg.js Cluster**
-- **PostgreSQL Sharding**
+- **PostgreSQL**
 
 ```text
-                ┌────────────────────┐
-                │     API Server     │
-                │   Egg.js Cluster   │
-                │    Multiple Workers│
-                └─────────┬──────────┘
-                          │
-                          │
-        ┌─────────────────┴─────────────────┐
-        │                                   │
-   ┌──────────────┐                   ┌──────────────┐
-   │ small_bank_s0 │                   │ small_bank_s1 │
-   │  shard DB     │                   │  shard DB     │
-   │ accounts      │                   │ accounts      │
-   │ transfers     │                   │ transfers     │
-   └──────────────┘                   └──────────────┘
-                │
-                │
-        ┌──────────────┐
-        │ small_bank_meta │
-        │ routing table   │
-        │ account_shards  │
-        └──────────────┘
+            ┌────────────────────┐
+            │     API Server     │
+            │   Egg.js Cluster   │
+            │   Multiple Workers │
+            └─────────┬──────────┘
+                      │
+                      │
+              ┌──────────────┐
+              │  PostgreSQL  │
+              │  small_bank  │
+              │              │
+              │  accounts    │
+              │  transfers   │
+              └──────────────┘
 ```
 
 ---
 
-## Database Sharding 設計
+## System Invariants
 
-系統使用 **三個 PostgreSQL Database**
-
-### small_bank_meta
-
-儲存帳戶與 shard 的 routing 資訊。
-
-Table：
+銀行系統必須滿足以下不變條件：
 
 ```text
-account_shards
+1. Balance cannot be negative
+2. Total balance invariant preserved
+3. Every successful transfer must create a transfer record
 ```
+
+說明：
+
+```text
+balance >= 0
+Σ(balance before) = Σ(balance after)
+successful transfer → transfer record
+```
+
+---
+
+## Database Schema
+
+系統包含兩個核心資料表。
+
+### accounts
 
 |欄位|型別|
 |---|---|
-|account_id|BIGINT|
-|shard_id|INT|
+|id|BIGINT|
+|user_id|BIGINT|
+|balance|BIGINT|
 |created_at|TIMESTAMP|
-
-用途：
-
-```text
-account_id -> shard_id
-```
+|updated_at|TIMESTAMP|
 
 ---
 
-### small_bank_s0
+### transfers
 
-Shard Database 0
-
-包含：
-
-```text
-accounts
-transfers
-```
-
----
-
-### small_bank_s1
-
-Shard Database 1
-
-Schema 與 `small_bank_s0` 相同。
-
----
-
-## Sharding Strategy
-
-目前使用 **Modulo-based Sharding**
-
-```text
-shard_id = account_id % shard_count
-```
-
-Example（2 shards）：
-
-```text
-account_id 1 -> shard 1
-account_id 2 -> shard 0
-account_id 3 -> shard 1
-account_id 4 -> shard 0
-```
-
----
-
-## Sharding 實作進度
-
-目前系統已完成基本 **Database Sharding routing**。
-
-Database 架構：
-
-```text
-small_bank_meta   (routing table)
-small_bank_s0     (shard)
-small_bank_s1     (shard)
-```
-
-routing table：
-
-```text
-account_shards
-```
-
-Example：
-
-```text
-account_id | shard_id
-1          | 1
-```
-
-代表：
-
-```text
-account 1 存在於 small_bank_s1
-```
-
-建立帳戶流程：
-
-```text
-create user
-      ↓
-create account
-      ↓
-計算 shard_id
-      ↓
-寫入 shard database
-      ↓
-更新 routing table
-```
-
-目前已成功驗證：
-
-- account routing
-- shard 寫入
-- routing table 建立
-
-Example：
-
-```bash
-psql -d small_bank_meta -c "SELECT * FROM account_shards;"
-```
+|欄位|型別|
+|---|---|
+|id|BIGINT|
+|from_account_id|BIGINT|
+|to_account_id|BIGINT|
+|amount|BIGINT|
+|created_at|TIMESTAMP|
 
 ---
 
@@ -199,13 +112,6 @@ GET /accounts/:id
 
 帳戶餘額不可直接修改，必須透過 **transfer** 改變。
 
-建立帳戶流程：
-
-1. 建立 account_id
-2. 計算 shard_id
-3. 寫入 shard database
-4. 更新 routing table
-
 ---
 
 ### 3. 轉帳（Transfer）
@@ -216,13 +122,89 @@ POST /transfers
 
 ---
 
-### 轉帳特性
+## Transaction 設計
 
-- 檢查餘額是否足夠
-- 使用 PostgreSQL Transaction
-- 使用 `SELECT ... FOR UPDATE` 進行 row-level locking
-- 固定順序上鎖避免 deadlock
-- 同時寫入 `transfers` 交易紀錄表
+每筆轉帳流程：
+
+```text
+BEGIN
+↓
+鎖定帳戶 row
+SELECT ... FOR UPDATE
+↓
+檢查餘額
+↓
+扣款
+↓
+加款
+↓
+寫入 transfer record
+↓
+COMMIT
+```
+
+---
+
+## Deadlock Prevention
+
+若兩筆轉帳同時執行：
+
+```text
+A：1 -> 2
+B：2 -> 1
+```
+
+若未排序，可能發生：
+
+```text
+A 鎖 1 等 2
+B 鎖 2 等 1
+```
+
+造成 **deadlock**。
+
+解決方式：
+
+```text
+先鎖較小 id
+再鎖較大 id
+```
+
+避免交叉等待。
+
+---
+
+## Lock Timeout Strategy
+
+為避免高併發下 transaction 長時間等待 row lock，  
+在 transfer transaction 中加入：
+
+```sql
+SET LOCAL lock_timeout = '200ms'
+```
+
+設計理念：
+
+```text
+Fail Fast instead of Wait Forever
+```
+
+效果：
+
+```text
+lock wait timeout → transaction cancel
+API 回傳 504 Gateway Timeout
+connection pool 不被占滿
+```
+
+API Response：
+
+```json
+{
+  "ok": false,
+  "message": "request timeout"
+}
+```
 
 ---
 
@@ -290,75 +272,18 @@ http://127.0.0.1:7001
 
 ---
 
-## 高併發設計說明
-
-### Transaction + Row-Level Lock
-
-每筆轉帳流程：
-
-1. 開啟 database transaction
-2. 依 accountId 排序後加鎖
-3. 使用 `SELECT ... FOR UPDATE` 鎖定帳戶
-4. 檢查餘額
-5. 更新餘額
-6. 寫入 transfers 紀錄
-7. Commit
-
----
-
-## 為何需要固定順序上鎖？
-
-若兩筆轉帳同時執行：
-
-```text
-A：1 -> 2
-B：2 -> 1
-```
-
-若未排序，可能發生：
-
-```text
-A 鎖 1 等 2
-B 鎖 2 等 1
-```
-
-造成 **deadlock**。
-
-透過排序：
-
-```text
-先鎖較小 id
-再鎖較大 id
-```
-
-可避免交叉等待。
-
----
-
-## 設計說明
-
-### 為何不能直接修改餘額？
-
-銀行系統中餘額不應直接透過 `UPDATE` 操作改變，而應透過交易（transaction）改變。
-
-優點：
-
-- 保證交易可追溯性
-- 避免資料被任意覆寫
-- 確保帳務一致性
-- 保證 ACID 特性
-
----
-
 ## 壓測結果（Benchmark）
 
 本專案使用 **autocannon** 進行壓力測試。
 
 測試環境：
 
-- MacBook Air (Apple Silicon)
-- Node.js v20
-- PostgreSQL 16
+```text
+MacBook Air (Apple Silicon)
+Node.js v20
+PostgreSQL 16
+Egg.js cluster: 8 workers
+```
 
 ---
 
@@ -379,85 +304,153 @@ autocannon -c 200 -d 15 http://127.0.0.1:7001/health
 
 說明：
 
-- 此 API 不存取資料庫
-- 可視為 Node.js + Egg.js 的純應用層吞吐能力
-- 證明系統瓶頸不在 Web Server
+```text
+此 API 不存取資料庫
+代表 Node.js + Egg.js 應用層的最大吞吐能力
+```
 
 ---
 
-## 熱點帳戶轉帳（高鎖競爭）
+## Hot Account Contention Test
 
-測試情境：
-
-所有請求集中於兩個帳戶互轉
+### Test Setup
 
 ```text
-1 -> 2
-2 -> 1
+8 workers cluster
+DB: PostgreSQL
+Locking: row-level locking
+
+Simulated hot account contention
+fromId = 6
+toId = 7
+amount = 1
 ```
-
-測試結果：
-
-```text
-≈ 1.4k RPS
-平均延遲 ≈ 55ms
-```
-
-說明：
-
-- row-level lock 競爭嚴重
-- transaction 必須序列化
-- PostgreSQL 成為瓶頸
 
 ---
 
-## 多帳戶隨機轉帳
-
-測試情境：
-
-多帳戶隨機轉帳，分散 lock contention。
-
-測試結果：
+### Load Test
 
 ```text
-≈ 5k RPS
-平均延遲 ≈ 38ms
-0 error
+Tool: autocannon
+
+connections = 50
+duration = 10 seconds
+endpoint = POST /transfers
 ```
-
-說明：
-
-- 鎖競爭降低
-- throughput 顯著提升
 
 ---
 
-## 效能觀察
-
-實驗結果顯示：
+### Initial Data
 
 ```text
-Node.js / Egg.js 應用層 ≈ 40k RPS
+Account 6 balance = 100000
+Account 7 balance = 0
+```
+
+---
+
+### Performance Result
+
+```text
+Req/sec (avg) ≈ 1595
+Total requests ≈ 18000
+```
+
+Latency
+
+| Metric | Value |
+|------|------|
+| Average | ~30 ms |
+| p50 | ~22 ms |
+| p99 | ~140 ms |
+| Max | ~287 ms |
+
+---
+
+### Transfer Result
+
+```text
+Successful transfers = 17595
+
+Final account 6 balance = 82405
+Final account 7 balance = 17595
+```
+
+驗證：
+
+```text
+Total balance invariant preserved
+```
+
+---
+
+## Observation
+
+在熱點帳戶競爭情境下：
+
+```text
+多個 transaction 競爭相同 account row
+```
+
+造成：
+
+```text
+transaction queue
+row-level lock contention
+```
+
+因此：
+
+```text
 PostgreSQL transaction 成為主要瓶頸
-單 DB transfer throughput ≈ 5k RPS
 ```
-
-透過 Sharding 可以提升整體吞吐量。
 
 ---
 
-## 未來優化方向
+## Future Improvements
 
 可能優化方向：
 
-- 增加 shard 數量
-- PostgreSQL tuning
-- connection pool tuning
-- WAL tuning
-- transfer table partition
-- async transfer pipeline
+### Redis
 
-目標：
+```text
+account balance read cache
+hot account protection
+rate limit
+減少 PostgreSQL 壓力
+```
+
+---
+
+### System Protection
+
+```text
+request rate limiting
+backpressure
+connection pool protection
+```
+
+---
+
+### Architecture Improvement
+
+```text
+database sharding
+分散資料量
+分散寫入壓力
+提升吞吐量
+```
+
+或
+
+```text
+Redis queue
+transfer queue
+```
+
+---
+
+## Target
 
 ```text
 10k RPS transfer workload
@@ -468,16 +461,27 @@ PostgreSQL transaction 成為主要瓶頸
 ## Concurrency Test
 
 ### Single Worker
-- 20 concurrent transfers: passed
-- 50 concurrent transfers: passed
+
+```text
+20 concurrent transfers: passed
+50 concurrent transfers: passed
+```
 
 ### 8 Workers Cluster
-- 50 concurrent transfers: passed
 
-Result:
-- balance consistency preserved
-- transfer records fully written
-- no lost update
-- no overdraft
+```text
+50 concurrent transfers: passed
+```
+
+Result
+
+```text
+balance consistency preserved
+transfer records fully written
+no lost update
+no overdraft
+```
+
+---
 
 Author: **kanglei0613**
