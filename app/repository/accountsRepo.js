@@ -120,6 +120,9 @@ class AccountsRepo {
       // 開始transaction
       await client.query('BEGIN');
 
+      // 在 transaction 內設定 lock timeout
+      await client.query("SET LOCAL lock_timeout = '200ms'");
+
       // 固定鎖順序，避免deadlock
       const a = Math.min(fromAccountId, toAccountId);
       const b = Math.max(fromAccountId, toAccountId);
@@ -192,7 +195,8 @@ class AccountsRepo {
         transferId: transferResult.rows[0].id,
       };
     } catch (err) {
-      // 發生錯誤就rollback
+      this.ctx.app.logger.error('transfer error:', err.message, err.code);
+
       try {
         await client.query('ROLLBACK');
       } catch (rollbackErr) {

@@ -14,38 +14,34 @@ module.exports = appInfo => {
     csrf: { enable: false },
   };
 
-  // PostgreSQL connection pool
+  /**
+   * PostgreSQL connection pool
+   * 單一資料庫 (不做 sharding)
+   */
   config.pg = {
     host: 'localhost',
     port: 5432,
+    user: 'kanglei0613',
+    password: '',
     database: 'small_bank',
-    max: 10, // 每個 worker 最多 10 connections
+
+    // 每個 worker 的 connection pool size
+    max: 10,
+
+    // 連線閒置多久自動釋放
+    idleTimeoutMillis: 30000,
+
+    // 取得 connection 最多等多久
+    connectionTimeoutMillis: 2000,
+
+    // query 最長執行時間 (避免 transaction 卡死)
+    statement_timeout: 5000,
   };
 
-  // Sharding: meta + shard pools
-  config.pgMeta = {
-    host: 'localhost',
-    port: 5432,
-    database: 'small_bank_meta',
-    max: 2,
-  };
-
-  config.pgShards = [
-    {
-      host: 'localhost',
-      port: 5432,
-      database: 'small_bank_s0',
-      max: 4,
-    },
-    {
-      host: 'localhost',
-      port: 5432,
-      database: 'small_bank_s1',
-      max: 4,
-    },
-  ];
-
-  // 開啟 cluster workers
+  /**
+   * Egg cluster
+   * 開 8 個 workers 提高併發能力
+   */
   config.cluster = {
     listen: {
       port: 7001,
