@@ -465,4 +465,19 @@ PostgreSQL transaction 成為主要瓶頸
 
 ---
 
+## Concurrency Test
+
+### Single Worker
+- 20 concurrent transfers: passed
+- 50 concurrent transfers: passed
+
+### 8 Workers Cluster
+- 50 concurrent transfers: passed
+
+Result:
+- balance consistency preserved
+- transfer records fully written
+- no lost update
+- no overdraft
+
 Author: **kanglei0613**
