@@ -7,7 +7,9 @@
     "declarations": true
   },
   "dependencies": {
+    "axios": "^1.13.6",
     "egg": "^3.17.5",
+    "egg-redis": "^2.6.1",
     "egg-scripts": "^2.17.0",
     "pg": "^8.19.0"
   },
@@ -29,7 +31,13 @@
     "test:local": "egg-bin test",
     "cov": "egg-bin cov",
     "lint": "eslint .",
-    "ci": "npm run lint && npm run cov"
+    "ci": "npm run lint && npm run cov",
+    "hotspot-test": "node scripts/hotspot_test.sh",
+    "hotspot-test-light": "node scripts/hotspot_test_light.sh",
+    "reset-test-data": "node scripts/reset_test_data.js",
+    "random-transfer-test": "node scripts/random_transfer_test.js",
+    "create-test-accounts-100": "node scripts/create_test_accounts_100.js",
+    "create-test-accounts-1000": "node scripts/create_test_accounts_1000.js"
   },
   "repository": {
     "type": "git",
