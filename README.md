@@ -1,8 +1,8 @@
-# Small Bank (Node.js / Egg.js + PostgreSQL)
+# Small Bank (Node.js / Egg.js + PostgreSQL + Redis)
 
 ## 專案說明
 
-本專案為一個簡化版銀行系統（Small Bank），使用 **Node.js + Egg.js + PostgreSQL** 實作，重點在：
+本專案為一個簡化版銀行系統（Small Bank），使用 **Node.js + Egg.js + PostgreSQL + Redis** 實作，重點在：
 
 - RESTful API 設計
 - 高併發下資料一致性處理
@@ -10,6 +10,9 @@
 - 轉帳操作的併發安全控制
 - PostgreSQL Transaction + Row-level Lock
 - Lock Timeout Fail-Fast Strategy
+- Async Job API
+- Redis Transfer Queue
+- Cluster-safe Queue Processing
 
 ---
 
@@ -18,24 +21,77 @@
 目前系統採用：
 
 - **Egg.js Cluster**
+- **Redis Queue**
 - **PostgreSQL**
 
 ```text
-            ┌────────────────────┐
-            │     API Server     │
-            │   Egg.js Cluster   │
-            │   Multiple Workers │
-            └─────────┬──────────┘
-                      │
-                      │
-              ┌──────────────┐
-              │  PostgreSQL  │
-              │  small_bank  │
-              │              │
-              │  accounts    │
-              │  transfers   │
-              └──────────────┘
+                 ┌────────────────────────┐
+                 │       API Server       │
+                 │     Egg.js Cluster     │
+                 │     Multiple Workers   │
+                 └───────────┬────────────┘
+                             │
+                             │
+                    ┌────────▼────────┐
+                    │   Redis Queue   │
+                    │ transfer:queue  │
+                    │  per-fromId     │
+                    └────────┬────────┘
+                             │
+                             │
+                      ┌──────▼──────┐
+                      │ PostgreSQL  │
+                      │ small_bank  │
+                      │             │
+                      │ accounts    │
+                      │ transfers   │
+                      └─────────────┘
 ```
+
+---
+
+## Transfer Processing Flow
+
+轉帳 API 採用 **Async Job API**。
+
+Client 呼叫：
+
+```text
+POST /transfers
+```
+
+Server 不直接執行 transaction，而是：
+
+```text
+建立 transfer job
+↓
+寫入 Redis Job Store
+↓
+推入 Redis Queue
+↓
+worker drain queue
+↓
+執行 PostgreSQL transaction
+↓
+更新 job status
+```
+
+Client 會先收到：
+
+```json
+{
+  "jobId": "...",
+  "status": "queued"
+}
+```
+
+之後透過：
+
+```text
+GET /transfer-jobs/:jobId
+```
+
+查詢最終結果。
 
 ---
 
@@ -87,38 +143,73 @@ successful transfer → transfer record
 
 ---
 
-## 功能實作
+## Redis Transfer Queue
 
-### 1. 使用者（User)
+為了解決 **Hot Account Contention** 問題，系統使用：
 
+```text
+per-fromId queue
 ```
-POST /users
-GET /users/:id
+
+Redis key：
+
+```text
+transfer:queue:from:{fromId}
 ```
 
-用途：
+例如：
 
-- 建立使用者
-- 查詢使用者
+```text
+transfer:queue:from:6
+```
+
+設計效果：
+
+```text
+同一 fromId transfer 會被序列化
+不同 fromId transfer 可以並行
+```
+
+避免：
+
+```text
+多筆 transfer 同時修改同一帳戶
+```
 
 ---
 
-### 2. 帳戶（Account）
+## Cluster-safe Queue Processing
 
+系統支援 **Egg.js Cluster / multi-worker**。
+
+為避免多 worker 同時處理同一 queue，使用：
+
+```text
+Redis Owner Lock
 ```
-POST /accounts
-GET /accounts/:id
+
+Owner key：
+
+```text
+transfer:queue:owner:from:{fromId}
 ```
 
-帳戶餘額不可直接修改，必須透過 **transfer** 改變。
+流程：
 
----
+```text
+worker 嘗試 SET NX owner lock
 
-### 3. 轉帳（Transfer）
-
+成功 → drain queue
+失敗 → queue 已由其他 worker 處理
 ```
-POST /transfers
+
+Owner lock TTL：
+
+```text
+10 seconds
 ```
+
+worker 在 drain 過程中會持續 refresh lock。
 
 ---
 
@@ -176,8 +267,7 @@ B 鎖 2 等 1
 
 ## Lock Timeout Strategy
 
-為避免高併發下 transaction 長時間等待 row lock，  
-在 transfer transaction 中加入：
+為避免高併發下 transaction 長時間等待 row lock：
 
 ```sql
 SET LOCAL lock_timeout = '200ms'
@@ -230,12 +320,20 @@ curl -X POST http://127.0.0.1:7001/accounts \
 
 ---
 
-### 轉帳
+### 建立轉帳
 
 ```bash
 curl -X POST http://127.0.0.1:7001/transfers \
   -H "Content-Type: application/json" \
   -d '{"fromId":1,"toId":2,"amount":30}'
+```
+
+---
+
+### 查詢 Job
+
+```bash
+curl http://127.0.0.1:7001/transfer-jobs/{jobId}
 ```
 
 ---
@@ -246,6 +344,14 @@ curl -X POST http://127.0.0.1:7001/transfers \
 
 ```bash
 npm install
+```
+
+---
+
+### 啟動 Redis
+
+```bash
+brew services start redis
 ```
 
 ---
@@ -282,6 +388,7 @@ http://127.0.0.1:7001
 MacBook Air (Apple Silicon)
 Node.js v20
 PostgreSQL 16
+Redis
 Egg.js cluster: 8 workers
 ```
 
@@ -317,10 +424,10 @@ autocannon -c 200 -d 15 http://127.0.0.1:7001/health
 
 ```text
 8 workers cluster
-DB: PostgreSQL
-Locking: row-level locking
+Redis Queue
+PostgreSQL transaction
+row-level locking
 
-Simulated hot account contention
 fromId = 6
 toId = 7
 amount = 1
@@ -352,7 +459,7 @@ Account 7 balance = 0
 ### Performance Result
 
 ```text
-Req/sec (avg) ≈ 1595
+Req/sec (avg) ≈ 1600
 Total requests ≈ 18000
 ```
 
@@ -399,10 +506,17 @@ transaction queue
 row-level lock contention
 ```
 
-因此：
+透過 Redis queue：
 
 ```text
-PostgreSQL transaction 成為主要瓶頸
+transfer 被序列化
+避免 row lock storm
+```
+
+目前系統主要瓶頸：
+
+```text
+PostgreSQL transaction throughput
 ```
 
 ---
@@ -444,8 +558,9 @@ database sharding
 或
 
 ```text
-Redis queue
-transfer queue
+Redis transfer queue
+job retry
+dead letter queue
 ```
 
 ---
