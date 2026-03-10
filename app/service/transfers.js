@@ -3,7 +3,8 @@
 const Service = require('egg').Service;
 const AccountsRepo = require('../repository/accountsRepo');
 const inflight = require('../lib/inflight');
-const transferQueueManager = require('../lib/transfer_queue_manager');
+const redisTransferQueue = require('../lib/redis_transfer_queue');
+const transferJobStore = require('../lib/transfer_job_store');
 
 class TransferService extends Service {
 
@@ -11,19 +12,20 @@ class TransferService extends Service {
   // enqueueTransfer({ fromId, toId, amount })
   //
   // 作用：
-  // - 作為 queue 的入口
-  // - 根據 fromId 產生 queue key
-  // - 同一個 fromId 的 transfer 會依序排隊
-  // - 不同 fromId 的 transfer 可以並行
+  // - Async Job API 的入口
+  // - 驗證輸入
+  // - 建立 transfer job
+  // - 寫入 job store
+  // - 丟進 Redis per-fromId queue
+  // - 嘗試啟動 queue drain
+  // - 立刻回傳 jobId
   //
-  // 流程：
-  // 1. 驗證基本輸入
-  // 2. 依 fromId 產生 queue key
-  // 3. 丟進 queue
-  // 4. queue 內再真正執行 transfer()
+  // 注意：
+  // - 這裡不直接執行 DB transaction
+  // - 真正的轉帳會在背景 drain / worker 流程中執行
   //
   async enqueueTransfer({ fromId, toId, amount }) {
-    const { logger } = this.ctx;
+    const { app, logger } = this.ctx;
 
     // 基本檢查：fromId 必須是正整數
     if (!Number.isInteger(fromId) || fromId <= 0) {
@@ -53,27 +55,72 @@ class TransferService extends Service {
       throw err;
     }
 
-    // 用 fromId 產生 queue key
-    // 例如 fromId=6 -> transfer:from:6
-    const queueKey = transferQueueManager.buildTransferFromKey(fromId);
+    // 建立 jobId
+    // 這裡先用時間戳 + 隨機字串組成簡單唯一值
+    // 如果你之後想更正式，也可以改成 uuid
+    const jobId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 
-    logger.info(
-      '[Queue] enqueue transfer: key=%s fromId=%s toId=%s amount=%s currentQueueLen=%s',
-      queueKey,
+    // 建立 job payload
+    const job = {
+      jobId,
       fromId,
       toId,
       amount,
-      transferQueueManager.getQueueLength(queueKey)
+      createdAt: Date.now(),
+    };
+
+    // 先把 job metadata 寫進 job store
+    // 初始狀態設為 queued
+    await transferJobStore.createJob(app.redis, {
+      jobId,
+      fromId,
+      toId,
+      amount,
+      status: 'queued',
+      createdAt: job.createdAt,
+      updatedAt: job.createdAt,
+      result: null,
+      error: null,
+    });
+
+    // 用 fromId 產生 Redis queue key
+    // 例如 fromId=6 -> transfer:queue:from:6
+    const queueKey = redisTransferQueue.buildQueueKey(fromId);
+
+    logger.info(
+      '[TransferJob] enqueue: jobId=%s queueKey=%s fromId=%s toId=%s amount=%s',
+      jobId,
+      queueKey,
+      fromId,
+      toId,
+      amount
     );
 
-    // 丟進 queue，等輪到這筆 job 時再執行真正 transfer
-    return await transferQueueManager.enqueue(
-      queueKey,
-      async payload => {
-        return await this.transfer(payload);
+    // 將 job push 進 Redis queue
+    await redisTransferQueue.pushJob(app.redis, fromId, job);
+
+    // 嘗試啟動這個 fromId 的 drain 流程
+    // 這裡不 await，避免 request 被 drain 卡住
+    redisTransferQueue.tryStartDrain({
+      ctx: this.ctx,
+      fromId,
+      handler: async jobItem => {
+        return await this.processTransferJob(jobItem);
       },
-      { fromId, toId, amount }
-    );
+    }).catch(err => {
+      logger.error(
+        '[TransferJob] tryStartDrain error: fromId=%s jobId=%s err=%s',
+        fromId,
+        jobId,
+        err && err.message
+      );
+    });
+
+    // Async Job API：立刻回 jobId
+    return {
+      jobId,
+      status: 'queued',
+    };
   }
 
   //
@@ -81,31 +128,18 @@ class TransferService extends Service {
   //
   // 作用：
   // - 真正執行單筆轉帳邏輯
-  // - 這裡不負責排隊，排隊由 enqueueTransfer() 處理
+  // - 這裡不負責建立 job，也不負責排隊
+  // - 它只專心做「真正的轉帳」
   //
   // 流程：
   // 1. 檢查 inflight protection
   // 2. 建立 accounts repository
   // 3. 呼叫 repository 執行 PostgreSQL transaction
   // 4. transaction 成功後，刪除轉出與轉入帳戶的 Redis cache
-  // 5. request 結束後，減少 inflight counter
+  // 5. request / worker 結束後，減少 inflight counter
   //
   async transfer({ fromId, toId, amount }) {
     const { app, logger } = this.ctx;
-
-    //
-    // 這裡保留 inflight protection
-    //
-    // 原因：
-    // - queue 解的是「同一個 fromId 的排隊問題」
-    // - inflight 解的是「正在處理中的數量上限」
-    //
-    // 在目前這版裡：
-    // - 同一 fromId 基本上會被 queue 串行
-    // - inflight 還是可當作保護機制保留
-    //
-    // 但因為已經有 queue，這層壓力通常會比之前小很多
-    //
 
     // 產生 inflight counter 的 Redis key
     // 例如 fromId=6 -> inflight:transfer:from:6
@@ -122,7 +156,7 @@ class TransferService extends Service {
         inflightCount
       );
 
-      // 因為這筆 request 沒有真的進 transaction，所以先減回去
+      // 因為這筆 request / job 沒有真的進 transaction，所以先減回去
       await app.redis.decr(inflightKey);
 
       const err = new Error('Too many concurrent transfers');
@@ -152,12 +186,69 @@ class TransferService extends Service {
   }
 
   //
+  // processTransferJob(job)
+  //
+  // 作用：
+  // - 提供給 queue drain / worker 呼叫
+  // - 負責更新 job 狀態
+  // - 執行真正的 transfer()
+  // - 將結果或錯誤回寫到 job store
+  //
+  async processTransferJob(job) {
+    const { app, logger } = this.ctx;
+    const { jobId, fromId, toId, amount } = job;
+
+    try {
+      // job 進入 processing 狀態
+      await transferJobStore.markProcessing(app.redis, jobId);
+
+      logger.info(
+        '[TransferJob] processing: jobId=%s fromId=%s toId=%s amount=%s',
+        jobId,
+        fromId,
+        toId,
+        amount
+      );
+
+      // 執行真正轉帳
+      const result = await this.transfer({ fromId, toId, amount });
+
+      // 成功後更新 job 狀態
+      await transferJobStore.markSuccess(app.redis, jobId, result);
+
+      logger.info(
+        '[TransferJob] success: jobId=%s fromId=%s toId=%s amount=%s',
+        jobId,
+        fromId,
+        toId,
+        amount
+      );
+
+      return result;
+    } catch (err) {
+      // 失敗後更新 job 狀態
+      await transferJobStore.markFailed(app.redis, jobId, err);
+
+      logger.error(
+        '[TransferJob] failed: jobId=%s fromId=%s toId=%s amount=%s err=%s',
+        jobId,
+        fromId,
+        toId,
+        amount,
+        err && err.message
+      );
+
+      throw err;
+    }
+  }
+
+  //
   // listTransfers({ accountId, limit })
   //
   // 作用：
   // - 查詢某個帳戶的交易紀錄
   //
-  // 這個功能和 queue 無關，維持原本邏輯即可
+  // 這個功能和 Async Job API queue 無關，維持原本邏輯即可
   //
   async listTransfers({ accountId, limit }) {
     const aid = Number(accountId);
@@ -177,6 +268,7 @@ class TransferService extends Service {
       throw err;
     }
 
+    // 限制最大筆數，避免一次查太多
     if (lim > 200) {
       const err = new Error('limit must be <= 200');
       err.status = 400;

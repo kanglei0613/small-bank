@@ -1,3 +1,6 @@
+// obsolete
+// 舊版 single-process queue 架構，不再用於主流程
+
 'use strict';
 
 /**

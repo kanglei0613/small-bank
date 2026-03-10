@@ -193,6 +193,10 @@ class AccountsRepo {
 
       return {
         transferId: transferResult.rows[0].id,
+        fromId: fromAccountId,
+        toId: toAccountId,
+        amount: transferAmount,
+        createdAt: transferResult.rows[0].created_at,
       };
     } catch (err) {
       this.ctx.app.logger.error('transfer error:', err.message, err.code);
