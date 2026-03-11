@@ -2,601 +2,609 @@
 
 ## 專案說明
 
-本專案為一個簡化版銀行系統（Small Bank），使用 **Node.js + Egg.js + PostgreSQL + Redis** 實作，重點在：
+本專案實作一個簡化版銀行系統（Small Bank），使用：
 
-- RESTful API 設計
-- 高併發下資料一致性處理
-- 帳戶餘額正確性保證
-- 轉帳操作的併發安全控制
-- PostgreSQL Transaction + Row-level Lock
-- Lock Timeout Fail-Fast Strategy
-- Async Job API
-- Redis Transfer Queue
-- Cluster-safe Queue Processing
+- Node.js
+- Egg.js
+- PostgreSQL
+- Redis
+
+本專案的重點在於探索 **高併發轉帳系統的設計與優化**，包含：
+
+- Transaction + Row-level Lock
+- Redis queue-based transfer architecture
+- Admission control（避免系統過載）
+- Batch queue processing
+- Queue metrics
+- Benchmark-driven performance testing
+
+系統主要功能：
+
+- 建立使用者
+- 建立帳戶
+- 查詢帳戶餘額
+- 轉帳
+- 查詢轉帳紀錄
+- 高併發壓力測試
 
 ---
 
-## 系統架構
+# 系統架構
 
-目前系統採用：
+## High Level Architecture
 
-- **Egg.js Cluster**
-- **Redis Queue**
-- **PostgreSQL**
-
-```text
-                 ┌────────────────────────┐
-                 │       API Server       │
-                 │     Egg.js Cluster     │
-                 │     Multiple Workers   │
-                 └───────────┬────────────┘
-                             │
-                             │
-                    ┌────────▼────────┐
-                    │   Redis Queue   │
-                    │ transfer:queue  │
-                    │  per-fromId     │
-                    └────────┬────────┘
-                             │
-                             │
-                      ┌──────▼──────┐
-                      │ PostgreSQL  │
-                      │ small_bank  │
-                      │             │
-                      │ accounts    │
-                      │ transfers   │
-                      └─────────────┘
+```
+Client
+   │
+   ▼
+HTTP API (Egg.js)
+   │
+   │ enqueue transfer job
+   ▼
+Redis Transfer Queue
+   │
+   ▼
+Queue Worker (Background)
+   │
+   ▼
+PostgreSQL
+(Transaction + Row-level Lock)
 ```
 
+設計目標：
+
+在高併發情境下減少 **資料庫 lock contention**，並提升系統吞吐量。
+
 ---
 
-## Transfer Processing Flow
+## Architecture Diagram
 
-轉帳 API 採用 **Async Job API**。
+```
+                +-------------+
+                |   Client    |
+                +-------------+
+                       │
+                       ▼
+              +------------------+
+              |   Egg.js API     |
+              |   (Cluster x8)   |
+              +------------------+
+                       │
+                       │ enqueue transfer job
+                       ▼
+               +----------------+
+               | Redis Transfer |
+               |     Queue      |
+               +----------------+
+                       │
+                       ▼
+               +----------------+
+               | Queue Workers  |
+               |  (Batch Drain) |
+               +----------------+
+                       │
+                       ▼
+               +----------------+
+               |  PostgreSQL    |
+               | Transactions + |
+               | Row-level Lock |
+               +----------------+
+```
 
-Client 呼叫：
+系統將流程拆成三個階段：
 
-```text
+```
+API 接收請求
+        ↓
+Redis Queue 緩衝請求
+        ↓
+Worker 執行轉帳
+        ↓
+PostgreSQL Transaction
+```
+
+這樣可以避免 API worker 在高併發時被資料庫 transaction block。
+
+---
+
+# 為什麼使用 Queue 架構
+
+如果 API 直接執行轉帳：
+
+```
+API → PostgreSQL → Transaction
+```
+
+在高併發下可能出現：
+
+- row-level lock 競爭
+- API worker 被 transaction block
+- throughput 不穩定
+- latency 上升
+
+因此改為：
+
+```
+API → Redis Queue → Worker → DB
+```
+
+角色分工如下：
+
+| 元件 | 職責 |
+|-----|-----|
+| API Worker | 接收 request，建立 transfer job |
+| Redis Queue | 暫存轉帳任務 |
+| Queue Worker | 背景執行轉帳 |
+| PostgreSQL | 保證資料一致性 |
+
+優點：
+
+- 減少 DB lock contention
+- 平滑處理高併發流量
+- 提升系統穩定度
+- 提高 sustained throughput
+
+---
+
+# Concurrency Control Strategy
+
+轉帳系統最大的挑戰是 **併發一致性（Concurrency + Consistency）**。
+
+本系統採用三層策略：
+
+---
+
+## 1️⃣ PostgreSQL Transaction + Row-level Lock
+
+每筆轉帳使用：
+
+```
+BEGIN
+SELECT ... FOR UPDATE
+UPDATE balance
+INSERT transfer record
+COMMIT
+```
+
+Row-level lock 確保：
+
+- 同一帳戶餘額不會被同時修改
+- 轉帳具有原子性
+- 資料一致性
+
+---
+
+## 2️⃣ Redis Queue Serialization
+
+Redis queue 將同一帳戶的轉帳 **序列化處理**。
+
+例如：
+
+```
+transfer:queue:from:6
+```
+
+所有 `fromId = 6` 的轉帳會排入同一 queue：
+
+```
+transfer1
+transfer2
+transfer3
+```
+
+Worker 會依序處理。
+
+好處：
+
+- 避免 DB lock 競爭
+- 減少 transaction 衝突
+- 提升 throughput
+
+---
+
+## 3️⃣ Admission Control
+
+為避免 queue 過長導致系統過載：
+
+```
+maxQueueLengthPerFromId
+```
+
+當 queue 超過 threshold：
+
+```
+API 會直接拒絕 request
+```
+
+好處：
+
+- 保護資料庫
+- 防止系統雪崩
+- 維持穩定吞吐
+
+---
+
+# Transfer Flow
+
+## Step 1：Client 發送轉帳
+
+```
 POST /transfers
 ```
 
-Server 不直接執行 transaction，而是：
-
-```text
-建立 transfer job
-↓
-寫入 Redis Job Store
-↓
-推入 Redis Queue
-↓
-worker drain queue
-↓
-執行 PostgreSQL transaction
-↓
-更新 job status
-```
-
-Client 會先收到：
+範例：
 
 ```json
 {
-  "jobId": "...",
-  "status": "queued"
+  "fromId": 6,
+  "toId": 7,
+  "amount": 1
 }
 ```
 
-之後透過：
-
-```text
-GET /transfer-jobs/:jobId
-```
-
-查詢最終結果。
-
 ---
 
-## System Invariants
+## Step 2：API 建立 Transfer Job
 
-銀行系統必須滿足以下不變條件：
+API 不直接執行轉帳，而是將 job 放入 Redis queue：
 
-```text
-1. Balance cannot be negative
-2. Total balance invariant preserved
-3. Every successful transfer must create a transfer record
 ```
-
-說明：
-
-```text
-balance >= 0
-Σ(balance before) = Σ(balance after)
-successful transfer → transfer record
-```
-
----
-
-## Database Schema
-
-系統包含兩個核心資料表。
-
-### accounts
-
-|欄位|型別|
-|---|---|
-|id|BIGINT|
-|user_id|BIGINT|
-|balance|BIGINT|
-|created_at|TIMESTAMP|
-|updated_at|TIMESTAMP|
-
----
-
-### transfers
-
-|欄位|型別|
-|---|---|
-|id|BIGINT|
-|from_account_id|BIGINT|
-|to_account_id|BIGINT|
-|amount|BIGINT|
-|created_at|TIMESTAMP|
-
----
-
-## Redis Transfer Queue
-
-為了解決 **Hot Account Contention** 問題，系統使用：
-
-```text
-per-fromId queue
-```
-
-Redis key：
-
-```text
 transfer:queue:from:{fromId}
 ```
 
 例如：
 
-```text
+```
 transfer:queue:from:6
 ```
 
-設計效果：
+---
 
-```text
-同一 fromId transfer 會被序列化
-不同 fromId transfer 可以並行
+## Step 3：Queue Worker 處理
+
+Worker 會從 queue 取出 job，並執行：
+
+```
+PostgreSQL Transaction
++
+Row-level Lock
 ```
 
-避免：
+確保：
 
-```text
-多筆 transfer 同時修改同一帳戶
-```
+- 轉帳原子性
+- 餘額一致性
+- 交易紀錄正確
 
 ---
 
-## Cluster-safe Queue Processing
+# Redis Transfer Queue
 
-系統支援 **Egg.js Cluster / multi-worker**。
+每個帳戶有自己的 queue：
 
-為避免多 worker 同時處理同一 queue，使用：
-
-```text
-Redis Owner Lock
+```
+transfer:queue:from:{accountId}
 ```
 
-Owner key：
+例如：
 
-```text
-transfer:queue:owner:from:{fromId}
+```
+transfer:queue:from:6
 ```
 
-流程：
+這樣可以避免：
 
-```text
-worker 嘗試 SET NX owner lock
-
-成功 → drain queue
-失敗 → queue 已由其他 worker 處理
-```
-
-Owner lock TTL：
-
-```text
-10 seconds
-```
-
-worker 在 drain 過程中會持續 refresh lock。
+- 多 request 競爭同一帳戶
+- hot account lock contention
 
 ---
 
-## Transaction 設計
+# Admission Control
 
-每筆轉帳流程：
+為避免 queue 無限制成長：
 
-```text
-BEGIN
-↓
-鎖定帳戶 row
-SELECT ... FOR UPDATE
-↓
-檢查餘額
-↓
-扣款
-↓
-加款
-↓
-寫入 transfer record
-↓
-COMMIT
 ```
+maxQueueLengthPerFromId
+```
+
+當 queue 超過 threshold：
+
+```
+request 會被拒絕
+```
+
+這可以：
+
+- 保護資料庫
+- 防止系統過載
+- 維持整體穩定
 
 ---
 
-## Deadlock Prevention
+# Batch Queue Processing
 
-若兩筆轉帳同時執行：
+Queue worker 會批次處理 queue：
 
-```text
-A：1 -> 2
-B：2 -> 1
+```
+batchSize = 20
 ```
 
-若未排序，可能發生：
+優點：
 
-```text
-A 鎖 1 等 2
-B 鎖 2 等 1
-```
-
-造成 **deadlock**。
-
-解決方式：
-
-```text
-先鎖較小 id
-再鎖較大 id
-```
-
-避免交叉等待。
+- 減少 Redis round-trip
+- 提升處理效率
+- 提高吞吐量
 
 ---
 
-## Lock Timeout Strategy
+# Queue Metrics
 
-為避免高併發下 transaction 長時間等待 row lock：
+系統提供 Queue Metrics API。
 
-```sql
-SET LOCAL lock_timeout = '200ms'
+---
+
+## 查詢單一 Queue
+
+```
+GET /queue/stats?fromId=6
 ```
 
-設計理念：
-
-```text
-Fail Fast instead of Wait Forever
-```
-
-效果：
-
-```text
-lock wait timeout → transaction cancel
-API 回傳 504 Gateway Timeout
-connection pool 不被占滿
-```
-
-API Response：
+範例：
 
 ```json
 {
-  "ok": false,
-  "message": "request timeout"
+  "ok": true,
+  "data": {
+    "fromId": 6,
+    "queueLength": 2
+  }
 }
 ```
 
 ---
 
-## API 使用範例
+## 查詢整體 Queue 狀態
 
-### 建立使用者
+```
+GET /queue/global-stats
+```
 
-```bash
-curl -X POST http://127.0.0.1:7001/users \
-  -H "Content-Type: application/json" \
-  -d '{"name":"Alice"}'
+範例：
+
+```json
+{
+  "ok": true,
+  "data": {
+    "totalQueues": 3,
+    "totalJobs": 8,
+    "hotAccounts": [
+      { "fromId": 6, "queueLength": 5 }
+    ]
+  }
+}
+```
+
+可以觀察：
+
+- queue 壓力
+- hot accounts
+- worker 活動
+
+---
+
+# API 使用方式
+
+## Users
+
+建立使用者
+
+```
+POST /users
+```
+
+查詢使用者
+
+```
+GET /users/:id
 ```
 
 ---
 
-### 建立帳戶
+## Accounts
 
-```bash
-curl -X POST http://127.0.0.1:7001/accounts \
-  -H "Content-Type: application/json" \
-  -d '{"userId":1,"initialBalance":100}'
+建立帳戶
+
+```
+POST /accounts
+```
+
+查詢帳戶
+
+```
+GET /accounts/:id
 ```
 
 ---
 
-### 建立轉帳
+## Transfers
 
-```bash
-curl -X POST http://127.0.0.1:7001/transfers \
-  -H "Content-Type: application/json" \
-  -d '{"fromId":1,"toId":2,"amount":30}'
+建立轉帳 job
+
+```
+POST /transfers
+```
+
+查詢轉帳紀錄
+
+```
+GET /transfers
 ```
 
 ---
 
-### 查詢 Job
+## Transfer Job
 
-```bash
-curl http://127.0.0.1:7001/transfer-jobs/{jobId}
+查詢 job 狀態
+
+```
+GET /transfer-jobs/:jobId
 ```
 
 ---
 
-## 執行方式
+# Benchmark
 
-### 安裝套件
+Benchmark scripts 位於：
 
-```bash
-npm install
+```
+scripts/
 ```
 
 ---
 
-### 啟動 Redis
+## Full Benchmark
 
-```bash
-brew services start redis
+執行完整測試：
+
+```
+./scripts/full_benchmark.sh
+```
+
+流程：
+
+1. Reset database
+2. 建立 1000 accounts
+3. 執行 random transfer benchmark
+
+---
+
+## Random Transfer Benchmark
+
+Script：
+
+```
+scripts/random_transfer_test.js
+```
+
+特性：
+
+- 隨機 fromId
+- 隨機 toId
+- 分散 workload
+- 模擬真實交易
+
+設定範例：
+
+```
+MAX_ACCOUNT_ID = 1000
+CONCURRENCY = 200
+DURATION_SECONDS = 10
+AMOUNT = 1
 ```
 
 ---
 
-### 啟動 PostgreSQL（macOS）
+# Benchmark Results
 
-```bash
-brew services start postgresql@16
+## 測試環境
+
 ```
-
----
-
-### 啟動開發模式
-
-```bash
-npm run dev
-```
-
-預設執行於：
-
-```text
-http://127.0.0.1:7001
-```
-
----
-
-## 壓測結果（Benchmark）
-
-本專案使用 **autocannon** 進行壓力測試。
-
-測試環境：
-
-```text
-MacBook Air (Apple Silicon)
-Node.js v20
-PostgreSQL 16
-Redis
-Egg.js cluster: 8 workers
-```
-
----
-
-## Health API（不經資料庫）
-
-測試指令：
-
-```bash
-autocannon -c 200 -d 15 http://127.0.0.1:7001/health
-```
-
-測試結果：
-
-```text
-≈ 39k - 46k RPS
-平均延遲 ≈ 6-8ms
-```
-
-說明：
-
-```text
-此 API 不存取資料庫
-代表 Node.js + Egg.js 應用層的最大吞吐能力
-```
-
----
-
-## Hot Account Contention Test
-
-### Test Setup
-
-```text
-8 workers cluster
-Redis Queue
-PostgreSQL transaction
-row-level locking
-
-fromId = 6
-toId = 7
-amount = 1
-```
-
----
-
-### Load Test
-
-```text
-Tool: autocannon
-
-connections = 50
-duration = 10 seconds
-endpoint = POST /transfers
-```
-
----
-
-### Initial Data
-
-```text
-Account 6 balance = 100000
-Account 7 balance = 0
-```
-
----
-
-### Performance Result
-
-```text
-Req/sec (avg) ≈ 1600
-Total requests ≈ 18000
-```
-
-Latency
-
-| Metric | Value |
-|------|------|
-| Average | ~30 ms |
-| p50 | ~22 ms |
-| p99 | ~140 ms |
-| Max | ~287 ms |
-
----
-
-### Transfer Result
-
-```text
-Successful transfers = 17595
-
-Final account 6 balance = 82405
-Final account 7 balance = 17595
-```
-
-驗證：
-
-```text
-Total balance invariant preserved
-```
-
----
-
-## Observation
-
-在熱點帳戶競爭情境下：
-
-```text
-多個 transaction 競爭相同 account row
-```
-
-造成：
-
-```text
-transaction queue
-row-level lock contention
-```
-
-透過 Redis queue：
-
-```text
-transfer 被序列化
-避免 row lock storm
-```
-
-目前系統主要瓶頸：
-
-```text
-PostgreSQL transaction throughput
-```
-
----
-
-## Future Improvements
-
-可能優化方向：
-
-### Redis
-
-```text
-account balance read cache
-hot account protection
-rate limit
-減少 PostgreSQL 壓力
-```
-
----
-
-### System Protection
-
-```text
-request rate limiting
-backpressure
-connection pool protection
-```
-
----
-
-### Architecture Improvement
-
-```text
-database sharding
-分散資料量
-分散寫入壓力
-提升吞吐量
-```
-
-或
-
-```text
+Egg.js cluster workers: 8
 Redis transfer queue
-job retry
-dead letter queue
+PostgreSQL transactions
+Batch size: 20
+Accounts: 1000
 ```
 
 ---
 
-## Target
+# Burst Throughput（短時間吞吐）
 
-```text
-10k RPS transfer workload
+測試：
+
+```
+CONCURRENCY = 200
+DURATION = 10 seconds
+```
+
+結果：
+
+```
+Total Requests: 85600
+Success Requests: 85600
+Success Rate: 100%
+
+Average Success RPS ≈ 8547
 ```
 
 ---
 
-## Concurrency Test
+# Sustained Throughput（長時間穩定吞吐）
 
-### Single Worker
+測試：
 
-```text
-20 concurrent transfers: passed
-50 concurrent transfers: passed
+```
+CONCURRENCY = 200
+DURATION = 30 seconds
 ```
 
-### 8 Workers Cluster
+結果：
 
-```text
-50 concurrent transfers: passed
+```
+Total Requests: 193800
+Success Requests: 193800
+Success Rate: 100%
+
+Average Success RPS ≈ 6459
 ```
 
-Result
-
-```text
-balance consistency preserved
-transfer records fully written
-no lost update
-no overdraft
-```
+系統可在 distributed workload 下 **穩定維持約 6k+ RPS**。
 
 ---
 
-Author: **kanglei0613**
+# 未來優化方向
+
+## Database Sharding
+
+目前所有帳戶仍在單一 PostgreSQL database。
+
+未來可透過 **database sharding**：
+
+```
+accounts_0
+accounts_1
+accounts_2
+```
+
+透過 shard routing：
+
+```
+accountId % shardCount
+```
+
+優點：
+
+- 分散 DB load
+- 降低單一 database bottleneck
+- 提升系統整體吞吐量
+
+---
+
+# 總結
+
+本專案展示如何設計一個 **高併發轉帳系統**，包含：
+
+- Redis queue-based architecture
+- PostgreSQL transaction + row-level locking
+- admission control
+- batch queue processing
+- queue metrics
+- benchmark-driven optimization
+
+目前系統可在 **distributed random workload** 下穩定達到：
+
+```
+~6k+ RPS sustained transfer throughput
+```
+
+並為未來 **database sharding 架構**打下基礎。
