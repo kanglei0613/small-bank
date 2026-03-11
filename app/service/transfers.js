@@ -17,15 +17,20 @@ class TransferService extends Service {
   // - 建立 transfer job
   // - 寫入 job store
   // - 丟進 Redis per-fromId queue
-  // - 嘗試啟動 queue drain
   // - 立刻回傳 jobId
   //
   // 注意：
   // - 這裡不直接執行 DB transaction
-  // - 真正的轉帳會在背景 drain / worker 流程中執行
+  // - 真正的轉帳會由背景 queue worker 負責 drain
   //
   async enqueueTransfer({ fromId, toId, amount }) {
     const { app, logger } = this.ctx;
+
+    // 讀取 transfer queue config
+    const transferQueueConfig = app.config.transferQueue || {
+      rejectThresholdPerFromId: 240,
+      maxQueueLengthPerFromId: 300,
+    };
 
     // 基本檢查：fromId 必須是正整數
     if (!Number.isInteger(fromId) || fromId <= 0) {
@@ -56,8 +61,6 @@ class TransferService extends Service {
     }
 
     // 建立 jobId
-    // 這裡先用時間戳 + 隨機字串組成簡單唯一值
-    // 如果你之後想更正式，也可以改成 uuid
     const jobId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 
     // 建立 job payload
@@ -69,8 +72,7 @@ class TransferService extends Service {
       createdAt: Date.now(),
     };
 
-    // 先把 job metadata 寫進 job store
-    // 初始狀態設為 queued
+    // 寫入 job store
     await transferJobStore.createJob(app.redis, {
       jobId,
       fromId,
@@ -83,8 +85,7 @@ class TransferService extends Service {
       error: null,
     });
 
-    // 用 fromId 產生 Redis queue key
-    // 例如 fromId=6 -> transfer:queue:from:6
+    // queue key
     const queueKey = redisTransferQueue.buildQueueKey(fromId);
 
     logger.info(
@@ -96,27 +97,13 @@ class TransferService extends Service {
       amount
     );
 
-    // 將 job push 進 Redis queue
-    await redisTransferQueue.pushJob(app.redis, fromId, job);
-
-    // 嘗試啟動這個 fromId 的 drain 流程
-    // 這裡不 await，避免 request 被 drain 卡住
-    redisTransferQueue.tryStartDrain({
-      ctx: this.ctx,
-      fromId,
-      handler: async jobItem => {
-        return await this.processTransferJob(jobItem);
-      },
-    }).catch(err => {
-      logger.error(
-        '[TransferJob] tryStartDrain error: fromId=%s jobId=%s err=%s',
-        fromId,
-        jobId,
-        err && err.message
-      );
+    // push job 進 Redis queue（含 admission control）
+    await redisTransferQueue.pushJob(app.redis, fromId, job, {
+      rejectThresholdPerFromId: transferQueueConfig.rejectThresholdPerFromId,
+      maxQueueLengthPerFromId: transferQueueConfig.maxQueueLengthPerFromId,
     });
 
-    // Async Job API：立刻回 jobId
+    // Async Job API 回傳
     return {
       jobId,
       status: 'queued',
@@ -126,29 +113,15 @@ class TransferService extends Service {
   //
   // transfer({ fromId, toId, amount })
   //
-  // 作用：
-  // - 真正執行單筆轉帳邏輯
-  // - 這裡不負責建立 job，也不負責排隊
-  // - 它只專心做「真正的轉帳」
-  //
-  // 流程：
-  // 1. 檢查 inflight protection
-  // 2. 建立 accounts repository
-  // 3. 呼叫 repository 執行 PostgreSQL transaction
-  // 4. transaction 成功後，刪除轉出與轉入帳戶的 Redis cache
-  // 5. request / worker 結束後，減少 inflight counter
+  // 真正執行 DB transaction
   //
   async transfer({ fromId, toId, amount }) {
     const { app, logger } = this.ctx;
 
-    // 產生 inflight counter 的 Redis key
-    // 例如 fromId=6 -> inflight:transfer:from:6
     const inflightKey = inflight.transferFromKey(fromId);
 
-    // 使用 Redis INCR 統計目前同時處理中的 transfer 數量
     const inflightCount = await app.redis.incr(inflightKey);
 
-    // 如果超過 inflight 上限，直接拒絕
     if (inflightCount > inflight.transferMaxInflight()) {
       logger.warn(
         '[Inflight] transfer blocked: fromId=%s inflight=%s',
@@ -156,7 +129,6 @@ class TransferService extends Service {
         inflightCount
       );
 
-      // 因為這筆 request / job 沒有真的進 transaction，所以先減回去
       await app.redis.decr(inflightKey);
 
       const err = new Error('Too many concurrent transfers');
@@ -164,42 +136,40 @@ class TransferService extends Service {
       throw err;
     }
 
-    // 建立 repository
     const repo = new AccountsRepo(this.ctx);
 
     try {
-      // 執行真正的 PostgreSQL transaction
+
       const result = await repo.transfer(fromId, toId, amount);
 
-      // transaction 成功後，刪除相關帳戶 cache
-      // 避免後續查詢拿到舊資料
       await Promise.all([
         this.ctx.service.accounts.invalidateAccountCache(fromId),
         this.ctx.service.accounts.invalidateAccountCache(toId),
       ]);
 
       return result;
+
     } finally {
-      // 不論成功或失敗，都要把 inflight counter 減回去
+
       await app.redis.decr(inflightKey);
+
     }
   }
 
   //
-  // processTransferJob(job)
+  // processTransferJob
   //
   // 作用：
-  // - 提供給 queue drain / worker 呼叫
-  // - 負責更新 job 狀態
-  // - 執行真正的 transfer()
-  // - 將結果或錯誤回寫到 job store
+  // - Queue worker 呼叫
+  // - 更新 job 狀態
+  // - 執行真正的 transfer
   //
   async processTransferJob(job) {
     const { app, logger } = this.ctx;
     const { jobId, fromId, toId, amount } = job;
 
     try {
-      // job 進入 processing 狀態
+
       await transferJobStore.markProcessing(app.redis, jobId);
 
       logger.info(
@@ -210,10 +180,8 @@ class TransferService extends Service {
         amount
       );
 
-      // 執行真正轉帳
       const result = await this.transfer({ fromId, toId, amount });
 
-      // 成功後更新 job 狀態
       await transferJobStore.markSuccess(app.redis, jobId, result);
 
       logger.info(
@@ -225,8 +193,9 @@ class TransferService extends Service {
       );
 
       return result;
+
     } catch (err) {
-      // 失敗後更新 job 狀態
+
       await transferJobStore.markFailed(app.redis, jobId, err);
 
       logger.error(
@@ -243,48 +212,42 @@ class TransferService extends Service {
   }
 
   //
-  // listTransfers({ accountId, limit })
+  // listTransfers
   //
-  // 作用：
-  // - 查詢某個帳戶的交易紀錄
-  //
-  // 這個功能和 Async Job API queue 無關，維持原本邏輯即可
+  // 查詢某個帳戶的交易紀錄
   //
   async listTransfers({ accountId, limit }) {
+
     const aid = Number(accountId);
     const lim = limit === undefined ? 50 : Number(limit);
 
-    // 檢查 accountId
     if (!Number.isInteger(aid) || aid <= 0) {
       const err = new Error('accountId must be a positive integer');
       err.status = 400;
       throw err;
     }
 
-    // 檢查 limit
     if (!Number.isInteger(lim) || lim <= 0) {
       const err = new Error('limit must be a positive integer');
       err.status = 400;
       throw err;
     }
 
-    // 限制最大筆數，避免一次查太多
     if (lim > 200) {
       const err = new Error('limit must be <= 200');
       err.status = 400;
       throw err;
     }
 
-    // 建立 repository
     const repo = new AccountsRepo(this.ctx);
 
-    // 查詢交易紀錄
     const items = await repo.listTransfersByAccountId(aid, lim);
 
     return {
       items,
     };
   }
+
 }
 
 module.exports = TransferService;

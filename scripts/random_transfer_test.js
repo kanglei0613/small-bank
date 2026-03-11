@@ -17,6 +17,7 @@ DURATION_SECONDS 測試秒數
 */
 
 const axios = require('axios');
+const http = require('http');
 
 const API_URL = 'http://127.0.0.1:7001/transfers';
 
@@ -24,13 +25,25 @@ const API_URL = 'http://127.0.0.1:7001/transfers';
 const MAX_ACCOUNT_ID = 1000;
 
 // 每批同時送出的 request 數量
-const CONCURRENCY = 500;
+const CONCURRENCY = 200;
 
 // 測試總時長（秒）
-const DURATION_SECONDS = 10;
+const DURATION_SECONDS = 30;
 
 // 固定轉帳金額
 const AMOUNT = 1;
+
+// HTTP keep-alive agent
+const httpAgent = new http.Agent({
+  keepAlive: true,
+  maxSockets: 1000,
+});
+
+// axios instance
+const client = axios.create({
+  httpAgent,
+  timeout: 5000,
+});
 
 // 成功與失敗計數
 let successCount = 0;
@@ -66,7 +79,7 @@ async function sendRandomTransfer() {
   const payload = buildRandomTransferPayload();
 
   try {
-    await axios.post(API_URL, payload);
+    await client.post(API_URL, payload);
     successCount += 1;
   } catch (err) {
     failCount += 1;

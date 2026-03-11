@@ -59,6 +59,30 @@ module.exports = appInfo => {
     },
   };
 
+  /**
+   * Redis transfer queue 設定
+   */
+  config.transferQueue = {
+
+    // 每個 fromId queue 的提早拒絕門檻
+    // 當 queue 長度 >= 240 時，就開始拒絕新請求
+    rejectThresholdPerFromId: 240,
+
+    // 每個 fromId queue 的最大長度（硬上限）
+    // 即使 admission control 沒先擋住，也不能超過這個值
+    maxQueueLengthPerFromId: 300,
+
+    // owner lock TTL（毫秒）
+    ownerTtlMs: 10000,
+
+    // owner heartbeat 刷新間隔（毫秒）
+    ownerRefreshIntervalMs: 3000,
+
+    // 每次 drain 從 queue 批次取出的 job 數量
+    batchSize: 20,
+
+  };
+
   const userConfig = {};
 
   return {

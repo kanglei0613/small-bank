@@ -76,4 +76,23 @@ module.exports = app => {
   // 查詢 transfer job 狀態
   // client 可透過輪詢這個 API 取得最終轉帳結果
   router.get('/transfer-jobs/:jobId', controller.transferJobs.show);
+
+
+  // =========================
+  // Queue API
+  // =========================
+  //
+  // 用於觀察 Redis transfer queue 狀態
+  // 主要用於：
+  // - Debug
+  // - 系統監控
+  // - Hot account 偵測
+  //
+
+  // 查詢某個 fromId queue 狀態
+  router.get('/queue/stats', controller.queue.stats);
+
+  // 查詢整體 queue metrics
+  router.get('/queue/global-stats', controller.queue.globalStats);
+
 };
