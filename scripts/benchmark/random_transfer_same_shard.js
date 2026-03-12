@@ -25,7 +25,7 @@ const API_URL = 'http://127.0.0.1:7001/transfers';
 const MAX_ACCOUNT_ID = 1000;
 
 // 每批同時送出的 request 數量
-const CONCURRENCY = 400;
+const CONCURRENCY = 250;
 
 // 測試總時長（秒）
 const DURATION_SECONDS = 30;

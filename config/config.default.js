@@ -85,14 +85,14 @@ module.exports = appInfo => {
   };
 
   // Egg cluster
-  // 開 8 個 workers 提高併發能力
-  config.cluster = {
+  exports.cluster = {
     listen: {
       port: 7001,
       hostname: '127.0.0.1',
     },
-    workers: 8,
   };
+
+  exports.cluster.workers = 12;
 
   exports.redis = {
     client: {

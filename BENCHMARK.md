@@ -254,15 +254,79 @@ Avg Fail RPS: 0
 - 沒有 timeout
 - same-shard routing 正常運作
 
-結論
-
-```
-same-shard 穩定吞吐量 ≈ 5.7k RPS
-```
-
 ---
 
 # Test 2
+
+測試參數
+
+```
+CONCURRENCY = 250
+DURATION_SECONDS = 30
+MAX_ACCOUNT_ID = 1000
+```
+
+測試結果
+
+```
+Total Requests: 185750
+Success Requests: 185750
+Failed Requests: 0
+
+Success Rate: 100%
+
+Avg Total RPS: 6190
+Avg Success RPS: 6190
+Avg Fail RPS: 0
+```
+
+觀察
+
+- 系統仍保持完全穩定
+- Worker 與 Redis queue 可以即時消化請求
+- 吞吐量達到目前測試最高值
+
+---
+
+# Test 3
+
+測試參數
+
+```
+CONCURRENCY = 300
+DURATION_SECONDS = 30
+MAX_ACCOUNT_ID = 1000
+```
+
+測試結果
+
+```
+Total Requests: 159900
+Success Requests: 152518
+Failed Requests: 7382
+
+Success Rate: 95.38%
+
+Avg Total RPS: 5327
+Avg Success RPS: 5081
+Avg Fail RPS: 245
+```
+
+錯誤統計
+
+```
+NETWORK_ERROR: 7382
+```
+
+觀察
+
+- Client timeout 開始出現
+- Redis queue backlog 增加
+- Worker throughput 接近上限
+
+---
+
+# Test 4
 
 測試參數
 
@@ -275,56 +339,48 @@ MAX_ACCOUNT_ID = 1000
 測試結果
 
 ```
-Total Requests: 109200
-Success Requests: 85805
-Failed Requests: 23395
-
-Success Rate: 78.58%
-
-Avg Total RPS: 3625
 Avg Success RPS: 2848
-Avg Fail RPS: 776
-```
-
-錯誤統計
-
-```
-NETWORK_ERROR: 23395
+Success Rate: 78%
 ```
 
 觀察
 
-- Client timeout 開始出現
-- Redis queue backlog 增加
-- Worker 處理能力達到瓶頸
+- 系統明顯過載
+- timeout 與 NETWORK_ERROR 大量增加
+- 有效吞吐量明顯下降
+
+---
+
+# Sweet Spot 分析
+
+Concurrency Sweep
+
+| Concurrency | Success RPS | Success Rate |
+|-------------|-------------|-------------|
+| 200 | 5742 | 100% |
+| 250 | **6190** | **100%** |
+| 300 | 5081 | 95% |
+| 400 | 2848 | 78% |
 
 結論
 
 ```
-系統飽和點約在
+系統最佳吞吐點 (Sweet Spot)
 
-CONCURRENCY ≈ 200
+CONCURRENCY ≈ 250
 ```
 
-當 concurrency 超過系統飽和點時：
+此時系統可達到：
 
 ```
-吞吐量下降
-timeout 增加
-NETWORK_ERROR 上升
+≈ 6200 transfers/sec
 ```
 
----
+且保持：
 
-# 性能總覽
-
-| 架構 | Workload | Concurrency | RPS | 成功率 |
-|----|----|----|----|----|
-| Single DB | Hotspot | 50 | ~1595 | 100% |
-| Single DB | Random (10s) | 200 | ~8547 | 100% |
-| Single DB | Random (30s) | 200 | ~6459 | 100% |
-| Sharding | Same-Shard Random | 200 | ~5742 | 100% |
-| Sharding | Same-Shard Random | 400 | ~2848 | 78% |
+```
+100% success rate
+```
 
 ---
 
@@ -333,7 +389,7 @@ NETWORK_ERROR 上升
 1️⃣ 系統在以下情況達到飽和：
 
 ```
-CONCURRENCY ≈ 200
+CONCURRENCY ≈ 250
 ```
 
 2️⃣ 當 concurrency 超過系統能力時：
@@ -362,18 +418,7 @@ row-level lock contention
 
 # 未來優化方向
 
-## 1 Worker tuning
-
-可能測試
-
-```
-workers = 12
-workers = 16
-```
-
----
-
-## 2 PostgreSQL connection pool tuning
+## 1 PostgreSQL connection pool tuning
 
 ```
 增加 pool size
@@ -382,7 +427,7 @@ workers = 16
 
 ---
 
-## 3 API worker 與 queue worker 分離
+## 2 API worker 與 queue worker 分離
 
 目標架構
 
@@ -398,19 +443,19 @@ process transfer
 
 ---
 
-## 4 進一步壓測
+## 3 進一步壓測
 
 建議測試
 
 ```
-CONCURRENCY = 250
-CONCURRENCY = 300
+CONCURRENCY = 280
+CONCURRENCY = 320
 ```
 
 目的
 
 ```
-找到系統的 saturation curve
+更精確找出系統 saturation curve
 ```
 
 ---
@@ -429,7 +474,7 @@ PostgreSQL sharding (2 shards)
 系統可穩定支撐約：
 
 ```
-≈ 5.7k transfers/sec
+≈ 6200 transfers/sec
 ```
 
 在 same-shard random workload 情境下。
