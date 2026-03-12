@@ -1,4 +1,17 @@
 #!/bin/bash
+# ========================================
+# random_transfer_single_DB.sh
+#
+# Benchmark for single database version
+#
+# Scenario:
+#   - random account transfer
+#   - single PostgreSQL database
+#
+# Purpose:
+#   - baseline throughput measurement
+#
+# ========================================
 
 echo "========================================"
 echo "Small Bank Full Benchmark"
@@ -55,7 +68,7 @@ echo ""
 echo "Step 3: Start random transfer benchmark"
 echo "----------------------------------------"
 
-node scripts/random_transfer_test.js
+node scripts/benchmark/random_transfer_single_db.js
 
 echo ""
 echo "========================================"

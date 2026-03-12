@@ -1,10 +1,25 @@
 #!/bin/bash
+# ========================================
+# hotspot_transfer_single_db.sh
+#
+# Benchmark for single database hotspot transfer
+#
+# Scenario:
+#   - fixed account pair transfer
+#   - single PostgreSQL database
+#   - extreme row lock contention
+#
+# Purpose:
+#   - baseline hotspot throughput measurement
+#
+# ========================================
 
 echo "========================================"
 echo "Small Bank Hotspot Transfer Benchmark"
 echo "========================================"
 echo ""
 echo "Test scenario:"
+echo "single DB hotspot transfer"
 echo "fromId = 6"
 echo "toId = 7"
 echo "amount = 1"

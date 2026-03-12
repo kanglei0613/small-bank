@@ -2,26 +2,47 @@
 
 const { Pool } = require('pg');
 
-// when app starts, create a PostgreSQL connection pool and attach it to app.pg
+// app 啟動時，建立 meta DB 與各 shard 的 PostgreSQL connection pool
 module.exports = app => {
-  // 單一資料庫 (不做 sharding)
-  const pool = new Pool(app.config.pg);
+  // meta DB
+  const metaPg = new Pool(app.config.pgMeta);
 
-  // 所有request共用同一個 pool
-  app.pg = pool;
+  // shard DB map
+  const shardPgMap = {};
 
-  // 在server啟動前測試DB, 預載cache, migration, 初始化
+  for (const shardId of Object.keys(app.config.pgShards)) {
+    shardPgMap[shardId] = new Pool(app.config.pgShards[shardId]);
+  }
+
+  // 所有 request 共用同一組 pool
+  app.metaPg = metaPg;
+  app.shardPgMap = shardPgMap;
+
+  // 在 server 啟動前測試 DB 連線
   app.beforeStart(async () => {
-    const client = await app.pg.connect();
+    // 測試 meta DB
+    const metaClient = await app.metaPg.connect();
     try {
-      await client.query('SELECT 1');
-      app.logger.info('[pg] PostgreSQL connected');
+      await metaClient.query('SELECT 1');
+      app.logger.info('[pg] meta DB connected');
     } finally {
-      client.release();
+      metaClient.release();
+    }
+
+    // 測試所有 shard DB
+    for (const shardId of Object.keys(app.shardPgMap)) {
+      const shardClient = await app.shardPgMap[shardId].connect();
+
+      try {
+        await shardClient.query('SELECT 1');
+        app.logger.info('[pg] shard DB connected: shardId=%s', shardId);
+      } finally {
+        shardClient.release();
+      }
     }
   });
 
-  // 當app發生error時, log error
+  // 當 app 發生 error 時，log error
   app.on('error', err => {
     app.logger.error('[app error]', err);
   });

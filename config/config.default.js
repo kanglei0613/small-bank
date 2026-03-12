@@ -14,16 +14,14 @@ module.exports = appInfo => {
     csrf: { enable: false },
   };
 
-  /**
-   * PostgreSQL connection pool
-   * 單一資料庫 (不做 sharding)
-   */
-  config.pg = {
+  // PostgreSQL sharding 設定
+  // meta DB: 存 account_shards 這類 routing 資訊
+  config.pgMeta = {
     host: 'localhost',
     port: 5432,
     user: 'kanglei0613',
     password: '',
-    database: 'small_bank',
+    database: 'small_bank_meta',
 
     // 每個 worker 的 connection pool size
     max: 10,
@@ -34,14 +32,60 @@ module.exports = appInfo => {
     // 取得 connection 最多等多久
     connectionTimeoutMillis: 2000,
 
-    // query 最長執行時間 (避免 transaction 卡死)
+    // query 最長執行時間
     statement_timeout: 5000,
   };
 
-  /**
-   * Egg cluster
-   * 開 8 個 workers 提高併發能力
-   */
+  // shard 0 DB
+  config.pgShards = {
+    0: {
+      host: 'localhost',
+      port: 5432,
+      user: 'kanglei0613',
+      password: '',
+      database: 'small_bank_s0',
+
+      // 每個 worker 的 connection pool size
+      max: 10,
+
+      // 連線閒置多久自動釋放
+      idleTimeoutMillis: 30000,
+
+      // 取得 connection 最多等多久
+      connectionTimeoutMillis: 2000,
+
+      // query 最長執行時間
+      statement_timeout: 5000,
+    },
+
+    1: {
+      host: 'localhost',
+      port: 5432,
+      user: 'kanglei0613',
+      password: '',
+      database: 'small_bank_s1',
+
+      // 每個 worker 的 connection pool size
+      max: 10,
+
+      // 連線閒置多久自動釋放
+      idleTimeoutMillis: 30000,
+
+      // 取得 connection 最多等多久
+      connectionTimeoutMillis: 2000,
+
+      // query 最長執行時間
+      statement_timeout: 5000,
+    },
+  };
+
+  // shard 總數
+  config.sharding = {
+    shardCount: 2,
+  };
+
+  // Egg cluster
+  // 開 8 個 workers 提高併發能力
   config.cluster = {
     listen: {
       port: 7001,
@@ -59,9 +103,7 @@ module.exports = appInfo => {
     },
   };
 
-  /**
-   * Redis transfer queue 設定
-   */
+  // Redis transfer queue 設定
   config.transferQueue = {
 
     // 每個 fromId queue 的提早拒絕門檻
