@@ -8,7 +8,7 @@ const DURATION_SECONDS = Number(process.env.DURATION_SECONDS || 10);
 const MAX_ACCOUNT_ID = Number(process.env.MAX_ACCOUNT_ID || 1000);
 const AMOUNT = Number(process.env.AMOUNT || 1);
 
-const JOB_POLL_INTERVAL_MS = Number(process.env.JOB_POLL_INTERVAL_MS || 50);
+const JOB_POLL_INTERVAL_MS = Number(process.env.JOB_POLL_INTERVAL_MS || 200);
 const JOB_POLL_TIMEOUT_MS = Number(process.env.JOB_POLL_TIMEOUT_MS || 10000);
 
 function sleep(ms) {
