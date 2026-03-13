@@ -16,6 +16,7 @@ MAX_ACCOUNT_ID      可用帳戶上限
 CONCURRENCY         同時執行的 worker 數
 DURATION_SECONDS    測試秒數
 AMOUNT              固定轉帳金額
+SHARD_COUNT         shard 數量
 JOB_POLL_INTERVAL_MS  job 輪詢間隔
 JOB_POLL_TIMEOUT_MS   job 輪詢 timeout
 */
@@ -30,6 +31,8 @@ const MAX_ACCOUNT_ID = Number(process.env.MAX_ACCOUNT_ID || 1000);
 const CONCURRENCY = Number(process.env.CONCURRENCY || 200);
 const DURATION_SECONDS = Number(process.env.DURATION_SECONDS || 30);
 const AMOUNT = Number(process.env.AMOUNT || 1);
+
+const SHARD_COUNT = Number(process.env.SHARD_COUNT || 4);
 
 const JOB_POLL_INTERVAL_MS = Number(process.env.JOB_POLL_INTERVAL_MS || 50);
 const JOB_POLL_TIMEOUT_MS = Number(process.env.JOB_POLL_TIMEOUT_MS || 10000);
@@ -72,10 +75,10 @@ function randomAccountId() {
 
 // 計算 shardId
 function getShardId(accountId) {
-  return accountId % 2;
+  return accountId % SHARD_COUNT;
 }
 
-// 產生一筆 same-shard 的隨機轉帳資料
+// 產生 same-shard payload
 function buildSameShardTransferPayload() {
   const fromId = randomAccountId();
   const fromShardId = getShardId(fromId);
@@ -153,7 +156,7 @@ async function waitForJobResult(jobId) {
   }
 }
 
-// 執行一筆 same-shard 隨機轉帳請求
+// 執行一筆 transfer
 async function sendSameShardTransfer() {
   const payload = buildSameShardTransferPayload();
 
@@ -194,11 +197,13 @@ async function sendSameShardTransfer() {
     stats.failedRequests += 1;
 
     const errorMessage = result.job.error && result.job.error.message;
+
     if (errorMessage === 'insufficient funds') {
       stats.insufficientFunds += 1;
     } else {
       stats.otherBusinessFailed += 1;
     }
+
   } catch (err) {
     stats.failedRequests += 1;
     stats.requestErrors += 1;
@@ -212,17 +217,20 @@ async function worker(deadline) {
   }
 }
 
-// 主測試流程
+// 主流程
 async function main() {
+
   console.log('========================================');
   console.log('Small Bank Same-Shard Random Benchmark');
   console.log('========================================');
+
   console.log(`API: ${API}`);
   console.log(`API_URL: ${API_URL}`);
   console.log(`MAX_ACCOUNT_ID: ${MAX_ACCOUNT_ID}`);
   console.log(`CONCURRENCY: ${CONCURRENCY}`);
   console.log(`DURATION_SECONDS: ${DURATION_SECONDS}`);
   console.log(`AMOUNT: ${AMOUNT}`);
+  console.log(`SHARD_COUNT: ${SHARD_COUNT}`);
   console.log(`JOB_POLL_INTERVAL_MS: ${JOB_POLL_INTERVAL_MS}`);
   console.log(`JOB_POLL_TIMEOUT_MS: ${JOB_POLL_TIMEOUT_MS}`);
   console.log('');
@@ -235,26 +243,20 @@ async function main() {
   );
 
   const elapsedSeconds = (Date.now() - startedAt) / 1000;
+
   const successRate = stats.totalRequests === 0
     ? 0
     : (stats.successRequests / stats.totalRequests) * 100;
 
-  const avgTotalRps = elapsedSeconds === 0
-    ? 0
-    : stats.totalRequests / elapsedSeconds;
-
-  const avgSuccessRps = elapsedSeconds === 0
-    ? 0
-    : stats.successRequests / elapsedSeconds;
-
-  const avgFailRps = elapsedSeconds === 0
-    ? 0
-    : stats.failedRequests / elapsedSeconds;
+  const avgTotalRps = stats.totalRequests / elapsedSeconds;
+  const avgSuccessRps = stats.successRequests / elapsedSeconds;
+  const avgFailRps = stats.failedRequests / elapsedSeconds;
 
   console.log('');
   console.log('========================================');
   console.log('Same-Shard Random Benchmark Finished');
   console.log('========================================');
+
   console.log(`Elapsed Seconds     : ${elapsedSeconds.toFixed(2)}`);
   console.log(`Total Requests      : ${stats.totalRequests}`);
   console.log(`Success Requests    : ${stats.successRequests}`);
@@ -263,14 +265,17 @@ async function main() {
   console.log(`Avg Total RPS       : ${avgTotalRps.toFixed(2)}`);
   console.log(`Avg Success RPS     : ${avgSuccessRps.toFixed(2)}`);
   console.log(`Avg Fail RPS        : ${avgFailRps.toFixed(2)}`);
+
   console.log('');
   console.log('Failure Breakdown');
   console.log('----------------------------------------');
+
   console.log(`Insufficient Funds  : ${stats.insufficientFunds}`);
   console.log(`Other Business Fail : ${stats.otherBusinessFailed}`);
   console.log(`Enqueue Failed      : ${stats.enqueueFailed}`);
   console.log(`Request Errors      : ${stats.requestErrors}`);
   console.log(`Unexpected Type     : ${stats.unexpectedTypeSuccess}`);
+
 }
 
 main().catch(err => {

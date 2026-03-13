@@ -8,6 +8,8 @@ const DURATION_SECONDS = Number(process.env.DURATION_SECONDS || 10);
 const MAX_ACCOUNT_ID = Number(process.env.MAX_ACCOUNT_ID || 1000);
 const AMOUNT = Number(process.env.AMOUNT || 1);
 
+const SHARD_COUNT = Number(process.env.SHARD_COUNT || 4);
+
 const JOB_POLL_INTERVAL_MS = Number(process.env.JOB_POLL_INTERVAL_MS || 200);
 const JOB_POLL_TIMEOUT_MS = Number(process.env.JOB_POLL_TIMEOUT_MS || 10000);
 
@@ -30,8 +32,8 @@ function pickRandomAccountPair(maxAccountId) {
   return { fromId, toId };
 }
 
-function calcShardId(accountId, shardCount = 2) {
-  return Number(accountId) % shardCount;
+function calcShardId(accountId) {
+  return Number(accountId) % SHARD_COUNT;
 }
 
 async function createTransferJob({ fromId, toId, amount }) {
@@ -111,8 +113,10 @@ async function waitForJobResult(jobId) {
 
 async function runOneTransfer(stats) {
   const { fromId, toId } = pickRandomAccountPair(MAX_ACCOUNT_ID);
+
   const fromShardId = calcShardId(fromId);
   const toShardId = calcShardId(toId);
+
   const isSameShard = fromShardId === toShardId;
 
   stats.totalRequests += 1;
@@ -137,6 +141,7 @@ async function runOneTransfer(stats) {
     }
 
     const jobId = createResp.data.data && createResp.data.data.jobId;
+
     if (!jobId) {
       stats.failedRequests += 1;
       stats.enqueueFailed += 1;
@@ -149,6 +154,7 @@ async function runOneTransfer(stats) {
       stats.successRequests += 1;
 
       const transferResult = result.job.result || {};
+
       if (transferResult.type === 'same-shard') {
         stats.sameShardSuccess += 1;
       } else if (transferResult.type === 'cross-shard') {
@@ -156,16 +162,19 @@ async function runOneTransfer(stats) {
       } else {
         stats.unknownTypeSuccess += 1;
       }
+
     } else {
       stats.failedRequests += 1;
 
       const errorMessage = result.job.error && result.job.error.message;
+
       if (errorMessage === 'insufficient funds') {
         stats.insufficientFunds += 1;
       } else {
         stats.otherBusinessFailed += 1;
       }
     }
+
   } catch (err) {
     stats.failedRequests += 1;
     stats.requestErrors += 1;
@@ -179,15 +188,18 @@ async function worker(deadline, stats) {
 }
 
 async function main() {
+
   console.log('========================================');
   console.log('Small Bank Random Transfer Benchmark');
   console.log('========================================');
   console.log('');
+
   console.log(`API=${API}`);
   console.log(`CONCURRENCY=${CONCURRENCY}`);
   console.log(`DURATION_SECONDS=${DURATION_SECONDS}`);
   console.log(`MAX_ACCOUNT_ID=${MAX_ACCOUNT_ID}`);
   console.log(`AMOUNT=${AMOUNT}`);
+  console.log(`SHARD_COUNT=${SHARD_COUNT}`);
   console.log(`JOB_POLL_INTERVAL_MS=${JOB_POLL_INTERVAL_MS}`);
   console.log(`JOB_POLL_TIMEOUT_MS=${JOB_POLL_TIMEOUT_MS}`);
   console.log('');
@@ -224,26 +236,17 @@ async function main() {
     ? 0
     : (stats.successRequests / stats.totalRequests) * 100;
 
-  const avgTotalRps = elapsedSeconds === 0
-    ? 0
-    : stats.totalRequests / elapsedSeconds;
+  const avgTotalRps = stats.totalRequests / elapsedSeconds;
+  const avgSuccessRps = stats.successRequests / elapsedSeconds;
 
-  const avgSuccessRps = elapsedSeconds === 0
-    ? 0
-    : stats.successRequests / elapsedSeconds;
-
-  const sameShardPickedRate = stats.totalRequests === 0
-    ? 0
-    : (stats.sameShardPicked / stats.totalRequests) * 100;
-
-  const crossShardPickedRate = stats.totalRequests === 0
-    ? 0
-    : (stats.crossShardPicked / stats.totalRequests) * 100;
+  const sameShardPickedRate = (stats.sameShardPicked / stats.totalRequests) * 100;
+  const crossShardPickedRate = (stats.crossShardPicked / stats.totalRequests) * 100;
 
   console.log('========================================');
   console.log('Benchmark Result');
   console.log('========================================');
   console.log('');
+
   console.log(`Elapsed Seconds     : ${elapsedSeconds.toFixed(2)}`);
   console.log(`Total Requests      : ${stats.totalRequests}`);
   console.log(`Success Requests    : ${stats.successRequests}`);
@@ -252,20 +255,25 @@ async function main() {
   console.log(`Avg Total RPS       : ${avgTotalRps.toFixed(2)}`);
   console.log(`Avg Success RPS     : ${avgSuccessRps.toFixed(2)}`);
   console.log('');
+
   console.log('Shard Mix');
   console.log('----------------------------------------');
+
   console.log(`Same-Shard Picked   : ${stats.sameShardPicked} (${sameShardPickedRate.toFixed(2)}%)`);
   console.log(`Cross-Shard Picked  : ${stats.crossShardPicked} (${crossShardPickedRate.toFixed(2)}%)`);
   console.log(`Same-Shard Success  : ${stats.sameShardSuccess}`);
   console.log(`Cross-Shard Success : ${stats.crossShardSuccess}`);
   console.log(`Unknown Type Success: ${stats.unknownTypeSuccess}`);
   console.log('');
+
   console.log('Failure Breakdown');
   console.log('----------------------------------------');
+
   console.log(`Insufficient Funds  : ${stats.insufficientFunds}`);
   console.log(`Other Business Fail : ${stats.otherBusinessFailed}`);
   console.log(`Enqueue Failed      : ${stats.enqueueFailed}`);
   console.log(`Request Errors      : ${stats.requestErrors}`);
+
   console.log('');
   console.log('========================================');
   console.log('Benchmark Finished');

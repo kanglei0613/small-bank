@@ -12,7 +12,6 @@
 # Purpose:
 #   - measure full random transfer throughput
 #   - include real mixed shard traffic
-#
 # ========================================
 
 echo "========================================"
@@ -34,6 +33,16 @@ TRUNCATE TABLE accounts RESTART IDENTITY CASCADE;
 EOF
 
 psql small_bank_s1 <<EOF
+TRUNCATE TABLE transfers RESTART IDENTITY CASCADE;
+TRUNCATE TABLE accounts RESTART IDENTITY CASCADE;
+EOF
+
+psql small_bank_s2 <<EOF
+TRUNCATE TABLE transfers RESTART IDENTITY CASCADE;
+TRUNCATE TABLE accounts RESTART IDENTITY CASCADE;
+EOF
+
+psql small_bank_s3 <<EOF
 TRUNCATE TABLE transfers RESTART IDENTITY CASCADE;
 TRUNCATE TABLE accounts RESTART IDENTITY CASCADE;
 EOF
@@ -91,7 +100,11 @@ echo ""
 echo "Step 4: Start full random transfer benchmark"
 echo "----------------------------------------"
 
-CONCURRENCY=200 DURATION_SECONDS=30 MAX_ACCOUNT_ID=1000 AMOUNT=1 \
+CONCURRENCY=200 \
+DURATION_SECONDS=30 \
+MAX_ACCOUNT_ID=1000 \
+AMOUNT=1 \
+SHARD_COUNT=4 \
 node scripts/benchmark/random_transfer_all_shards.js
 
 echo ""

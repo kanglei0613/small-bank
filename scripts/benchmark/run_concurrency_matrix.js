@@ -8,7 +8,7 @@ const MAX_ACCOUNT_ID = Number(process.env.MAX_ACCOUNT_ID || 1000);
 const DURATION_SECONDS = Number(process.env.DURATION_SECONDS || 30);
 const AMOUNT = Number(process.env.AMOUNT || 1);
 
-const CONCURRENCY_LIST = [ 300, 400, 500, 550, 600, 650, 700 ];
+const CONCURRENCY_LIST = [ 300, 400, 500, 600, 700, 800, 900 ];
 
 const TARGET_SCRIPT_MAP = {
   'same-shard': 'scripts/benchmark/random_transfer_same_shard.js',
@@ -175,6 +175,7 @@ async function main() {
   console.log(`MAX_ACCOUNT_ID=${MAX_ACCOUNT_ID}`);
   console.log(`DURATION_SECONDS=${DURATION_SECONDS}`);
   console.log(`AMOUNT=${AMOUNT}`);
+  console.log(`SHARD_COUNT=${process.env.SHARD_COUNT || 4}`);
   console.log(`CONCURRENCY_LIST=${CONCURRENCY_LIST.join(', ')}`);
   console.log('');
 
