@@ -139,20 +139,24 @@ class TransferService extends Service {
     const repo = new AccountsRepo(this.ctx);
 
     try {
-
       const result = await repo.transfer(fromId, toId, amount);
 
-      await Promise.all([
+      // 轉帳成功後刪除 account cache
+      // cache 清理失敗不能影響已經成功的 DB transaction
+      const cacheResults = await Promise.allSettled([
         this.ctx.service.accounts.invalidateAccountCache(fromId),
         this.ctx.service.accounts.invalidateAccountCache(toId),
       ]);
 
+      for (const item of cacheResults) {
+        if (item.status === 'rejected') {
+          logger.error('[Redis] invalidate account cache error: %s', item.reason && item.reason.message);
+        }
+      }
+
       return result;
-
     } finally {
-
       await app.redis.decr(inflightKey);
-
     }
   }
 

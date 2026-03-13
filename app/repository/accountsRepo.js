@@ -139,9 +139,23 @@ class AccountsRepo {
       await shardClient.query('BEGIN');
 
       const accountSql = `
-        INSERT INTO accounts (id, user_id, balance)
-        VALUES ($1, $2, $3)
-        RETURNING id, user_id, balance, created_at, updated_at
+        INSERT INTO accounts (
+          id,
+          user_id,
+          balance,
+          available_balance,
+          reserved_balance
+        )
+        VALUES ($1, $2, $3, $3, 0)
+        RETURNING
+          id,
+          user_id,
+          balance,
+          available_balance AS "availableBalance",
+          reserved_balance AS "reservedBalance",
+          (available_balance + reserved_balance) AS "totalBalance",
+          created_at AS "createdAt",
+          updated_at AS "updatedAt"
       `;
 
       const accountResult = await shardClient.query(accountSql, [
@@ -208,7 +222,15 @@ class AccountsRepo {
 
     // 到對應 shard 查詢帳戶
     const sql = `
-      SELECT id, user_id, balance, created_at, updated_at
+      SELECT
+        id,
+        user_id,
+        balance,
+        available_balance AS "availableBalance",
+        reserved_balance AS "reservedBalance",
+        (available_balance + reserved_balance) AS "totalBalance",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt"
       FROM accounts
       WHERE id = $1
     `;
@@ -252,7 +274,9 @@ class AccountsRepo {
         from_account_id AS "fromId",
         to_account_id AS "toId",
         amount,
-        created_at
+        status,
+        created_at AS "createdAt",
+        updated_at AS "updatedAt"
       FROM transfers
       WHERE from_account_id = $1
          OR to_account_id = $1
@@ -265,7 +289,6 @@ class AccountsRepo {
   }
 
   // 轉帳
-  // 目前只支援 same-shard transfer
   async transfer(fromId, toId, amount) {
     const fromAccountId = Number(fromId);
     const toAccountId = Number(toId);
@@ -306,14 +329,29 @@ class AccountsRepo {
       throw err;
     }
 
-    // 目前先只支援 same-shard transfer
-    if (fromShardId !== toShardId) {
-      const err = new Error('cross-shard transfer not supported yet');
-      err.status = 501;
-      throw err;
+    // same-shard 走單一 transaction
+    if (fromShardId === toShardId) {
+      return await this.transferSameShard({
+        fromAccountId,
+        toAccountId,
+        transferAmount,
+        shardId: fromShardId,
+      });
     }
 
-    const shardPg = this.getShardPg(fromShardId);
+    // cross-shard 走 reserve / credit / finalize
+    return await this.transferCrossShard({
+      fromAccountId,
+      toAccountId,
+      transferAmount,
+      fromShardId,
+      toShardId,
+    });
+  }
+
+  // same-shard 轉帳
+  async transferSameShard({ fromAccountId, toAccountId, transferAmount, shardId }) {
+    const shardPg = this.getShardPg(shardId);
 
     // 從 shard pool 取得 connection
     const client = await shardPg.connect();
@@ -350,15 +388,20 @@ class AccountsRepo {
         throw err;
       }
 
-      // 扣款，並檢查不能透支
+      // 扣款，檢查 available_balance 是否足夠
       const debit = await client.query(
         `
           UPDATE accounts
-          SET balance = balance - $1,
+          SET available_balance = available_balance - $1,
+              balance = balance - $1,
               updated_at = NOW()
           WHERE id = $2
-            AND balance >= $1
-          RETURNING balance
+            AND available_balance >= $1
+          RETURNING
+            id,
+            balance,
+            available_balance,
+            reserved_balance
         `,
         [ transferAmount, fromAccountId ]
       );
@@ -373,7 +416,8 @@ class AccountsRepo {
       await client.query(
         `
           UPDATE accounts
-          SET balance = balance + $1,
+          SET available_balance = available_balance + $1,
+              balance = balance + $1,
               updated_at = NOW()
           WHERE id = $2
         `,
@@ -383,9 +427,23 @@ class AccountsRepo {
       // 寫入 transfer record
       const transferResult = await client.query(
         `
-          INSERT INTO transfers (from_account_id, to_account_id, amount)
-          VALUES ($1, $2, $3)
-          RETURNING id, from_account_id, to_account_id, amount, created_at
+          INSERT INTO transfers (
+            from_account_id,
+            to_account_id,
+            amount,
+            status,
+            created_at,
+            updated_at
+          )
+          VALUES ($1, $2, $3, 'COMPLETED', NOW(), NOW())
+          RETURNING
+            id,
+            from_account_id,
+            to_account_id,
+            amount,
+            status,
+            created_at,
+            updated_at
         `,
         [ fromAccountId, toAccountId, transferAmount ]
       );
@@ -398,11 +456,14 @@ class AccountsRepo {
         fromId: fromAccountId,
         toId: toAccountId,
         amount: transferAmount,
+        status: transferResult.rows[0].status,
         createdAt: transferResult.rows[0].created_at,
-        shardId: fromShardId,
+        updatedAt: transferResult.rows[0].updated_at,
+        shardId,
+        type: 'same-shard',
       };
     } catch (err) {
-      this.ctx.app.logger.error('transfer error:', err.message, err.code);
+      this.ctx.app.logger.error('same-shard transfer error:', err.message, err.code);
 
       try {
         await client.query('ROLLBACK');
@@ -414,6 +475,360 @@ class AccountsRepo {
     } finally {
       // 歸還 connection
       client.release();
+    }
+  }
+
+  // cross-shard 轉帳
+  async transferCrossShard({
+    fromAccountId,
+    toAccountId,
+    transferAmount,
+    fromShardId,
+    toShardId,
+  }) {
+    const fromShardPg = this.getShardPg(fromShardId);
+    const toShardPg = this.getShardPg(toShardId);
+
+    const fromClient = await fromShardPg.connect();
+    const toClient = await toShardPg.connect();
+
+    let transferId = null;
+    let credited = false;
+
+    try {
+      // Step 1: 在 from shard 預留金額
+      await fromClient.query('BEGIN');
+      await fromClient.query("SET LOCAL lock_timeout = '200ms'");
+
+      // 鎖住 from account，避免併發下重複扣款
+      const fromLocked = await fromClient.query(
+        `
+          SELECT id
+          FROM accounts
+          WHERE id = $1
+          FOR UPDATE
+        `,
+        [ fromAccountId ]
+      );
+
+      if (fromLocked.rowCount === 0) {
+        const err = new Error(`account not found: ${fromAccountId}`);
+        err.status = 404;
+        throw err;
+      }
+
+      // 從 available_balance 移到 reserved_balance
+      const reserveResult = await fromClient.query(
+        `
+          UPDATE accounts
+          SET available_balance = available_balance - $1,
+              reserved_balance = reserved_balance + $1,
+              updated_at = NOW()
+          WHERE id = $2
+            AND available_balance >= $1
+          RETURNING
+            id,
+            available_balance,
+            reserved_balance
+        `,
+        [ transferAmount, fromAccountId ]
+      );
+
+      if (reserveResult.rowCount === 0) {
+        const err = new Error('insufficient funds');
+        err.status = 409;
+        throw err;
+      }
+
+      // 在 from shard 寫入 RESERVED transfer record
+      const transferInsert = await fromClient.query(
+        `
+          INSERT INTO transfers (
+            from_account_id,
+            to_account_id,
+            amount,
+            status,
+            created_at,
+            updated_at
+          )
+          VALUES ($1, $2, $3, 'RESERVED', NOW(), NOW())
+          RETURNING id, created_at, updated_at
+        `,
+        [ fromAccountId, toAccountId, transferAmount ]
+      );
+
+      transferId = transferInsert.rows[0].id;
+
+      await fromClient.query('COMMIT');
+
+      // Step 2: 在 to shard 入帳
+      await toClient.query('BEGIN');
+      await toClient.query("SET LOCAL lock_timeout = '200ms'");
+
+      // 鎖住 to account
+      const toLocked = await toClient.query(
+        `
+          SELECT id
+          FROM accounts
+          WHERE id = $1
+          FOR UPDATE
+        `,
+        [ toAccountId ]
+      );
+
+      if (toLocked.rowCount === 0) {
+        const err = new Error(`account not found: ${toAccountId}`);
+        err.status = 404;
+        throw err;
+      }
+
+      // to shard 增加 available_balance，同步維持舊 balance
+      const creditResult = await toClient.query(
+        `
+          UPDATE accounts
+          SET available_balance = available_balance + $1,
+              balance = balance + $1,
+              updated_at = NOW()
+          WHERE id = $2
+          RETURNING id
+        `,
+        [ transferAmount, toAccountId ]
+      );
+
+      if (creditResult.rowCount === 0) {
+        const err = new Error(`account not found: ${toAccountId}`);
+        err.status = 404;
+        throw err;
+      }
+
+      await toClient.query('COMMIT');
+      credited = true;
+
+      // Step 3-1: 回 from shard 先標記 CREDITED
+      await fromClient.query('BEGIN');
+      await fromClient.query("SET LOCAL lock_timeout = '200ms'");
+
+      const markCreditedResult = await fromClient.query(
+        `
+          UPDATE transfers
+          SET status = 'CREDITED',
+              updated_at = NOW()
+          WHERE id = $1
+            AND status = 'RESERVED'
+          RETURNING id
+        `,
+        [ transferId ]
+      );
+
+      if (markCreditedResult.rowCount === 0) {
+        const err = new Error('mark credited failed');
+        err.status = 500;
+        throw err;
+      }
+
+      await fromClient.query('COMMIT');
+
+      // Step 3-2: 回 from shard finalize
+      await fromClient.query('BEGIN');
+      await fromClient.query("SET LOCAL lock_timeout = '200ms'");
+
+      // 鎖住 from account
+      const finalizeLocked = await fromClient.query(
+        `
+          SELECT id
+          FROM accounts
+          WHERE id = $1
+          FOR UPDATE
+        `,
+        [ fromAccountId ]
+      );
+
+      if (finalizeLocked.rowCount === 0) {
+        const err = new Error(`account not found: ${fromAccountId}`);
+        err.status = 404;
+        throw err;
+      }
+
+      // 正式把 reserved_balance 扣掉，並同步更新舊 balance
+      const finalizeResult = await fromClient.query(
+        `
+          UPDATE accounts
+          SET reserved_balance = reserved_balance - $1,
+              balance = balance - $1,
+              updated_at = NOW()
+          WHERE id = $2
+            AND reserved_balance >= $1
+          RETURNING id
+        `,
+        [ transferAmount, fromAccountId ]
+      );
+
+      if (finalizeResult.rowCount === 0) {
+        const err = new Error('finalize reserved funds failed');
+        err.status = 500;
+        throw err;
+      }
+
+      // 更新 transfer 狀態
+      const completeResult = await fromClient.query(
+        `
+          UPDATE transfers
+          SET status = 'COMPLETED',
+              updated_at = NOW()
+          WHERE id = $1
+            AND status = 'CREDITED'
+          RETURNING id
+        `,
+        [ transferId ]
+      );
+
+      if (completeResult.rowCount === 0) {
+        const err = new Error('mark completed failed');
+        err.status = 500;
+        throw err;
+      }
+
+      await fromClient.query('COMMIT');
+
+      return {
+        transferId,
+        fromId: fromAccountId,
+        toId: toAccountId,
+        amount: transferAmount,
+        status: 'COMPLETED',
+        fromShardId,
+        toShardId,
+        type: 'cross-shard',
+      };
+    } catch (err) {
+      this.ctx.app.logger.error('cross-shard transfer error:', err.message, err.code);
+
+      try {
+        await fromClient.query('ROLLBACK');
+      } catch (rollbackErr) {
+        this.ctx.app.logger.error('From shard rollback failed:', rollbackErr);
+      }
+
+      try {
+        await toClient.query('ROLLBACK');
+      } catch (rollbackErr) {
+        this.ctx.app.logger.error('To shard rollback failed:', rollbackErr);
+      }
+
+      // reserve 成功但 to shard 尚未入帳，補償回 available_balance
+      if (transferId && !credited) {
+        try {
+          await fromClient.query('BEGIN');
+
+          // 鎖住 from account
+          const compensateLocked = await fromClient.query(
+            `
+              SELECT id
+              FROM accounts
+              WHERE id = $1
+              FOR UPDATE
+            `,
+            [ fromAccountId ]
+          );
+
+          if (compensateLocked.rowCount === 0) {
+            const compensateErr = new Error(`account not found: ${fromAccountId}`);
+            compensateErr.status = 404;
+            throw compensateErr;
+          }
+
+          // 釋放 reserved_balance
+          const compensateResult = await fromClient.query(
+            `
+              UPDATE accounts
+              SET available_balance = available_balance + $1,
+                  reserved_balance = reserved_balance - $1,
+                  updated_at = NOW()
+              WHERE id = $2
+                AND reserved_balance >= $1
+              RETURNING id
+            `,
+            [ transferAmount, fromAccountId ]
+          );
+
+          if (compensateResult.rowCount === 0) {
+            const compensateErr = new Error('release reserved funds failed');
+            compensateErr.status = 500;
+            throw compensateErr;
+          }
+
+          // 更新 transfer 狀態
+          const failResult = await fromClient.query(
+            `
+              UPDATE transfers
+              SET status = 'FAILED',
+                  updated_at = NOW()
+              WHERE id = $1
+                AND status = 'RESERVED'
+              RETURNING id
+            `,
+            [ transferId ]
+          );
+
+          if (failResult.rowCount === 0) {
+            const compensateErr = new Error('mark failed after reserve rollback failed');
+            compensateErr.status = 500;
+            throw compensateErr;
+          }
+
+          await fromClient.query('COMMIT');
+        } catch (compensateErr) {
+          try {
+            await fromClient.query('ROLLBACK');
+          } catch (rollbackErr) {
+            this.ctx.app.logger.error('Compensate rollback failed:', rollbackErr);
+          }
+
+          this.ctx.app.logger.error('cross-shard compensate failed:', compensateErr);
+        }
+      }
+
+      // to shard 已入帳，但 finalize 失敗
+      // 這時不能直接把錢退回，否則可能造成雙方都拿到錢
+      // 先把 transfer status 保留在 CREDITED，交由後續修復流程處理
+      if (transferId && credited) {
+        try {
+          await fromClient.query('BEGIN');
+
+          const markCreditedRecoveryResult = await fromClient.query(
+            `
+              UPDATE transfers
+              SET status = 'CREDITED',
+                  updated_at = NOW()
+              WHERE id = $1
+                AND status IN ('RESERVED', 'CREDITED')
+              RETURNING id
+            `,
+            [ transferId ]
+          );
+
+          if (markCreditedRecoveryResult.rowCount === 0) {
+            const recoveryErr = new Error('mark credited recovery failed');
+            recoveryErr.status = 500;
+            throw recoveryErr;
+          }
+
+          await fromClient.query('COMMIT');
+        } catch (recoveryErr) {
+          try {
+            await fromClient.query('ROLLBACK');
+          } catch (rollbackErr) {
+            this.ctx.app.logger.error('Credited recovery rollback failed:', rollbackErr);
+          }
+
+          this.ctx.app.logger.error('cross-shard credited recovery failed:', recoveryErr);
+        }
+      }
+
+      throw err;
+    } finally {
+      fromClient.release();
+      toClient.release();
     }
   }
 }
