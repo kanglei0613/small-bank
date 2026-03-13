@@ -1,22 +1,22 @@
 #!/bin/bash
 # ========================================
-# random_transfer_same_shard.sh
+# random_transfer_all_shards.sh
 #
-# Benchmark for sharding same-shard random transfer
+# Benchmark for sharding random transfer
 #
 # Scenario:
 #   - random account transfer
-#   - same-shard only
+#   - include same-shard + cross-shard
 #   - sharding version
 #
 # Purpose:
-#   - measure same-shard throughput
-#   - avoid cross-shard failure noise
+#   - measure full random transfer throughput
+#   - include real mixed shard traffic
 #
 # ========================================
 
 echo "========================================"
-echo "Small Bank Same-Shard Random Benchmark"
+echo "Small Bank Full Random Benchmark"
 echo "========================================"
 echo ""
 
@@ -88,22 +88,11 @@ ORDER BY shard_id;
 "
 
 echo ""
-echo "Step 3-1: Show sample account routing"
-echo "----------------------------------------"
-
-psql small_bank_meta -c "
-SELECT account_id, shard_id
-FROM account_shards
-ORDER BY account_id
-LIMIT 20;
-"
-
-echo ""
-echo "Step 4: Start same-shard random transfer benchmark"
+echo "Step 4: Start full random transfer benchmark"
 echo "----------------------------------------"
 
 CONCURRENCY=200 DURATION_SECONDS=30 MAX_ACCOUNT_ID=1000 AMOUNT=1 \
-node scripts/benchmark/random_transfer_same_shard.js
+node scripts/benchmark/random_transfer_all_shards.js
 
 echo ""
 echo "========================================"

@@ -1,105 +1,61 @@
 'use strict';
 
-/*
-random_transfer_same_shard.js
-
-用途：
-隨機產生 same-shard 的 fromId / toId，持續對 /transfers 發送請求，
-並輪詢 transfer job 狀態，統計真正完成的 same-shard transfer 吞吐量。
-
-使用方式：
-node scripts/benchmark/random_transfer_same_shard.js
-
-可調整參數：
-API                 API base URL
-MAX_ACCOUNT_ID      可用帳戶上限
-CONCURRENCY         同時執行的 worker 數
-DURATION_SECONDS    測試秒數
-AMOUNT              固定轉帳金額
-JOB_POLL_INTERVAL_MS  job 輪詢間隔
-JOB_POLL_TIMEOUT_MS   job 輪詢 timeout
-*/
-
 const axios = require('axios');
-const http = require('http');
 
 const API = process.env.API || 'http://127.0.0.1:7001';
-const API_URL = `${API}/transfers`;
-
-const MAX_ACCOUNT_ID = Number(process.env.MAX_ACCOUNT_ID || 1000);
 const CONCURRENCY = Number(process.env.CONCURRENCY || 200);
-const DURATION_SECONDS = Number(process.env.DURATION_SECONDS || 30);
+const DURATION_SECONDS = Number(process.env.DURATION_SECONDS || 10);
+const MAX_ACCOUNT_ID = Number(process.env.MAX_ACCOUNT_ID || 1000);
 const AMOUNT = Number(process.env.AMOUNT || 1);
 
 const JOB_POLL_INTERVAL_MS = Number(process.env.JOB_POLL_INTERVAL_MS || 50);
 const JOB_POLL_TIMEOUT_MS = Number(process.env.JOB_POLL_TIMEOUT_MS || 10000);
 
-// HTTP keep-alive agent
-const httpAgent = new http.Agent({
-  keepAlive: true,
-  maxSockets: 1000,
-});
-
-// axios instance
-const client = axios.create({
-  httpAgent,
-  timeout: 5000,
-  validateStatus: () => true,
-});
-
-// 統計資料
-const stats = {
-  totalRequests: 0,
-  successRequests: 0,
-  failedRequests: 0,
-
-  enqueueFailed: 0,
-  requestErrors: 0,
-  insufficientFunds: 0,
-  otherBusinessFailed: 0,
-  unexpectedTypeSuccess: 0,
-};
-
-// 睡眠
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// 隨機產生帳戶 id
-function randomAccountId() {
-  return Math.floor(Math.random() * MAX_ACCOUNT_ID) + 1;
+function randomInt(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
-// 計算 shardId
-function getShardId(accountId) {
-  return accountId % 2;
-}
+function pickRandomAccountPair(maxAccountId) {
+  const fromId = randomInt(1, maxAccountId);
+  let toId = randomInt(1, maxAccountId);
 
-// 產生一筆 same-shard 的隨機轉帳資料
-function buildSameShardTransferPayload() {
-  const fromId = randomAccountId();
-  const fromShardId = getShardId(fromId);
-
-  let toId = randomAccountId();
-
-  while (toId === fromId || getShardId(toId) !== fromShardId) {
-    toId = randomAccountId();
+  while (toId === fromId) {
+    toId = randomInt(1, maxAccountId);
   }
 
-  return {
-    fromId,
-    toId,
-    amount: AMOUNT,
-  };
+  return { fromId, toId };
 }
 
-// 查 job
-async function getTransferJob(jobId) {
-  const response = await client.get(`${API}/transfer-jobs/${jobId}`);
+function calcShardId(accountId, shardCount = 2) {
+  return Number(accountId) % shardCount;
+}
+
+async function createTransferJob({ fromId, toId, amount }) {
+  const response = await axios.post(`${API}/transfers`, {
+    fromId,
+    toId,
+    amount,
+  }, {
+    timeout: 5000,
+    validateStatus: () => true,
+  });
+
   return response;
 }
 
-// 等待 job 完成
+async function getTransferJob(jobId) {
+  const response = await axios.get(`${API}/transfer-jobs/${jobId}`, {
+    timeout: 5000,
+    validateStatus: () => true,
+  });
+
+  return response;
+}
+
 async function waitForJobResult(jobId) {
   const startedAt = Date.now();
 
@@ -153,14 +109,26 @@ async function waitForJobResult(jobId) {
   }
 }
 
-// 執行一筆 same-shard 隨機轉帳請求
-async function sendSameShardTransfer() {
-  const payload = buildSameShardTransferPayload();
+async function runOneTransfer(stats) {
+  const { fromId, toId } = pickRandomAccountPair(MAX_ACCOUNT_ID);
+  const fromShardId = calcShardId(fromId);
+  const toShardId = calcShardId(toId);
+  const isSameShard = fromShardId === toShardId;
 
   stats.totalRequests += 1;
 
+  if (isSameShard) {
+    stats.sameShardPicked += 1;
+  } else {
+    stats.crossShardPicked += 1;
+  }
+
   try {
-    const createResp = await client.post(API_URL, payload);
+    const createResp = await createTransferJob({
+      fromId,
+      toId,
+      amount: AMOUNT,
+    });
 
     if (createResp.status !== 202 || !createResp.data || !createResp.data.ok) {
       stats.failedRequests += 1;
@@ -169,7 +137,6 @@ async function sendSameShardTransfer() {
     }
 
     const jobId = createResp.data.data && createResp.data.data.jobId;
-
     if (!jobId) {
       stats.failedRequests += 1;
       stats.enqueueFailed += 1;
@@ -179,25 +146,25 @@ async function sendSameShardTransfer() {
     const result = await waitForJobResult(jobId);
 
     if (result.ok) {
-      const transferResult = result.job.result || {};
-
-      if (transferResult.type !== 'same-shard') {
-        stats.failedRequests += 1;
-        stats.unexpectedTypeSuccess += 1;
-        return;
-      }
-
       stats.successRequests += 1;
-      return;
-    }
 
-    stats.failedRequests += 1;
-
-    const errorMessage = result.job.error && result.job.error.message;
-    if (errorMessage === 'insufficient funds') {
-      stats.insufficientFunds += 1;
+      const transferResult = result.job.result || {};
+      if (transferResult.type === 'same-shard') {
+        stats.sameShardSuccess += 1;
+      } else if (transferResult.type === 'cross-shard') {
+        stats.crossShardSuccess += 1;
+      } else {
+        stats.unknownTypeSuccess += 1;
+      }
     } else {
-      stats.otherBusinessFailed += 1;
+      stats.failedRequests += 1;
+
+      const errorMessage = result.job.error && result.job.error.message;
+      if (errorMessage === 'insufficient funds') {
+        stats.insufficientFunds += 1;
+      } else {
+        stats.otherBusinessFailed += 1;
+      }
     }
   } catch (err) {
     stats.failedRequests += 1;
@@ -205,36 +172,54 @@ async function sendSameShardTransfer() {
   }
 }
 
-// worker
-async function worker(deadline) {
+async function worker(deadline, stats) {
   while (Date.now() < deadline) {
-    await sendSameShardTransfer();
+    await runOneTransfer(stats);
   }
 }
 
-// 主測試流程
 async function main() {
   console.log('========================================');
-  console.log('Small Bank Same-Shard Random Benchmark');
+  console.log('Small Bank Random Transfer Benchmark');
   console.log('========================================');
-  console.log(`API: ${API}`);
-  console.log(`API_URL: ${API_URL}`);
-  console.log(`MAX_ACCOUNT_ID: ${MAX_ACCOUNT_ID}`);
-  console.log(`CONCURRENCY: ${CONCURRENCY}`);
-  console.log(`DURATION_SECONDS: ${DURATION_SECONDS}`);
-  console.log(`AMOUNT: ${AMOUNT}`);
-  console.log(`JOB_POLL_INTERVAL_MS: ${JOB_POLL_INTERVAL_MS}`);
-  console.log(`JOB_POLL_TIMEOUT_MS: ${JOB_POLL_TIMEOUT_MS}`);
   console.log('');
+  console.log(`API=${API}`);
+  console.log(`CONCURRENCY=${CONCURRENCY}`);
+  console.log(`DURATION_SECONDS=${DURATION_SECONDS}`);
+  console.log(`MAX_ACCOUNT_ID=${MAX_ACCOUNT_ID}`);
+  console.log(`AMOUNT=${AMOUNT}`);
+  console.log(`JOB_POLL_INTERVAL_MS=${JOB_POLL_INTERVAL_MS}`);
+  console.log(`JOB_POLL_TIMEOUT_MS=${JOB_POLL_TIMEOUT_MS}`);
+  console.log('');
+
+  const stats = {
+    totalRequests: 0,
+    successRequests: 0,
+    failedRequests: 0,
+
+    sameShardPicked: 0,
+    crossShardPicked: 0,
+
+    sameShardSuccess: 0,
+    crossShardSuccess: 0,
+    unknownTypeSuccess: 0,
+
+    insufficientFunds: 0,
+    otherBusinessFailed: 0,
+    enqueueFailed: 0,
+    requestErrors: 0,
+  };
 
   const startedAt = Date.now();
   const deadline = startedAt + DURATION_SECONDS * 1000;
 
   await Promise.all(
-    Array.from({ length: CONCURRENCY }, () => worker(deadline))
+    Array.from({ length: CONCURRENCY }, () => worker(deadline, stats))
   );
 
-  const elapsedSeconds = (Date.now() - startedAt) / 1000;
+  const endedAt = Date.now();
+  const elapsedSeconds = (endedAt - startedAt) / 1000;
+
   const successRate = stats.totalRequests === 0
     ? 0
     : (stats.successRequests / stats.totalRequests) * 100;
@@ -247,14 +232,18 @@ async function main() {
     ? 0
     : stats.successRequests / elapsedSeconds;
 
-  const avgFailRps = elapsedSeconds === 0
+  const sameShardPickedRate = stats.totalRequests === 0
     ? 0
-    : stats.failedRequests / elapsedSeconds;
+    : (stats.sameShardPicked / stats.totalRequests) * 100;
 
+  const crossShardPickedRate = stats.totalRequests === 0
+    ? 0
+    : (stats.crossShardPicked / stats.totalRequests) * 100;
+
+  console.log('========================================');
+  console.log('Benchmark Result');
+  console.log('========================================');
   console.log('');
-  console.log('========================================');
-  console.log('Same-Shard Random Benchmark Finished');
-  console.log('========================================');
   console.log(`Elapsed Seconds     : ${elapsedSeconds.toFixed(2)}`);
   console.log(`Total Requests      : ${stats.totalRequests}`);
   console.log(`Success Requests    : ${stats.successRequests}`);
@@ -262,7 +251,14 @@ async function main() {
   console.log(`Success Rate        : ${successRate.toFixed(2)}%`);
   console.log(`Avg Total RPS       : ${avgTotalRps.toFixed(2)}`);
   console.log(`Avg Success RPS     : ${avgSuccessRps.toFixed(2)}`);
-  console.log(`Avg Fail RPS        : ${avgFailRps.toFixed(2)}`);
+  console.log('');
+  console.log('Shard Mix');
+  console.log('----------------------------------------');
+  console.log(`Same-Shard Picked   : ${stats.sameShardPicked} (${sameShardPickedRate.toFixed(2)}%)`);
+  console.log(`Cross-Shard Picked  : ${stats.crossShardPicked} (${crossShardPickedRate.toFixed(2)}%)`);
+  console.log(`Same-Shard Success  : ${stats.sameShardSuccess}`);
+  console.log(`Cross-Shard Success : ${stats.crossShardSuccess}`);
+  console.log(`Unknown Type Success: ${stats.unknownTypeSuccess}`);
   console.log('');
   console.log('Failure Breakdown');
   console.log('----------------------------------------');
@@ -270,10 +266,13 @@ async function main() {
   console.log(`Other Business Fail : ${stats.otherBusinessFailed}`);
   console.log(`Enqueue Failed      : ${stats.enqueueFailed}`);
   console.log(`Request Errors      : ${stats.requestErrors}`);
-  console.log(`Unexpected Type     : ${stats.unexpectedTypeSuccess}`);
+  console.log('');
+  console.log('========================================');
+  console.log('Benchmark Finished');
+  console.log('========================================');
 }
 
 main().catch(err => {
-  console.error('Benchmark failed:', err);
+  console.error('benchmark fatal error:', err);
   process.exit(1);
 });

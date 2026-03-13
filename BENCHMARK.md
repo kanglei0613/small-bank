@@ -384,78 +384,189 @@ CONCURRENCY ≈ 250
 
 ---
 
-# 重要觀察
+# Async Job Transfer Benchmark
 
-1️⃣ 系統在以下情況達到飽和：
-
-```
-CONCURRENCY ≈ 250
-```
-
-2️⃣ 當 concurrency 超過系統能力時：
+在加入 **Async Job API + Redis Transfer Queue** 後，  
+系統的轉帳流程變為：
 
 ```
-Redis queue backlog
-Client timeout
-NETWORK_ERROR
-```
-
-3️⃣ same-shard transaction 仍然會產生：
-
-```
-row-level lock contention
-```
-
-4️⃣ Sharding 的優勢主要在：
-
-```
-降低不同帳戶之間的 DB contention
-```
-
-而不是解決同 shard 的鎖競爭。
-
----
-
-# 未來優化方向
-
-## 1 PostgreSQL connection pool tuning
-
-```
-增加 pool size
-提高並行處理能力
-```
-
----
-
-## 2 API worker 與 queue worker 分離
-
-目標架構
-
-```
-API Workers
+Client
+↓
+POST /transfers
 ↓
 enqueue transfer job
-
-Queue Workers
 ↓
-process transfer
+Redis Transfer Queue
+↓
+Queue Worker
+↓
+Execute DB transaction
+↓
+Update transfer job result
 ```
+
+Benchmark 會：
+
+```
+1. 發送 transfer request
+2. 取得 jobId
+3. 輪詢 /transfer-jobs/:jobId
+4. 等待 job 完成
+5. 統計成功與失敗
+```
+
+因此此 benchmark 測量的是：
+
+```
+完整 transfer lifecycle throughput
+```
+
+而不是單純 API enqueue throughput。
 
 ---
 
-## 3 進一步壓測
+# Same-Shard Random Transfer (Async Job)
 
-建議測試
+測試腳本
 
 ```
-CONCURRENCY = 280
-CONCURRENCY = 320
+scripts/benchmark/random_transfer_same_shard.sh
+```
+
+測試情境
+
+```
+隨機帳戶轉帳
+只允許 same-shard transfer
 ```
 
 目的
 
 ```
-更精確找出系統 saturation curve
+測量 async job 架構下
+same-shard transaction throughput
+```
+
+---
+
+# Test 1
+
+測試參數
+
+```
+CONCURRENCY = 200
+DURATION_SECONDS = 30
+MAX_ACCOUNT_ID = 1000
+AMOUNT = 1
+```
+
+測試結果
+
+```
+Total Requests: 6637
+Success Requests: 6637
+Failed Requests: 0
+
+Success Rate: 100%
+
+Avg Total RPS: 214.37
+Avg Success RPS: 214.37
+```
+
+觀察
+
+```
+系統在 async job pipeline 下保持穩定
+無 timeout 或 transaction error
+same-shard transaction 正常運作
+```
+
+---
+
+# Mixed Random Transfer (Same + Cross Shard)
+
+測試腳本
+
+```
+scripts/benchmark/random_transfer_all_shards.sh
+```
+
+測試情境
+
+```
+完全隨機帳戶轉帳
+包含 same-shard 與 cross-shard transaction
+```
+
+Shard 分布
+
+```
+Same-Shard ≈ 50%
+Cross-Shard ≈ 50%
+```
+
+---
+
+# Test 1
+
+測試參數
+
+```
+CONCURRENCY = 200
+DURATION_SECONDS = 30
+MAX_ACCOUNT_ID = 1000
+AMOUNT = 1
+```
+
+測試結果
+
+```
+Total Requests: 6463
+Success Requests: 6463
+Failed Requests: 0
+
+Success Rate: 100%
+
+Avg Total RPS: 209.95
+Avg Success RPS: 209.95
+```
+
+Shard Mix
+
+```
+Same-Shard Picked   : 3251
+Cross-Shard Picked  : 3212
+```
+
+觀察
+
+```
+cross-shard transaction 成功率 100%
+compensation logic 正常運作
+未出現 RESERVED transaction 卡住
+```
+
+---
+
+# Same-Shard vs Mixed Throughput
+
+| Workload | Success RPS |
+|--------|--------|
+| Same-Shard | **214.37** |
+| Mixed Random | **209.95** |
+
+差異
+
+```
+≈ 2%
+```
+
+觀察
+
+```
+cross-shard transaction 對整體吞吐影響很小
+主要瓶頸更可能在 async job pipeline
+而非 transaction 邏輯本身
 ```
 
 ---
@@ -468,15 +579,21 @@ CONCURRENCY = 320
 8 workers
 Redis transfer queue
 PostgreSQL sharding (2 shards)
-1000 accounts
+Async Job API
 ```
 
-系統可穩定支撐約：
+測得吞吐量：
 
 ```
-≈ 6200 transfers/sec
+≈ 210 transfers/sec
 ```
 
-在 same-shard random workload 情境下。
+此數值代表：
+
+```
+完整 transfer lifecycle throughput
+```
+
+而非單純 API request throughput。
 
 ---
