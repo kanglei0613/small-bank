@@ -37,7 +37,9 @@
     "reset-test-data": "node scripts/reset_test_data.js",
     "random-transfer-test": "node scripts/random_transfer_test.js",
     "create-test-accounts-100": "node scripts/create_test_accounts_100.js",
-    "create-test-accounts-1000": "node scripts/create_test_accounts_1000.js"
+    "create-test-accounts-1000": "node scripts/create_test_accounts_1000.js",
+    "dev:api": "APP_ROLE=api egg-bin dev",
+    "dev:queue": "APP_ROLE=queue egg-bin dev"
   },
   "repository": {
     "type": "git",

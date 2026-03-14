@@ -17,7 +17,7 @@ module.exports = appInfo => {
   // PostgreSQL sharding 設定
   // meta DB: 存 account_shards 這類 routing 資訊
   config.pgMeta = {
-    host: 'localhost',
+    host: '192.168.10.196',
     port: 5432,
     user: 'kanglei0613',
     password: '',
@@ -39,7 +39,7 @@ module.exports = appInfo => {
   // shard DB
   config.pgShards = {
     0: {
-      host: 'localhost',
+      host: '192.168.10.196',
       port: 5432,
       user: 'kanglei0613',
       password: '',
@@ -59,7 +59,7 @@ module.exports = appInfo => {
     },
 
     1: {
-      host: 'localhost',
+      host: '192.168.10.196',
       port: 5432,
       user: 'kanglei0613',
       password: '',
@@ -79,7 +79,7 @@ module.exports = appInfo => {
     },
 
     2: {
-      host: 'localhost',
+      host: '192.168.10.196',
       port: 5432,
       user: 'kanglei0613',
       password: '',
@@ -99,7 +99,7 @@ module.exports = appInfo => {
     },
 
     3: {
-      host: 'localhost',
+      host: '192.168.10.196',
       port: 5432,
       user: 'kanglei0613',
       password: '',
@@ -128,7 +128,7 @@ module.exports = appInfo => {
   exports.cluster = {
     listen: {
       port: 7001,
-      hostname: '127.0.0.1',
+      hostname: '192.168.10.196',
     },
   };
 
@@ -136,7 +136,7 @@ module.exports = appInfo => {
 
   exports.redis = {
     client: {
-      host: '127.0.0.1',
+      host: '192.168.10.196',
       port: 6379,
       password: '',
       db: 0,
