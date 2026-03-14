@@ -2,506 +2,734 @@
 
 ---
 
+# 測試目的
+
+本文件記錄 **Small Bank 系統在不同架構與測試情境下的壓力測試結果**，用於觀察：
+
+- API 吞吐量
+- 交易完成吞吐量 (completed transfer throughput)
+- Sharding 架構下的交易分布
+- Hotspot 保護機制
+- Async Job + Queue Worker 架構的實際效果
+- API intake throughput 與 completed throughput 的差異
+
+測試分為八種類型：
+
+1. Hotspot Transfer Test
+2. Random Mixed Shard Transfer Test
+3. Concurrency Sweep Test
+4. Polling Interval Sweep Test
+5. PostgreSQL Connection Pool Sweep
+6. Queue Worker Scaling Test
+7. Account Count Sweep
+8. Enqueue-Only API Intake Test
+
+---
+
 # 測試環境
 
-應用程式
+## 應用程式
 
-- Node.js
-- Egg.js Framework
-- Cluster Mode
+| 項目 | 設定 |
+|-----|-----|
+| Runtime | Node.js |
+| Framework | Egg.js |
+| Process | Cluster Mode |
+| Workers | 8 workers |
 
-Worker
+---
 
-- 8 Workers
+# 系統架構
 
-系統架構
+目前系統架構包含：
 
+- Async Job API
 - Redis Transfer Queue
+- Background Queue Worker
 - PostgreSQL
 - Row-level Locking
-- Database Sharding
+- Database Sharding (4 shards)
 
-資料庫
+整體流程：
 
+```text
+Client
+   │
+   ▼
+POST /transfers
+   │
+   │  (create transfer job)
+   ▼
+Redis Queue (per-fromId queue)
+   │
+   ▼
+Queue Worker
+   │
+   │  DB transaction
+   ▼
+PostgreSQL Shards
 ```
-small_bank_meta
-small_bank_s0
-small_bank_s1
-small_bank_s2
-small_bank_s3
-```
 
-帳戶設定
+Client 查詢結果：
 
-- 帳戶數量：1000
-- 初始餘額：100000
-
-轉帳設定
-
-```
-amount = 1
-```
-
-測試機器
-
-```
-MacBook Air (Development Machine)
+```text
+GET /transfer-jobs/:jobId
 ```
 
 ---
 
-# Benchmark 測試類型
+# Database Sharding
 
-本專案測試包含三種架構：
+目前系統使用 **4 個資料庫 shard**
 
-1️⃣ 單資料庫架構（Single Database）  
-2️⃣ 分片架構（Database Sharding - 2 Shards）  
-3️⃣ 分片架構（Database Sharding - 4 Shards）
+| Shard | Database |
+|------|---------|
+| shard 0 | small_bank_s0 |
+| shard 1 | small_bank_s1 |
+| shard 2 | small_bank_s2 |
+| shard 3 | small_bank_s3 |
 
-工作負載（Workload）包含：
+Meta Database：
 
-- Hotspot Transfer（熱點帳戶轉帳）
-- Random Transfer（隨機帳戶轉帳）
+| DB | 說明 |
+|---|---|
+| small_bank_meta | account_shards mapping |
+
+Account Sharding Rule：
+
+```text
+shard_id = accountId % SHARD_COUNT
+```
 
 ---
 
-# 單資料庫 Benchmark
+# Async Transfer Architecture
 
-## Hotspot Transfer（熱點轉帳）
+## Transfer API
 
-測試情境
-
+```text
+POST /transfers
 ```
+
+流程：
+
+1. API 驗證 request
+2. 建立 transfer job
+3. job 存入 Redis job store
+4. job push 進 Redis queue
+5. API 立即回傳 jobId
+
+Response example：
+
+```json
+{
+  "ok": true,
+  "data": {
+    "jobId": "1773502894541-ni3enz8i",
+    "status": "queued"
+  }
+}
+```
+
+---
+
+## Transfer Job Query
+
+```text
+GET /transfer-jobs/:jobId
+```
+
+Client 透過 polling 取得最終結果。
+
+| Status | 說明 |
+|------|------|
+| queued | job 已進 queue |
+| success | 轉帳成功 |
+| failed | 轉帳失敗 |
+
+註：後續優化後已移除 `processing` 中間狀態寫入，以減少 Redis write 成本。
+
+---
+
+# Benchmark Scenario 1
+# Hotspot Transfer Test
+
+## 測試目的
+
+模擬 **單一帳戶高併發轉帳情境**
+
+```text
 fromId = 6
 toId   = 7
-amount = 1
 ```
 
-測試工具
+---
 
-```
-autocannon
-```
+## 測試結果
 
-測試參數
-
-```
-connections = 50
-duration = 10s
-endpoint = POST /transfers
-```
-
-測試結果
-
-```
-Req/sec (avg) : ~1595
-Total Requests: ~18000
-```
-
-延遲（Latency）
-
-| 指標 | 數值 |
+| Metric | Value |
 |------|------|
-| Average | ~30 ms |
-| p50 | ~22 ms |
-| p99 | ~140 ms |
+| Total Requests | ~33k |
+| 2xx Responses | 1760 |
+| Non-2xx Responses | 31210 |
+| Avg Req/Sec | ~3297 |
+| Avg Latency | ~60 ms |
 
-觀察
+此測試顯示：
 
-- Row-level locking 正常運作
-- 轉帳資料保持一致性
-- 系統在中等競爭下運行穩定
-
----
-
-## Random Transfer（短時間吞吐）
-
-測試參數
-
-```
-CONCURRENCY = 200
-DURATION_SECONDS = 10
-MAX_ACCOUNT_ID = 1000
-AMOUNT = 1
-```
-
-測試結果
-
-```
-Avg Success RPS ≈ 8547
-Success Rate = 100%
-```
-
-觀察
-
-- 系統可以處理短時間 burst load
-- 沒有 timeout 或錯誤
+- 系統會對 **hot account** 啟動 admission control
+- 避免 queue backlog 過大
+- API intake 與實際可完成交易數量是不同維度
 
 ---
 
-## Random Transfer（長時間吞吐）
+# Benchmark Scenario 2
+# Random Mixed Shard Transfer Test
 
-測試參數
+模擬真實交易情境：
 
-```
-CONCURRENCY = 200
-DURATION_SECONDS = 30
-MAX_ACCOUNT_ID = 1000
-AMOUNT = 1
-```
+- 隨機帳戶轉帳
+- 混合 same-shard + cross-shard
+- 完整 async workflow
 
-測試結果
+## Initial Result
 
-```
-Avg Success RPS ≈ 6459
-Success Rate = 100%
-```
+| Metric | Value |
+|------|------|
+| Avg Success RPS | ~307 |
 
-結論
+---
 
-```
-單 DB 架構
-穩定吞吐量 ≈ 6.4k transfers/sec
+## Optimized Result
+
+在以下優化後重新測試：
+
+- active queue set（不再 SCAN Redis keyspace）
+- transfer hot path 不再查兩次 meta DB
+- job store 移除 `processing` 狀態寫入
+- cross-shard success path 簡化（`RESERVED -> COMPLETED`）
+- benchmark client 啟用 HTTP keep-alive
+- API / Queue worker 分離
+
+| Metric | Value |
+|------|------|
+| Elapsed Seconds | 30.38 |
+| Total Requests | 21183 |
+| Success Requests | 21183 |
+| Failed Requests | 0 |
+| Success Rate | 100% |
+| Avg Total RPS | 697.18 |
+| Avg Success RPS | 697.18 |
+
+### Shard Mix
+
+| Metric | Value |
+|------|------|
+| Same-Shard Picked | 5212 (24.60%) |
+| Cross-Shard Picked | 15971 (75.40%) |
+| Same-Shard Success | 5212 |
+| Cross-Shard Success | 15971 |
+
+### Failure Breakdown
+
+| Type | Count |
+|-----|------|
+| Insufficient Funds | 0 |
+| Other Business Fail | 0 |
+| Enqueue Failed | 0 |
+| Request Errors | 0 |
+
+---
+
+# Benchmark Scenario 3
+# Concurrency Sweep Test
+
+## Mixed Random Concurrency Sweep
+
+| Concurrency | Avg Success RPS |
+|-------------|----------------|
+| 100 | 315 |
+| 200 | 316 |
+| 300 | **321** |
+| 400 | 319 |
+| 500 | 315 |
+
+### Sweet Spot
+
+```text
+Best Concurrency ≈ 300
 ```
 
 ---
 
-# Async Job Transfer Architecture
+## Same-Shard Concurrency Sweep
 
-加入 **Async Job API + Redis Transfer Queue** 後：
+| Concurrency | Avg Success RPS |
+|-------------|----------------|
+| 100 | 387 |
+| 200 | 381 |
+| 300 | 388 |
+| 400 | **391** |
+| 500 | 390 |
 
+### Sweet Spot
+
+```text
+Best Concurrency ≈ 400
 ```
-Client
-↓
+
+---
+
+# Benchmark Scenario 4
+# Polling Interval Sweep
+
+| Poll Interval | Avg Success RPS |
+|---------------|----------------|
+| 200 ms | 304 |
+| 100 ms | **324** |
+| 50 ms | 322 |
+
+### Result
+
+```text
+Best Poll Interval ≈ 100 ms
+```
+
+---
+
+# Benchmark Scenario 5
+# PostgreSQL Connection Pool Sweep
+
+| Pool Max | Avg Success RPS |
+|---------|----------------|
+| 10 | **324** |
+| 20 | 319 |
+| 30 | 295 |
+
+### Result
+
+```text
+Best Pool Size ≈ 10
+```
+
+增加 connection pool 並未提升 throughput，  
+反而因為 transaction contention 增加導致吞吐量下降。
+
+---
+
+# Benchmark Scenario 6
+# Queue Worker Scaling Test
+
+測試 **Queue Worker 數量對吞吐量的影響**
+
+測試條件：
+
+```text
+Concurrency = 300
+Poll Interval = 100 ms
+Pool Max = 10
+Mixed Random Traffic
+```
+
+---
+
+## Queue Worker Scaling Result
+
+| Queue Workers | Avg Success RPS |
+|---------------|----------------|
+| 2 | 403 |
+| 4 | 539 |
+| 6 | **580** |
+| 8 | 541 |
+
+### Result
+
+```text
+Best Queue Worker Count ≈ 6
+Best Avg Success RPS ≈ 580
+```
+
+### Observations
+
+- 2 → 4 workers：大幅提升
+- 4 → 6 workers：仍有提升
+- 6 → 8 workers：開始下降
+
+代表 **6 workers 接近系統最佳 parallelism**。
+
+---
+
+# Benchmark Scenario 7
+# Account Count Sweep
+
+測試不同帳戶數量對系統吞吐量的影響。
+
+測試條件：
+
+```text
+Concurrency = 300
+Poll Interval = 100 ms
+Pool Max = 10
+Queue Workers = 6
+Mixed Random Traffic
+```
+
+---
+
+## Account Count Sweep Result
+
+| Account Count | Avg Success RPS |
+|---------------|----------------|
+| 1000 | **519** |
+| 5000 | 499 |
+| 10000 | 475 |
+
+### Result
+
+```text
+Best Account Count ≈ 1000
+```
+
+### Analysis
+
+帳戶數量增加後 throughput 略微下降：
+
+```text
+519 → 475 (約 8%)
+```
+
+可能原因：
+
+- PostgreSQL buffer cache locality 降低
+- working set 增大
+- index traversal 增加
+
+但系統仍維持：
+
+```text
+>470 transfers/sec
+```
+
+表示系統在 dataset 擴大時仍能保持穩定吞吐量。
+
+---
+
+# Benchmark Scenario 8
+# Enqueue-Only API Intake Test
+
+此測試只衡量：
+
+```text
 POST /transfers
-↓
-enqueue transfer job
-↓
-Redis Transfer Queue
-↓
-Queue Worker
-↓
-Execute DB transaction
-↓
-Update transfer job result
 ```
 
-Benchmark 流程
+也就是：
 
-```
-1. 發送 transfer request
-2. 取得 jobId
-3. 輪詢 /transfer-jobs/:jobId
-4. 等待 job 完成
-5. 統計成功與失敗
+- 建立 transfer job
+- 寫入 Redis queue
+- API 回傳 202
+
+**不包含 polling，不等待 job 完成**
+
+因此這個 benchmark 用來觀察：
+
+- API intake throughput
+- job enqueue 能力
+- intake 與 completed throughput 的差異
+
+---
+
+## Enqueue-Only Result
+
+測試條件：
+
+```text
+Concurrency = 300
+Account Count = 1000
+Duration = 30s
+Keep-Alive = true
 ```
 
-此 benchmark 測量的是：
+| Metric | Value |
+|------|------|
+| Elapsed Seconds | 30.04 |
+| Total Requests | 114714 |
+| Success Requests | 114714 |
+| Failed Requests | 0 |
+| Success Rate | 100% |
+| Avg Total RPS | 3819.09 |
+| Avg Success RPS | 3819.09 |
 
-```
-完整 transfer lifecycle throughput
+### Shard Mix
+
+| Metric | Value |
+|------|------|
+| Same-Shard Picked | 28657 (24.98%) |
+| Cross-Shard Picked | 86057 (75.02%) |
+
+### Success Breakdown
+
+| Type | Count |
+|-----|------|
+| Job Created | 114714 |
+| Missing Job ID | 0 |
+
+### Failure Breakdown
+
+| Type | Count |
+|-----|------|
+| HTTP 429 | 0 |
+| HTTP 4xx | 0 |
+| HTTP 5xx | 0 |
+| Other HTTP Status | 0 |
+| Request Errors | 0 |
+
+### Interpretation
+
+Enqueue-only benchmark 顯示：
+
+- API intake throughput 約可達 **3.8k req/sec**
+- 成功率維持 **100%**
+- 無 429 / 無 5xx / 無 request error
+
+這表示目前系統瓶頸：
+
+- **不在 API 收單能力**
+- 而在後段 transfer processing workflow
+
+也就是：
+
+```text
+API intake throughput  >>  completed transfer throughput
+3819 RPS              >>  697 RPS
 ```
 
 ---
 
-# Async Job Throughput
+# Cross-Shard Overhead
 
-## Same-Shard Random Transfer
+| Scenario | Best RPS |
+|--------|---------|
+| Same-Shard | ~391 |
+| Mixed Random (initial) | ~307 |
+| Mixed Random (optimized, workflow) | **~697** |
+| Enqueue-Only (API intake) | **~3819** |
 
-測試結果
+---
 
-```
-Avg Success RPS ≈ 214
+# Optimization Summary
+
+本輪新增與已完成的關鍵優化：
+
+1. **Active Queue Set**
+   - queue worker 不再透過 `SCAN transfer:queue:from:*` 尋找 active queue
+   - 改為直接維護 active fromId set
+
+2. **Shard Routing Fast Path**
+   - transfer hot path 不再查 meta DB 取得 shard
+   - 直接使用 `accountId % shardCount`
+
+3. **Job Store Write Reduction**
+   - 移除 `processing` 狀態
+   - job lifecycle 簡化為 `queued -> success/failed`
+
+4. **Cross-Shard Success Path Simplification**
+   - 成功路徑由：
+     ```text
+     RESERVED -> CREDITED -> COMPLETED
+     ```
+     簡化為：
+     ```text
+     RESERVED -> COMPLETED
+     ```
+
+5. **Benchmark Client Keep-Alive**
+   - benchmark client 使用 keep-alive agent
+   - 減少大量 HTTP request 的 client-side overhead
+
+---
+
+# System Stability
+
+所有 benchmark 結果顯示：
+
+```text
 Success Rate = 100%
+Enqueue Failed = 0
+Request Errors = 0
+```
+
+系統在目前測試條件下保持穩定。
+
+---
+
+# Current System Baseline
+
+目前最佳 workflow 配置：
+
+```text
+Concurrency ≈ 300
+Poll Interval ≈ 100 ms
+Shard Pool Max ≈ 10
+Queue Workers ≈ 6
 ```
 
 ---
 
-## Mixed Random Transfer
+## Baseline Throughput
 
-測試結果
+| Scenario | Throughput |
+|--------|-----------|
+| Same-Shard Workflow | ~391 transfers/sec |
+| Mixed Random Workflow (before latest simplification) | ~580 transfers/sec |
+| Mixed Random Workflow (current) | **~697 transfers/sec** |
+| Enqueue-Only API Intake | **~3819 req/sec** |
 
+---
+
+# Key Findings
+
+## 1. API intake 並不是目前瓶頸
+
+系統目前可以穩定達到：
+
+```text
+~3819 enqueue req/sec
 ```
-Avg Success RPS ≈ 209
-Success Rate = 100%
+
+但完整交易完成吞吐量約為：
+
+```text
+~697 completed transfers/sec
 ```
 
-差異
+表示目前瓶頸主要在：
 
-```
-≈ 2%
+- queue draining
+- Redis 協調
+- cross-shard transaction path
+- PostgreSQL transaction throughput
+
+---
+
+## 2. Cross-Shard Workflow 仍然是主成本來源
+
+在 mixed-random 測試中：
+
+```text
+cross-shard ≈ 75%
+same-shard  ≈ 25%
 ```
 
-結論
+因此目前 workflow throughput 大多反映的是：
 
+```text
+cross-shard heavy workload
 ```
-cross-shard transaction 對吞吐影響很小
-主要瓶頸在 async job pipeline
+
+而不是純 same-shard 理想吞吐。
+
+---
+
+## 3. 簡化流程對 throughput 有實際幫助
+
+Mixed Random Workflow 從最初：
+
+```text
+~307 RPS
+```
+
+提升到目前：
+
+```text
+~697 RPS
+```
+
+代表：
+
+- queue architecture 優化有效
+- hot path trimming 有效
+- cross-shard success path 簡化有效
+
+---
+
+# Future Optimization Directions
+
+### 1. Two-Machine Deployment Test
+
+建議下一步測試：
+
+- Machine 1：API server
+- Machine 2：Queue workers
+
+用於觀察 API 與 worker 分機後，completed throughput 是否進一步提升。
+
+---
+
+### 2. Redis Queue Parallelism
+
+持續優化：
+
+- queue draining
+- owner scheduling
+- worker coordination
+
+---
+
+### 3. PostgreSQL Transaction Throughput
+
+進一步觀察：
+
+- cross-shard contention
+- transaction cost
+- lock competition
+
+---
+
+### 4. Queue Admission Control Tuning
+
+調整：
+
+```text
+queue length limit
+reject threshold
+```
+
+平衡：
+
+```text
+throughput vs protection
 ```
 
 ---
 
-# Queue Batch Size Tuning
-
-原始設定
-
-```
-batchSize = 20
-```
-
-調整為
-
-```
-batchSize = 10
-```
-
-效果
-
-| Batch Size | Peak RPS |
-|-------------|----------|
-| 20 | ~507 |
-| 10 | **~656** |
-
-提升
-
-```
-≈ +29%
-```
-
-原因
-
-```
-降低單次 queue drain latency
-提高 queue scheduling 粒度
-```
-
----
-
-# Concurrency Sweep（2 Shards）
-
-| Concurrency | Success RPS | Success Rate |
-|-------------|-------------|-------------|
-| 700 | 606 | 100% |
-| 750 | 632 | 100% |
-| 800 | 653 | 100% |
-| 850 | **656** | 93.76% |
-| 900 | 596 | 68.69% |
-| 950 | 568 | 60.65% |
-| 1000 | 524 | 45.71% |
-
-Stable Sweet Spot
-
-```
-CONCURRENCY ≈ 800
-Avg Success RPS ≈ 653
-Success Rate = 100%
-```
-
-Peak Throughput
-
-```
-≈ 656 transfers/sec
-```
-
----
-
-# Worker Scaling Benchmark
-
-測試條件
-
-```
-CONCURRENCY = 800
-batchSize = 10
-poll interval = 100ms
-```
-
-測試結果
-
-| Workers | Avg Success RPS | Success Rate |
-|--------|-----------------|-------------|
-| 6 | 603 | 95% |
-| 8 | **653** | **100%** |
-| 10 | 583 | 84% |
-| 12 | 602 | 100% |
-
-結論
-
-```
-最佳 worker 數量 ≈ CPU 平行度
-本環境最佳值為 8 workers
-```
-
----
-
-# Sharding Benchmark（4 Shards）
-
-資料庫
-
-```
-small_bank_s0
-small_bank_s1
-small_bank_s2
-small_bank_s3
-```
-
-Routing
-
-```
-accountId % shardCount
-```
-
-帳戶分布
-
-```
-250 accounts per shard
-```
-
----
-
-# Same-Shard Concurrency Sweep（4 Shards）
-
-| Concurrency | Total Requests | Success Requests | Failed Requests | Success Rate | Avg Total RPS | Avg Success RPS |
-|-------------|----------------|------------------|----------------|--------------|---------------|-----------------|
-| 300 | 9289 | 9289 | 0 | 100.00% | 300.63 | 300.63 |
-| 400 | 11369 | 11369 | 0 | 100.00% | 361.69 | 361.69 |
-| 500 | 13376 | 13376 | 0 | 100.00% | 430.57 | 430.57 |
-| 600 | 15785 | 15785 | 0 | 100.00% | **510.28** | **510.28** |
-| 700 | 20483 | 14249 | 6234 | 69.57% | 659.61 | 458.86 |
-| 800 | 30716 | 13902 | 16814 | 45.26% | 993.08 | 449.47 |
-| 900 | 36440 | 12117 | 24323 | 33.25% | 1165.04 | 387.40 |
-
-Sweet Spot
-
-```
-CONCURRENCY ≈ 600
-Avg Success RPS ≈ 510
-Success Rate = 100%
-```
-
----
-
-# Throughput Curve
-
-```
-Concurrency ↑
-↓
-Throughput ↑
-↓
-Plateau
-↓
-Overload
-↓
-Throughput ↓
-```
-
-系統在
-
-```
-600 concurrency
-```
-
-達到最佳吞吐。
-
----
-
-# 系統能力總結
-
-目前架構
-
-```
-Node.js + Egg Cluster
-8 workers
-Redis transfer queue
-PostgreSQL sharding
-Async Job API
-```
-
-系統能力
-
-```
-Single DB throughput ≈ 6400 transfers/sec
-Async Queue throughput ≈ 650 transfers/sec
-4-shard throughput ≈ 510 transfers/sec
-```
-
-Async job pipeline 帶來更穩定的併發控制，但降低了單機吞吐。
-
----
-
-# Benchmark 重要觀察
-
-1️⃣ Async job pipeline 會降低單機吞吐
-
-原因
-
-```
-enqueue
-queue
-worker
-DB transaction
-job polling
-```
-
----
-
-2️⃣ Sharding 主要降低 DB contention
-
-但在 async pipeline 下：
-
-```
-queue system 成為主要瓶頸
-```
-
----
-
-3️⃣ 系統 overload threshold
-
-```
-Concurrency ≈ 700
-```
-
-超過後 queue backlog 開始增加。
-
----
-
-# 目前主要瓶頸
-
-```
-Redis transfer queue
-worker scheduling
-job polling
-async pipeline overhead
-```
-
-而非單純 DB throughput。
-
----
-
-# 未來優化方向
-
-可能的優化方向
-
-```
-API worker / queue worker 分離
-Redis pipeline / Lua queue
-減少 job polling
-增加 shard 數量
-多機部署
-```
-
-進一步提升吞吐能力。
-
----
-
-# 未來 Benchmark 計畫
-
-後續計畫測試：
-
-```
-API enqueue throughput benchmark
-不同 shard 數 scaling
-worker / queue worker 分離架構
-multi-node deployment
-```
-
-以評估系統在更接近 production 的架構下的性能表現。
+# Summary
+
+Small Bank 系統目前已完成：
+
+- Async Job API
+- Redis transfer queue
+- Queue worker processing
+- PostgreSQL sharding
+- Cross-shard transaction support
+- Active queue set optimization
+- Transfer hot path routing optimization
+- Job state write reduction
+- Cross-shard success path simplification
+
+目前 benchmark 結果：
+
+| Scenario | Throughput |
+|--------|-----------|
+| Same-Shard Workflow | ~391 transfers/sec |
+| Mixed Random Workflow | **~697 transfers/sec** |
+| Enqueue-Only API Intake | **~3819 req/sec** |
+
+系統保持：
+
+- **100% success rate**
+- **穩定吞吐**
+- **無 queue rejection**
+- **無 request error**
+
+此結果可作為後續兩機實驗與更高吞吐優化的 **baseline benchmark**。
