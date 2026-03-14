@@ -1,28 +1,46 @@
 #!/bin/bash
 # ========================================
-# random_transfer_all_shards.sh
+# random_transfer_enqueue_only.sh
 #
-# Benchmark for sharding random transfer
+# Benchmark for API intake throughput
 #
 # Scenario:
 #   - random account transfer
-#   - include same-shard + cross-shard
-#   - sharding version
+#   - enqueue only
+#   - no job polling
 #
 # Purpose:
-#   - measure full random transfer throughput
-#   - include real mixed shard traffic
+#   - measure POST /transfers intake RPS
 # ========================================
 
+set -e
+
 echo "========================================"
-echo "Small Bank Full Random Benchmark"
+echo "Small Bank Enqueue Only Benchmark"
 echo "========================================"
 echo ""
 
-API="http://127.0.0.1:7001"
+API="${API:-http://127.0.0.1:7001}"
 
-ACCOUNT_COUNT=1000
-INITIAL_BALANCE=100000
+ACCOUNT_COUNT="${ACCOUNT_COUNT:-1000}"
+INITIAL_BALANCE="${INITIAL_BALANCE:-100000}"
+
+CONCURRENCY="${CONCURRENCY:-300}"
+DURATION_SECONDS="${DURATION_SECONDS:-30}"
+AMOUNT="${AMOUNT:-1}"
+
+SHARD_COUNT="${SHARD_COUNT:-4}"
+
+echo "Configuration"
+echo "----------------------------------------"
+echo "API=$API"
+echo "ACCOUNT_COUNT=$ACCOUNT_COUNT"
+echo "INITIAL_BALANCE=$INITIAL_BALANCE"
+echo "CONCURRENCY=$CONCURRENCY"
+echo "DURATION_SECONDS=$DURATION_SECONDS"
+echo "AMOUNT=$AMOUNT"
+echo "SHARD_COUNT=$SHARD_COUNT"
+echo ""
 
 echo "Step 1: Reset sharding databases"
 echo "----------------------------------------"
@@ -55,7 +73,7 @@ EOF
 
 redis-cli FLUSHDB
 
-echo "Sharding databases reset completed"
+echo "Database reset completed"
 echo ""
 
 sleep 1
@@ -65,13 +83,13 @@ echo "----------------------------------------"
 
 for ((i=1;i<=ACCOUNT_COUNT;i++))
 do
-  curl -s -X POST $API/users \
+  curl -s -X POST "$API/users" \
     -H "Content-Type: application/json" \
     -d "{
       \"name\":\"user_$i\"
     }" > /dev/null
 
-  curl -s -X POST $API/accounts \
+  curl -s -X POST "$API/accounts" \
     -H "Content-Type: application/json" \
     -d "{
       \"userId\":$i,
@@ -99,15 +117,16 @@ ORDER BY shard_id;
 "
 
 echo ""
-echo "Step 4: Start full random transfer benchmark"
+echo "Step 4: Start enqueue-only benchmark"
 echo "----------------------------------------"
 
-CONCURRENCY=200 \
-DURATION_SECONDS=30 \
-MAX_ACCOUNT_ID=1000 \
-AMOUNT=1 \
-SHARD_COUNT=4 \
-node scripts/benchmark/random_transfer_all_shards.js
+API="$API" \
+CONCURRENCY="$CONCURRENCY" \
+DURATION_SECONDS="$DURATION_SECONDS" \
+MAX_ACCOUNT_ID="$ACCOUNT_COUNT" \
+AMOUNT="$AMOUNT" \
+SHARD_COUNT="$SHARD_COUNT" \
+node scripts/benchmark/random_transfer_enqueue_only.js
 
 echo ""
 echo "========================================"

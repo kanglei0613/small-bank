@@ -5,6 +5,7 @@
 // 作用：
 // - 使用 Redis list 作為 per-fromId queue
 // - 使用 Redis owner lock 避免多個 process 同時 drain 同一條 queue
+// - 使用 active queue set 記錄目前有待處理 queue 的 fromId
 // - drain 時依序取出 job
 // - 呼叫 handler(job) 執行真正的 transfer job
 //
@@ -13,6 +14,9 @@
 //
 // owner key 範例：
 // transfer:queue:owner:from:6
+//
+// active queue set key 範例：
+// transfer:queue:active:fromIds
 
 // 建立 queue key
 function buildQueueKey(fromId) {
@@ -22,6 +26,11 @@ function buildQueueKey(fromId) {
 // 建立 owner key
 function buildOwnerKey(fromId) {
   return `transfer:queue:owner:from:${fromId}`;
+}
+
+// 建立 active queue set key
+function buildActiveQueueSetKey() {
+  return 'transfer:queue:active:fromIds';
 }
 
 // 建立 owner value
@@ -41,13 +50,36 @@ function getTransferQueueConfig(app) {
   };
 }
 
+// 將 fromId 加入 active queue set
+async function addActiveFromId(redis, fromId) {
+  const activeQueueSetKey = buildActiveQueueSetKey();
+  await redis.sadd(activeQueueSetKey, String(fromId));
+}
+
+// 將 fromId 從 active queue set 移除
+async function removeActiveFromId(redis, fromId) {
+  const activeQueueSetKey = buildActiveQueueSetKey();
+  await redis.srem(activeQueueSetKey, String(fromId));
+}
+
+// 取得所有 active fromId
+async function getActiveFromIds(redis) {
+  const activeQueueSetKey = buildActiveQueueSetKey();
+  const values = await redis.smembers(activeQueueSetKey);
+
+  return values
+    .map(value => Number(value))
+    .filter(value => Number.isInteger(value) && value > 0);
+}
+
 // 將 job push 進 queue
 //
 // 注意：
-// - 使用 Lua script 確保「檢查 queue 長度 + push」是原子操作
+// - 使用 Lua script 確保「檢查 queue 長度 + push + active set」是原子操作
 // - 先做 admission control，再做 hard limit
 async function pushJob(redis, fromId, job, options = {}) {
   const queueKey = buildQueueKey(fromId);
+  const activeQueueSetKey = buildActiveQueueSetKey();
   const payload = JSON.stringify(job);
 
   const rejectThresholdPerFromId = options.rejectThresholdPerFromId || 240;
@@ -57,6 +89,8 @@ async function pushJob(redis, fromId, job, options = {}) {
     local currentLength = redis.call("LLEN", KEYS[1])
     local rejectThreshold = tonumber(ARGV[1])
     local maxLength = tonumber(ARGV[2])
+    local payload = ARGV[3]
+    local fromId = ARGV[4]
 
     -- admission control：提早拒絕
     if currentLength >= rejectThreshold then
@@ -68,18 +102,21 @@ async function pushJob(redis, fromId, job, options = {}) {
       return -1
     end
 
-    redis.call("RPUSH", KEYS[1], ARGV[3])
+    redis.call("RPUSH", KEYS[1], payload)
+    redis.call("SADD", KEYS[2], fromId)
 
     return currentLength + 1
   `;
 
   const result = await redis.eval(
     lua,
-    1,
+    2,
     queueKey,
+    activeQueueSetKey,
     String(rejectThresholdPerFromId),
     String(maxQueueLengthPerFromId),
-    payload
+    payload,
+    String(fromId)
   );
 
   // admission control：提早拒絕
@@ -116,7 +153,6 @@ async function popJob(redis, fromId) {
 // 從 queue 左邊批次取出多筆 job
 async function popJobs(redis, fromId, batchSize) {
   const queueKey = buildQueueKey(fromId);
-
   const jobs = [];
 
   for (let i = 0; i < batchSize; i++) {
@@ -142,25 +178,30 @@ async function getQueueLength(redis, fromId) {
 async function getQueueStats(redis, fromId, options = {}) {
   const queueKey = buildQueueKey(fromId);
   const ownerKey = buildOwnerKey(fromId);
+  const activeQueueSetKey = buildActiveQueueSetKey();
 
   const [
     queueLength,
     ownerValue,
     ownerTTL,
+    activeMemberExists,
   ] = await Promise.all([
     redis.llen(queueKey),
     redis.get(ownerKey),
     redis.pttl(ownerKey),
+    redis.sismember(activeQueueSetKey, String(fromId)),
   ]);
 
   return {
     fromId,
     queueKey,
     ownerKey,
+    activeQueueSetKey,
     queueLength,
     ownerExists: !!ownerValue,
     ownerValue: ownerValue || null,
     ownerTTL,
+    activeInSet: activeMemberExists === 1,
     rejectThresholdPerFromId: options.rejectThresholdPerFromId || 240,
     maxQueueLengthPerFromId: options.maxQueueLengthPerFromId || 300,
     ownerTtlMs: options.ownerTtlMs || 10000,
@@ -315,6 +356,10 @@ async function drainQueue({ ctx, fromId, handler, ownerValue, options = {} }) {
           '[RedisQueue] queue empty: fromId=%s',
           fromId
         );
+
+        // queue 已經空了，從 active queue set 移除
+        await removeActiveFromId(redis, fromId);
+
         shouldContinue = false;
         continue;
       }
@@ -410,8 +455,12 @@ async function tryStartDrain({ ctx, fromId, handler }) {
 module.exports = {
   buildQueueKey,
   buildOwnerKey,
+  buildActiveQueueSetKey,
   buildOwnerValue,
   getTransferQueueConfig,
+  addActiveFromId,
+  removeActiveFromId,
+  getActiveFromIds,
   pushJob,
   popJob,
   popJobs,

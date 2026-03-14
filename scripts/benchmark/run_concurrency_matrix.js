@@ -4,15 +4,19 @@ const { spawn } = require('child_process');
 
 const TARGET = process.env.TARGET || 'same-shard';
 const API = process.env.API || 'http://127.0.0.1:7001';
-const MAX_ACCOUNT_ID = Number(process.env.MAX_ACCOUNT_ID || 1000);
+const ACCOUNT_COUNT = Number(process.env.ACCOUNT_COUNT || 1000);
+const INITIAL_BALANCE = Number(process.env.INITIAL_BALANCE || 100000);
+const MAX_ACCOUNT_ID = Number(process.env.MAX_ACCOUNT_ID || ACCOUNT_COUNT);
 const DURATION_SECONDS = Number(process.env.DURATION_SECONDS || 30);
 const AMOUNT = Number(process.env.AMOUNT || 1);
+const SHARD_COUNT = Number(process.env.SHARD_COUNT || 4);
 
-const CONCURRENCY_LIST = [ 300, 400, 500, 600, 700, 800, 900 ];
+const CONCURRENCY_LIST = [ 100, 200, 300, 400, 500 ];
 
 const TARGET_SCRIPT_MAP = {
-  'same-shard': 'scripts/benchmark/random_transfer_same_shard.js',
-  'all-shards': 'scripts/benchmark/random_transfer_all_shards.js',
+  'same-shard': 'scripts/benchmark/random_transfer_same_shard.sh',
+  'all-shards': 'scripts/benchmark/random_transfer_all_shards.sh',
+  'enqueue-only': 'scripts/benchmark/random_transfer_enqueue_only.sh',
 };
 
 function getTargetScript(target) {
@@ -29,14 +33,17 @@ function getTargetScript(target) {
 
 function runOneBenchmark({ concurrency, targetScript }) {
   return new Promise((resolve, reject) => {
-    const child = spawn('node', [ targetScript ], {
+    const child = spawn('bash', [ targetScript ], {
       env: {
         ...process.env,
         API,
+        ACCOUNT_COUNT: String(ACCOUNT_COUNT),
+        INITIAL_BALANCE: String(INITIAL_BALANCE),
         CONCURRENCY: String(concurrency),
         DURATION_SECONDS: String(DURATION_SECONDS),
         MAX_ACCOUNT_ID: String(MAX_ACCOUNT_ID),
         AMOUNT: String(AMOUNT),
+        SHARD_COUNT: String(SHARD_COUNT),
       },
       stdio: [ 'ignore', 'pipe', 'pipe' ],
     });
@@ -68,7 +75,7 @@ function runOneBenchmark({ concurrency, targetScript }) {
       }
 
       try {
-        const result = parseBenchmarkOutput(stdout, concurrency);
+        const result = parseBenchmarkOutput(stdout, concurrency, TARGET);
         resolve(result);
       } catch (err) {
         err.stdout = stdout;
@@ -77,6 +84,10 @@ function runOneBenchmark({ concurrency, targetScript }) {
       }
     });
   });
+}
+
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function parseNumber(output, label) {
@@ -101,11 +112,15 @@ function parseInteger(output, label) {
   return Number(match[1]);
 }
 
-function escapeRegExp(text) {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+function parseIntegerOrDefault(output, label, defaultValue = 0) {
+  try {
+    return parseInteger(output, label);
+  } catch (err) {
+    return defaultValue;
+  }
 }
 
-function parseBenchmarkOutput(output, concurrency) {
+function parseBenchmarkOutput(output, concurrency, target) {
   const elapsedSeconds = parseNumber(output, 'Elapsed Seconds');
   const totalRequests = parseInteger(output, 'Total Requests');
   const successRequests = parseInteger(output, 'Success Requests');
@@ -114,7 +129,7 @@ function parseBenchmarkOutput(output, concurrency) {
   const avgTotalRps = parseNumber(output, 'Avg Total RPS');
   const avgSuccessRps = parseNumber(output, 'Avg Success RPS');
 
-  return {
+  const result = {
     concurrency,
     elapsedSeconds,
     totalRequests,
@@ -124,6 +139,24 @@ function parseBenchmarkOutput(output, concurrency) {
     avgTotalRps,
     avgSuccessRps,
   };
+
+  if (target === 'enqueue-only') {
+    result.http429 = parseIntegerOrDefault(output, 'HTTP 429', 0);
+    result.http4xx = parseIntegerOrDefault(output, 'HTTP 4xx', 0);
+    result.http5xx = parseIntegerOrDefault(output, 'HTTP 5xx', 0);
+    result.otherHttpStatus = parseIntegerOrDefault(output, 'Other HTTP Status', 0);
+    result.requestErrors = parseIntegerOrDefault(output, 'Request Errors', 0);
+    result.jobCreated = parseIntegerOrDefault(output, 'Job Created', 0);
+    result.missingJobId = parseIntegerOrDefault(output, 'Missing Job ID', 0);
+    return result;
+  }
+
+  result.enqueueFailed = parseIntegerOrDefault(output, 'Enqueue Failed', 0);
+  result.requestErrors = parseIntegerOrDefault(output, 'Request Errors', 0);
+  result.insufficientFunds = parseIntegerOrDefault(output, 'Insufficient Funds', 0);
+  result.otherBusinessFail = parseIntegerOrDefault(output, 'Other Business Fail', 0);
+
+  return result;
 }
 
 function printMarkdownTable(results, target) {
@@ -133,22 +166,32 @@ function printMarkdownTable(results, target) {
   console.log('========================================');
   console.log('');
 
-  console.log(`## ${target === 'same-shard' ? 'Same-Shard' : 'Mixed Random'} Concurrency Sweep`);
-  console.log('');
-  console.log('| Concurrency | Total Requests | Success Requests | Failed Requests | Success Rate | Avg Total RPS | Avg Success RPS |');
-  console.log('|-------------|----------------|------------------|----------------|--------------|---------------|-----------------|');
+  if (target === 'enqueue-only') {
+    console.log('## Enqueue-Only Concurrency Sweep');
+    console.log('');
+    console.log('| Concurrency | Total Requests | Success Requests | Failed Requests | Success Rate | Avg Total RPS | Avg Success RPS | HTTP 429 | HTTP 4xx | HTTP 5xx | Request Errors |');
+    console.log('|-------------|----------------|------------------|-----------------|--------------|---------------|-----------------|----------|----------|----------|----------------|');
 
-  for (const item of results) {
-    console.log(
-      `| ${item.concurrency} | ${item.totalRequests} | ${item.successRequests} | ${item.failedRequests} | ${item.successRate.toFixed(2)}% | ${item.avgTotalRps.toFixed(2)} | ${item.avgSuccessRps.toFixed(2)} |`
-    );
+    for (const item of results) {
+      console.log(
+        `| ${item.concurrency} | ${item.totalRequests} | ${item.successRequests} | ${item.failedRequests} | ${item.successRate.toFixed(2)}% | ${item.avgTotalRps.toFixed(2)} | ${item.avgSuccessRps.toFixed(2)} | ${item.http429} | ${item.http4xx} | ${item.http5xx} | ${item.requestErrors} |`
+      );
+    }
+  } else {
+    console.log(`## ${target === 'same-shard' ? 'Same-Shard' : 'Mixed Random'} Concurrency Sweep`);
+    console.log('');
+    console.log('| Concurrency | Total Requests | Success Requests | Failed Requests | Success Rate | Avg Total RPS | Avg Success RPS | Enqueue Failed | Request Errors |');
+    console.log('|-------------|----------------|------------------|-----------------|--------------|---------------|-----------------|----------------|----------------|');
+
+    for (const item of results) {
+      console.log(
+        `| ${item.concurrency} | ${item.totalRequests} | ${item.successRequests} | ${item.failedRequests} | ${item.successRate.toFixed(2)}% | ${item.avgTotalRps.toFixed(2)} | ${item.avgSuccessRps.toFixed(2)} | ${item.enqueueFailed} | ${item.requestErrors} |`
+      );
+    }
   }
 
   const best = results.reduce((prev, curr) => {
-    if (!prev) {
-      return curr;
-    }
-
+    if (!prev) return curr;
     return curr.avgSuccessRps > prev.avgSuccessRps ? curr : prev;
   }, null);
 
@@ -156,9 +199,22 @@ function printMarkdownTable(results, target) {
   console.log('### Sweet Spot');
   console.log('');
   console.log('```');
-  console.log(`Best Concurrency = ${best.concurrency}`);
-  console.log(`Best Avg Success RPS = ${best.avgSuccessRps.toFixed(2)}`);
-  console.log(`Success Rate = ${best.successRate.toFixed(2)}%`);
+
+  if (target === 'enqueue-only') {
+    console.log(`Best Concurrency = ${best.concurrency}`);
+    console.log(`Best Avg Success RPS = ${best.avgSuccessRps.toFixed(2)}`);
+    console.log(`Success Rate = ${best.successRate.toFixed(2)}%`);
+    console.log(`HTTP 429 = ${best.http429}`);
+    console.log(`HTTP 5xx = ${best.http5xx}`);
+    console.log(`Request Errors = ${best.requestErrors}`);
+  } else {
+    console.log(`Best Concurrency = ${best.concurrency}`);
+    console.log(`Best Avg Success RPS = ${best.avgSuccessRps.toFixed(2)}`);
+    console.log(`Success Rate = ${best.successRate.toFixed(2)}%`);
+    console.log(`Enqueue Failed = ${best.enqueueFailed}`);
+    console.log(`Request Errors = ${best.requestErrors}`);
+  }
+
   console.log('```');
   console.log('');
 }
@@ -172,10 +228,12 @@ async function main() {
   console.log(`TARGET=${TARGET}`);
   console.log(`SCRIPT=${targetScript}`);
   console.log(`API=${API}`);
+  console.log(`ACCOUNT_COUNT=${ACCOUNT_COUNT}`);
+  console.log(`INITIAL_BALANCE=${INITIAL_BALANCE}`);
   console.log(`MAX_ACCOUNT_ID=${MAX_ACCOUNT_ID}`);
   console.log(`DURATION_SECONDS=${DURATION_SECONDS}`);
   console.log(`AMOUNT=${AMOUNT}`);
-  console.log(`SHARD_COUNT=${process.env.SHARD_COUNT || 4}`);
+  console.log(`SHARD_COUNT=${SHARD_COUNT}`);
   console.log(`CONCURRENCY_LIST=${CONCURRENCY_LIST.join(', ')}`);
   console.log('');
 

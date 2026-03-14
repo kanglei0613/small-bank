@@ -212,12 +212,8 @@ class AccountsRepo {
       throw err;
     }
 
-    // 先查 account 所在 shard
-    const shardId = await this.getShardIdByAccountId(accountId);
-    if (shardId === null) {
-      return null;
-    }
-
+    // 直接依 accountId 計算 shard
+    const shardId = this.calcShardIdByAccountId(accountId);
     const shardPg = this.getShardPg(shardId);
 
     // 到對應 shard 查詢帳戶
@@ -258,15 +254,26 @@ class AccountsRepo {
       throw err;
     }
 
-    // 先查 account 所在 shard
-    const shardId = await this.getShardIdByAccountId(aid);
-    if (shardId === null) {
+    // 直接依 accountId 計算 shard
+    const shardId = this.calcShardIdByAccountId(aid);
+    const shardPg = this.getShardPg(shardId);
+
+    // 先確認帳戶是否存在
+    const accountExistsResult = await shardPg.query(
+      `
+        SELECT id
+        FROM accounts
+        WHERE id = $1
+        LIMIT 1
+      `,
+      [ aid ]
+    );
+
+    if (accountExistsResult.rowCount === 0) {
       const err = new Error('account not found');
       err.status = 404;
       throw err;
     }
-
-    const shardPg = this.getShardPg(shardId);
 
     const sql = `
       SELECT
@@ -313,21 +320,11 @@ class AccountsRepo {
       throw err;
     }
 
-    // 先查 from / to 各自所在 shard
-    const fromShardId = await this.getShardIdByAccountId(fromAccountId);
-    const toShardId = await this.getShardIdByAccountId(toAccountId);
-
-    if (fromShardId === null) {
-      const err = new Error(`account not found: ${fromAccountId}`);
-      err.status = 404;
-      throw err;
-    }
-
-    if (toShardId === null) {
-      const err = new Error(`account not found: ${toAccountId}`);
-      err.status = 404;
-      throw err;
-    }
+    // 直接依 accountId 計算 shard
+    // 目前 shard routing 規則固定為 accountId % shardCount
+    // 因此 transfer hot path 不再額外查 meta DB
+    const fromShardId = this.calcShardIdByAccountId(fromAccountId);
+    const toShardId = this.calcShardIdByAccountId(toAccountId);
 
     // same-shard 走單一 transaction
     if (fromShardId === toShardId) {
@@ -604,31 +601,9 @@ class AccountsRepo {
       await toClient.query('COMMIT');
       credited = true;
 
-      // Step 3-1: 回 from shard 先標記 CREDITED
-      await fromClient.query('BEGIN');
-      await fromClient.query("SET LOCAL lock_timeout = '200ms'");
-
-      const markCreditedResult = await fromClient.query(
-        `
-          UPDATE transfers
-          SET status = 'CREDITED',
-              updated_at = NOW()
-          WHERE id = $1
-            AND status = 'RESERVED'
-          RETURNING id
-        `,
-        [ transferId ]
-      );
-
-      if (markCreditedResult.rowCount === 0) {
-        const err = new Error('mark credited failed');
-        err.status = 500;
-        throw err;
-      }
-
-      await fromClient.query('COMMIT');
-
-      // Step 3-2: 回 from shard finalize
+      // Step 3: 回 from shard finalize
+      // 成功路徑直接從 RESERVED -> COMPLETED
+      // 不再額外做一次 CREDITED 中間狀態 transaction
       await fromClient.query('BEGIN');
       await fromClient.query("SET LOCAL lock_timeout = '200ms'");
 
@@ -669,14 +644,14 @@ class AccountsRepo {
         throw err;
       }
 
-      // 更新 transfer 狀態
+      // 直接把 transfer 從 RESERVED 標成 COMPLETED
       const completeResult = await fromClient.query(
         `
           UPDATE transfers
           SET status = 'COMPLETED',
               updated_at = NOW()
           WHERE id = $1
-            AND status = 'CREDITED'
+            AND status = 'RESERVED'
           RETURNING id
         `,
         [ transferId ]

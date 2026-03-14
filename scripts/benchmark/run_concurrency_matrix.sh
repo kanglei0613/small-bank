@@ -1,7 +1,7 @@
 #!/bin/bash
 
 echo "========================================"
-echo "Small Bank Concurrency Matrix Runner"
+echo "Small Bank Full Benchmark Runner"
 echo "========================================"
 echo ""
 
@@ -15,6 +15,11 @@ echo "----------------------------------------"
 TARGET=all-shards node scripts/benchmark/run_concurrency_matrix.js
 
 echo ""
+echo "Run enqueue-only matrix"
+echo "----------------------------------------"
+TARGET=enqueue-only node scripts/benchmark/run_concurrency_matrix.js
+
+echo ""
 echo "========================================"
-echo "Matrix Finished"
+echo "All Benchmarks Finished"
 echo "========================================"

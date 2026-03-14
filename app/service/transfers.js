@@ -165,17 +165,14 @@ class TransferService extends Service {
   //
   // 作用：
   // - Queue worker 呼叫
-  // - 更新 job 狀態
   // - 執行真正的 transfer
+  // - 更新 job 狀態
   //
   async processTransferJob(job) {
     const { app, logger } = this.ctx;
     const { jobId, fromId, toId, amount } = job;
 
     try {
-
-      await transferJobStore.markProcessing(app.redis, jobId);
-
       logger.info(
         '[TransferJob] processing: jobId=%s fromId=%s toId=%s amount=%s',
         jobId,
@@ -212,6 +209,127 @@ class TransferService extends Service {
       );
 
       throw err;
+    }
+  }
+
+  //
+  // sleep(ms)
+  //
+  // Queue worker 背景 loop 的簡單等待工具
+  //
+  async sleep(ms) {
+    await new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  //
+  // listActiveFromIds()
+  //
+  // 作用：
+  // - 從 Redis active queue set 讀出目前待處理的 fromId
+  // - 不再掃描整個 Redis keyspace
+  //
+  async listActiveFromIds() {
+    const { app } = this.ctx;
+
+    return await redisTransferQueue.getActiveFromIds(app.redis);
+  }
+
+  //
+  // tryDrainOneFromIdQueue(fromId)
+  //
+  // 作用：
+  // - 嘗試取得該 fromId queue 的 owner lock
+  // - 若成功，開始 drain queue
+  // - 若失敗，表示已有其他 worker 正在處理
+  //
+  async tryDrainOneFromIdQueue(fromId) {
+    const { logger } = this.ctx;
+
+    const drained = await redisTransferQueue.tryStartDrain({
+      ctx: this.ctx,
+      fromId,
+      handler: async job => {
+        await this.processTransferJob(job);
+      },
+    });
+
+    if (drained) {
+      logger.info(
+        '[QueueWorker] drain finished: fromId=%s',
+        fromId
+      );
+    }
+
+    return drained;
+  }
+
+  //
+  // startQueueWorker()
+  //
+  // 作用：
+  // - queue role 啟動後進入背景 loop
+  // - 持續讀取 active queue set
+  // - 對每個 fromId 嘗試取得 owner 並 drain
+  //
+  // 注意：
+  // - 同一個 fromId 只會有一個 owner
+  // - 多個 queue worker process 可以同時存在
+  // - owner lock 會保證同一條 queue 不會被多個 process 同時 drain
+  //
+  async startQueueWorker() {
+    const { app, logger } = this.ctx;
+
+    const workerConfig = app.config.transferQueue || {};
+    const idleSleepMs = Number(workerConfig.workerIdleSleepMs || 200);
+    const errorSleepMs = Number(workerConfig.workerErrorSleepMs || 1000);
+
+    logger.info(
+      '[QueueWorker] started: pid=%s idleSleepMs=%s errorSleepMs=%s',
+      process.pid,
+      idleSleepMs,
+      errorSleepMs
+    );
+
+    // 背景 loop
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      try {
+        const fromIds = await this.listActiveFromIds();
+
+        if (fromIds.length === 0) {
+          await this.sleep(idleSleepMs);
+          continue;
+        }
+
+        logger.info(
+          '[QueueWorker] active queues found: count=%s fromIds=%j',
+          fromIds.length,
+          fromIds
+        );
+
+        for (const fromId of fromIds) {
+          try {
+            await this.tryDrainOneFromIdQueue(fromId);
+          } catch (err) {
+            logger.error(
+              '[QueueWorker] drain error: fromId=%s err=%s',
+              fromId,
+              err && (err.stack || err.message)
+            );
+          }
+        }
+
+        // 避免空轉過快
+        await this.sleep(idleSleepMs);
+
+      } catch (err) {
+        logger.error(
+          '[QueueWorker] loop error: %s',
+          err && (err.stack || err.message)
+        );
+
+        await this.sleep(errorSleepMs);
+      }
     }
   }
 

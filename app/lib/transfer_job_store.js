@@ -79,13 +79,6 @@ async function updateJob(redis, jobId, patch) {
   return nextJob;
 }
 
-// 將 job 標記為 processing
-async function markProcessing(redis, jobId) {
-  return await updateJob(redis, jobId, {
-    status: 'processing',
-  });
-}
-
 // 將 job 標記為 success
 async function markSuccess(redis, jobId, result) {
   return await updateJob(redis, jobId, {
@@ -111,7 +104,6 @@ module.exports = {
   buildJobKey,
   getJob,
   createJob,
-  markProcessing,
   markSuccess,
   markFailed,
 };
