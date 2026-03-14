@@ -28,7 +28,7 @@ const Redis = require('ioredis');
 
 // PostgreSQL connection
 const pgClient = new Client({
-  host: '192.168.10.196',
+  host: '127.0.0.1',
   port: 5432,
   user: 'kanglei0613',
   password: '',
@@ -37,7 +37,7 @@ const pgClient = new Client({
 
 // Redis connection
 const redis = new Redis({
-  host: '192.168.10.196',
+  host: '127.0.0.1',
   port: 6379,
   password: '',
   db: 0,
