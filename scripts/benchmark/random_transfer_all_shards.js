@@ -191,6 +191,15 @@ async function runOneTransfer(stats) {
         stats.insufficientFunds += 1;
       } else {
         stats.otherBusinessFailed += 1;
+
+        const key = errorMessage || 'unknown';
+
+        if (!stats.businessErrorMessages) {
+          stats.businessErrorMessages = {};
+        }
+
+        stats.businessErrorMessages[key] =
+          (stats.businessErrorMessages[key] || 0) + 1;
       }
     }
 
@@ -303,6 +312,18 @@ async function main() {
   console.log('========================================');
   console.log('Benchmark Finished');
   console.log('========================================');
+
+  console.log('');
+  console.log('Business Error Messages');
+  console.log('----------------------------------------');
+
+  const businessErrorMessages = stats.businessErrorMessages || {};
+  const sortedBusinessErrors = Object.entries(businessErrorMessages)
+    .sort((a, b) => b[1] - a[1]);
+
+  for (const [ message, count ] of sortedBusinessErrors) {
+    console.log(`${message}: ${count}`);
+  }
 
   // benchmark 結束時關閉 keep-alive agent
   httpAgent.destroy();

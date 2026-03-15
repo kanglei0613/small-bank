@@ -1,3 +1,4 @@
+// lib/redis_transfer_queue.js
 'use strict';
 
 // Redis Transfer Queue
@@ -8,15 +9,6 @@
 // - 使用 active queue set 記錄目前有待處理 queue 的 fromId
 // - drain 時依序取出 job
 // - 呼叫 handler(job) 執行真正的 transfer job
-//
-// queue key 範例：
-// transfer:queue:from:6
-//
-// owner key 範例：
-// transfer:queue:owner:from:6
-//
-// active queue set key 範例：
-// transfer:queue:active:fromIds
 
 // 建立 queue key
 function buildQueueKey(fromId) {
@@ -34,7 +26,6 @@ function buildActiveQueueSetKey() {
 }
 
 // 建立 owner value
-// 用 pid + 時間 + 隨機字串，避免不同 worker 混淆
 function buildOwnerValue() {
   return `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
@@ -73,10 +64,6 @@ async function getActiveFromIds(redis) {
 }
 
 // 將 job push 進 queue
-//
-// 注意：
-// - 使用 Lua script 確保「檢查 queue 長度 + push + active set」是原子操作
-// - 先做 admission control，再做 hard limit
 async function pushJob(redis, fromId, job, options = {}) {
   const queueKey = buildQueueKey(fromId);
   const activeQueueSetKey = buildActiveQueueSetKey();
@@ -92,12 +79,10 @@ async function pushJob(redis, fromId, job, options = {}) {
     local payload = ARGV[3]
     local fromId = ARGV[4]
 
-    -- admission control：提早拒絕
     if currentLength >= rejectThreshold then
       return -2
     end
 
-    -- hard limit：最終上限
     if currentLength >= maxLength then
       return -1
     end
@@ -119,7 +104,6 @@ async function pushJob(redis, fromId, job, options = {}) {
     String(fromId)
   );
 
-  // admission control：提早拒絕
   if (result === -2) {
     const err = new Error('queue admission rejected');
     err.status = 429;
@@ -127,7 +111,6 @@ async function pushJob(redis, fromId, job, options = {}) {
     throw err;
   }
 
-  // hard limit：queue 已滿
   if (result === -1) {
     const err = new Error('queue is full for this account');
     err.status = 429;
@@ -140,32 +123,38 @@ async function pushJob(redis, fromId, job, options = {}) {
 
 // 從 queue 左邊取出一筆 job
 async function popJob(redis, fromId) {
-  const queueKey = buildQueueKey(fromId);
-  const raw = await redis.lpop(queueKey);
-
-  if (!raw) {
-    return null;
-  }
-
-  return JSON.parse(raw);
+  const jobs = await popJobs(redis, fromId, 1);
+  return jobs[0] || null;
 }
 
-// 從 queue 左邊批次取出多筆 job
+// 使用 Lua 一次批次取出多筆 job
 async function popJobs(redis, fromId, batchSize) {
   const queueKey = buildQueueKey(fromId);
-  const jobs = [];
 
-  for (let i = 0; i < batchSize; i++) {
-    const raw = await redis.lpop(queueKey);
+  const lua = `
+    local n = tonumber(ARGV[1])
+    local values = redis.call("LRANGE", KEYS[1], 0, n - 1)
 
-    if (!raw) {
-      break;
-    }
+    if #values == 0 then
+      return values
+    end
 
-    jobs.push(JSON.parse(raw));
+    redis.call("LTRIM", KEYS[1], n, -1)
+    return values
+  `;
+
+  const raws = await redis.eval(
+    lua,
+    1,
+    queueKey,
+    String(batchSize)
+  );
+
+  if (!raws || raws.length === 0) {
+    return [];
   }
 
-  return jobs;
+  return raws.map(raw => JSON.parse(raw));
 }
 
 // 取得 queue 長度
@@ -293,12 +282,6 @@ function startOwnerHeartbeat({ ctx, fromId, ownerValue, options = {} }) {
           fromId,
           ownerValue
         );
-      } else {
-        logger.info(
-          '[RedisQueue] owner heartbeat refreshed: fromId=%s owner=%s',
-          fromId,
-          ownerValue
-        );
       }
     } catch (err) {
       logger.error(
@@ -331,6 +314,17 @@ async function drainQueue({ ctx, fromId, handler, ownerValue, options = {} }) {
   const ownerRefreshIntervalMs = options.ownerRefreshIntervalMs || 3000;
   const batchSize = options.batchSize || 5;
 
+  // 整個 drain 只開一個 heartbeat，不要每筆 job 都開一個 timer
+  const heartbeat = startOwnerHeartbeat({
+    ctx,
+    fromId,
+    ownerValue,
+    options: {
+      ownerTtlMs,
+      ownerRefreshIntervalMs,
+    },
+  });
+
   try {
     let shouldContinue = true;
 
@@ -357,7 +351,6 @@ async function drainQueue({ ctx, fromId, handler, ownerValue, options = {} }) {
           fromId
         );
 
-        // queue 已經空了，從 active queue set 移除
         await removeActiveFromId(redis, fromId);
 
         shouldContinue = false;
@@ -377,16 +370,6 @@ async function drainQueue({ ctx, fromId, handler, ownerValue, options = {} }) {
           job.jobId
         );
 
-        const heartbeat = startOwnerHeartbeat({
-          ctx,
-          fromId,
-          ownerValue,
-          options: {
-            ownerTtlMs,
-            ownerRefreshIntervalMs,
-          },
-        });
-
         try {
           await handler(job);
         } catch (err) {
@@ -396,12 +379,12 @@ async function drainQueue({ ctx, fromId, handler, ownerValue, options = {} }) {
             job.jobId,
             err && err.message
           );
-        } finally {
-          heartbeat.stop();
         }
       }
     }
   } finally {
+    heartbeat.stop();
+
     await releaseOwner(redis, fromId, ownerValue);
 
     logger.info(

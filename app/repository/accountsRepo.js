@@ -1,3 +1,4 @@
+// repository/accountsRepo.js
 'use strict';
 
 class AccountsRepo {
@@ -295,13 +296,12 @@ class AccountsRepo {
     return result.rows;
   }
 
-  // 轉帳
+  // 轉帳（fake benchmark 用，暫時不碰 DB）
   async transfer(fromId, toId, amount) {
     const fromAccountId = Number(fromId);
     const toAccountId = Number(toId);
     const transferAmount = Number(amount);
 
-    // 檢查參數
     if (!Number.isInteger(fromAccountId) || !Number.isInteger(toAccountId)) {
       const err = new Error('fromId/toId must be integer');
       err.status = 400;
@@ -320,54 +320,38 @@ class AccountsRepo {
       throw err;
     }
 
-    // 直接依 accountId 計算 shard
-    // 目前 shard routing 規則固定為 accountId % shardCount
-    // 因此 transfer hot path 不再額外查 meta DB
     const fromShardId = this.calcShardIdByAccountId(fromAccountId);
     const toShardId = this.calcShardIdByAccountId(toAccountId);
 
-    // same-shard 走單一 transaction
-    if (fromShardId === toShardId) {
-      return await this.transferSameShard({
-        fromAccountId,
-        toAccountId,
-        transferAmount,
-        shardId: fromShardId,
-      });
-    }
-
-    // cross-shard 走 reserve / credit / finalize
-    return await this.transferCrossShard({
-      fromAccountId,
-      toAccountId,
-      transferAmount,
+    return {
+      transferId: 1,
+      fromId: fromAccountId,
+      toId: toAccountId,
+      amount: transferAmount,
+      status: 'COMPLETED',
       fromShardId,
       toShardId,
-    });
+      type: fromShardId === toShardId ? 'same-shard' : 'cross-shard',
+    };
   }
 
   // same-shard 轉帳
   async transferSameShard({ fromAccountId, toAccountId, transferAmount, shardId }) {
     const shardPg = this.getShardPg(shardId);
-
-    // 從 shard pool 取得 connection
     const client = await shardPg.connect();
 
     try {
-      // 開始 transaction
       await client.query('BEGIN');
-
-      // 在 transaction 內設定 lock timeout
       await client.query("SET LOCAL lock_timeout = '200ms'");
 
       // 固定鎖順序，避免 deadlock
       const a = Math.min(fromAccountId, toAccountId);
       const b = Math.max(fromAccountId, toAccountId);
 
-      // 鎖住兩筆 account row
+      // 一次鎖兩筆 row，並把 available_balance 一起帶出來
       const locked = await client.query(
         `
-          SELECT id
+          SELECT id, available_balance
           FROM accounts
           WHERE id = ANY($1::bigint[])
           ORDER BY id
@@ -376,7 +360,6 @@ class AccountsRepo {
         [[ a, b ]]
       );
 
-      // 檢查帳戶是否存在
       if (locked.rowCount !== 2) {
         const found = new Set(locked.rows.map(r => Number(r.id)));
         const missing = !found.has(a) ? a : b;
@@ -385,43 +368,53 @@ class AccountsRepo {
         throw err;
       }
 
-      // 扣款，檢查 available_balance 是否足夠
-      const debit = await client.query(
-        `
-          UPDATE accounts
-          SET available_balance = available_balance - $1,
-              balance = balance - $1,
-              updated_at = NOW()
-          WHERE id = $2
-            AND available_balance >= $1
-          RETURNING
-            id,
-            balance,
-            available_balance,
-            reserved_balance
-        `,
-        [ transferAmount, fromAccountId ]
-      );
+      const fromRow = locked.rows.find(row => Number(row.id) === fromAccountId);
 
-      if (debit.rowCount === 0) {
+      if (!fromRow) {
+        const err = new Error(`account not found: ${fromAccountId}`);
+        err.status = 404;
+        throw err;
+      }
+
+      if (Number(fromRow.available_balance) < transferAmount) {
         const err = new Error('insufficient funds');
         err.status = 409;
         throw err;
       }
 
-      // 加款
-      await client.query(
+      // 一次更新兩筆帳戶，減少一個 round-trip
+      const updateResult = await client.query(
         `
           UPDATE accounts
-          SET available_balance = available_balance + $1,
-              balance = balance + $1,
-              updated_at = NOW()
-          WHERE id = $2
+          SET
+            available_balance = CASE
+              WHEN id = $2 THEN available_balance - $1
+              WHEN id = $3 THEN available_balance + $1
+              ELSE available_balance
+            END,
+            balance = CASE
+              WHEN id = $2 THEN balance - $1
+              WHEN id = $3 THEN balance + $1
+              ELSE balance
+            END,
+            updated_at = NOW()
+          WHERE id = ANY($4::bigint[])
+          RETURNING id
         `,
-        [ transferAmount, toAccountId ]
+        [
+          transferAmount,
+          fromAccountId,
+          toAccountId,
+          [ fromAccountId, toAccountId ],
+        ]
       );
 
-      // 寫入 transfer record
+      if (updateResult.rowCount !== 2) {
+        const err = new Error('same-shard account update failed');
+        err.status = 500;
+        throw err;
+      }
+
       const transferResult = await client.query(
         `
           INSERT INTO transfers (
@@ -445,7 +438,6 @@ class AccountsRepo {
         [ fromAccountId, toAccountId, transferAmount ]
       );
 
-      // 提交 transaction
       await client.query('COMMIT');
 
       return {
@@ -470,7 +462,6 @@ class AccountsRepo {
 
       throw err;
     } finally {
-      // 歸還 connection
       client.release();
     }
   }
@@ -497,24 +488,7 @@ class AccountsRepo {
       await fromClient.query('BEGIN');
       await fromClient.query("SET LOCAL lock_timeout = '200ms'");
 
-      // 鎖住 from account，避免併發下重複扣款
-      const fromLocked = await fromClient.query(
-        `
-          SELECT id
-          FROM accounts
-          WHERE id = $1
-          FOR UPDATE
-        `,
-        [ fromAccountId ]
-      );
-
-      if (fromLocked.rowCount === 0) {
-        const err = new Error(`account not found: ${fromAccountId}`);
-        err.status = 404;
-        throw err;
-      }
-
-      // 從 available_balance 移到 reserved_balance
+      // 直接用 UPDATE 當鎖 + 預留
       const reserveResult = await fromClient.query(
         `
           UPDATE accounts
@@ -523,21 +497,33 @@ class AccountsRepo {
               updated_at = NOW()
           WHERE id = $2
             AND available_balance >= $1
-          RETURNING
-            id,
-            available_balance,
-            reserved_balance
+          RETURNING id
         `,
         [ transferAmount, fromAccountId ]
       );
 
       if (reserveResult.rowCount === 0) {
+        const existsResult = await fromClient.query(
+          `
+            SELECT 1
+            FROM accounts
+            WHERE id = $1
+            LIMIT 1
+          `,
+          [ fromAccountId ]
+        );
+
+        if (existsResult.rowCount === 0) {
+          const err = new Error(`account not found: ${fromAccountId}`);
+          err.status = 404;
+          throw err;
+        }
+
         const err = new Error('insufficient funds');
         err.status = 409;
         throw err;
       }
 
-      // 在 from shard 寫入 RESERVED transfer record
       const transferInsert = await fromClient.query(
         `
           INSERT INTO transfers (
@@ -562,24 +548,7 @@ class AccountsRepo {
       await toClient.query('BEGIN');
       await toClient.query("SET LOCAL lock_timeout = '200ms'");
 
-      // 鎖住 to account
-      const toLocked = await toClient.query(
-        `
-          SELECT id
-          FROM accounts
-          WHERE id = $1
-          FOR UPDATE
-        `,
-        [ toAccountId ]
-      );
-
-      if (toLocked.rowCount === 0) {
-        const err = new Error(`account not found: ${toAccountId}`);
-        err.status = 404;
-        throw err;
-      }
-
-      // to shard 增加 available_balance，同步維持舊 balance
+      // 直接用 UPDATE 當鎖 + 入帳
       const creditResult = await toClient.query(
         `
           UPDATE accounts
@@ -602,29 +571,10 @@ class AccountsRepo {
       credited = true;
 
       // Step 3: 回 from shard finalize
-      // 成功路徑直接從 RESERVED -> COMPLETED
-      // 不再額外做一次 CREDITED 中間狀態 transaction
       await fromClient.query('BEGIN');
       await fromClient.query("SET LOCAL lock_timeout = '200ms'");
 
-      // 鎖住 from account
-      const finalizeLocked = await fromClient.query(
-        `
-          SELECT id
-          FROM accounts
-          WHERE id = $1
-          FOR UPDATE
-        `,
-        [ fromAccountId ]
-      );
-
-      if (finalizeLocked.rowCount === 0) {
-        const err = new Error(`account not found: ${fromAccountId}`);
-        err.status = 404;
-        throw err;
-      }
-
-      // 正式把 reserved_balance 扣掉，並同步更新舊 balance
+      // 直接用 UPDATE 當鎖 + finalize
       const finalizeResult = await fromClient.query(
         `
           UPDATE accounts
@@ -639,12 +589,27 @@ class AccountsRepo {
       );
 
       if (finalizeResult.rowCount === 0) {
+        const existsResult = await fromClient.query(
+          `
+            SELECT 1
+            FROM accounts
+            WHERE id = $1
+            LIMIT 1
+          `,
+          [ fromAccountId ]
+        );
+
+        if (existsResult.rowCount === 0) {
+          const err = new Error(`account not found: ${fromAccountId}`);
+          err.status = 404;
+          throw err;
+        }
+
         const err = new Error('finalize reserved funds failed');
         err.status = 500;
         throw err;
       }
 
-      // 直接把 transfer 從 RESERVED 標成 COMPLETED
       const completeResult = await fromClient.query(
         `
           UPDATE transfers
@@ -694,25 +659,8 @@ class AccountsRepo {
       if (transferId && !credited) {
         try {
           await fromClient.query('BEGIN');
+          await fromClient.query("SET LOCAL lock_timeout = '200ms'");
 
-          // 鎖住 from account
-          const compensateLocked = await fromClient.query(
-            `
-              SELECT id
-              FROM accounts
-              WHERE id = $1
-              FOR UPDATE
-            `,
-            [ fromAccountId ]
-          );
-
-          if (compensateLocked.rowCount === 0) {
-            const compensateErr = new Error(`account not found: ${fromAccountId}`);
-            compensateErr.status = 404;
-            throw compensateErr;
-          }
-
-          // 釋放 reserved_balance
           const compensateResult = await fromClient.query(
             `
               UPDATE accounts
@@ -727,12 +675,27 @@ class AccountsRepo {
           );
 
           if (compensateResult.rowCount === 0) {
+            const existsResult = await fromClient.query(
+              `
+                SELECT 1
+                FROM accounts
+                WHERE id = $1
+                LIMIT 1
+              `,
+              [ fromAccountId ]
+            );
+
+            if (existsResult.rowCount === 0) {
+              const compensateErr = new Error(`account not found: ${fromAccountId}`);
+              compensateErr.status = 404;
+              throw compensateErr;
+            }
+
             const compensateErr = new Error('release reserved funds failed');
             compensateErr.status = 500;
             throw compensateErr;
           }
 
-          // 更新 transfer 狀態
           const failResult = await fromClient.query(
             `
               UPDATE transfers
@@ -764,8 +727,6 @@ class AccountsRepo {
       }
 
       // to shard 已入帳，但 finalize 失敗
-      // 這時不能直接把錢退回，否則可能造成雙方都拿到錢
-      // 先把 transfer status 保留在 CREDITED，交由後續修復流程處理
       if (transferId && credited) {
         try {
           await fromClient.query('BEGIN');

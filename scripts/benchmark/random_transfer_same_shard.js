@@ -28,7 +28,7 @@ const API = process.env.API || 'http://127.0.0.1:7001';
 const API_URL = `${API}/transfers`;
 
 const MAX_ACCOUNT_ID = Number(process.env.MAX_ACCOUNT_ID || 1000);
-const CONCURRENCY = Number(process.env.CONCURRENCY || 200);
+const CONCURRENCY = Number(process.env.CONCURRENCY || 300);
 const DURATION_SECONDS = Number(process.env.DURATION_SECONDS || 30);
 const AMOUNT = Number(process.env.AMOUNT || 1);
 
@@ -40,7 +40,9 @@ const JOB_POLL_TIMEOUT_MS = Number(process.env.JOB_POLL_TIMEOUT_MS || 10000);
 // HTTP keep-alive agent
 const httpAgent = new http.Agent({
   keepAlive: true,
-  maxSockets: 1000,
+  maxSockets: Math.max(CONCURRENCY * 4, 256),
+  maxFreeSockets: 128,
+  keepAliveMsecs: 1000,
 });
 
 // axios instance
