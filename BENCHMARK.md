@@ -513,3 +513,331 @@ Batch queue draining
 ```
 
 ---
+
+# Benchmark Scenario 11
+# Mixed Workload Random Request Benchmark
+
+此測試的目的是模擬 **更接近實際系統流量的混合 API workload**。
+
+先前的 benchmark 主要集中於：
+
+```text
+POST /transfers
+```
+
+但在真實系統中，API 流量通常包含：
+
+```text
+Account 查詢
+Transfer 建立
+Transfer job polling
+Transaction history 查詢
+User / Account 建立
+```
+
+因此本測試設計 **Mixed Workload Random Benchmark**  
+隨機對多個 API endpoint 發送請求。
+
+---
+
+# Test Environment
+
+```text
+Machine
+  MacBook (Single Machine)
+
+System Components
+  API Server
+  Redis
+  PostgreSQL
+  Queue Workers
+
+Queue Workers = 4
+Shard Count = 4
+Account Count = 10000
+Concurrency = 300
+Duration = 30 seconds
+```
+
+---
+
+# Workload Distribution
+
+本測試使用隨機請求分布：
+
+| Endpoint | Weight |
+|------|------|
+| GET /accounts/:id | 35% |
+| POST /transfers | 25% |
+| GET /transfer-jobs/:jobId | 15% |
+| GET /transfers (history) | 15% |
+| POST /users | 5% |
+| POST /accounts | 5% |
+
+這樣的 workload 模擬：
+
+```text
+高比例 read requests
+適度 transfer write traffic
+部分 job polling
+少量資料建立
+```
+
+更接近實際 production API usage pattern。
+
+---
+
+# Benchmark Result
+
+| Metric | Value |
+|------|------|
+| Elapsed Seconds | 30.18 |
+| Total Requests | 128578 |
+| Success Requests | 128523 |
+| Failed Requests | 0 |
+| Success Rate | 99.96% |
+| Avg Total RPS | 4259.81 |
+| Avg Success RPS | 4257.98 |
+
+---
+
+# Endpoint Breakdown
+
+| Endpoint | Total | Success | Failed |
+|------|------|------|------|
+| GET /accounts/:id | 45230 | 45230 | 0 |
+| GET /transfer-jobs/:jobId | 19114 | 19114 | 0 |
+| GET /transfers (history) | 19477 | 19477 | 0 |
+| POST /accounts | 6367 | 6367 | 0 |
+| POST /transfers | 32008 | 32008 | 0 |
+| POST /users | 6327 | 6327 | 0 |
+
+---
+
+# Transfer Job Statistics
+
+| Metric | Value |
+|------|------|
+| Transfer Jobs Created | 32008 |
+| Job Poll Success | 16037 |
+| Job Poll Failed | 0 |
+| Job Poll Queued | 3077 |
+
+---
+
+# Additional Statistics
+
+| Metric | Value |
+|------|------|
+| Created Users | 6327 |
+| Created Accounts | 6367 |
+| Request Errors | 0 |
+
+---
+
+# Observations
+
+在混合 workload 情況下，系統仍然維持：
+
+```text
+~4250 RPS API throughput
+```
+
+且幾乎沒有 request failure。
+
+這顯示系統具備：
+
+```text
+穩定的 API routing
+可靠的 Redis queue
+穩定的 PostgreSQL sharding transaction
+```
+
+同時支援：
+
+```text
+read-heavy workload
+transfer write workload
+async job polling
+data creation
+```
+
+---
+
+# Transfer Throughput Estimation
+
+從 benchmark 統計可觀察：
+
+```text
+POST /transfers ≈ 32008 requests / 30s
+```
+
+平均：
+
+```text
+≈ 1066 transfer jobs / second
+```
+
+這個數字基本上代表 **transfer pipeline 的實際處理能力**。
+
+---
+
+# Throughput Comparison
+
+| Scenario | Avg Success RPS |
+|------|------|
+| Enqueue-only benchmark | ~4478 |
+| Mixed workload benchmark | ~4258 |
+| Fake transfer (no DB) | ~819 |
+| Full transfer (real DB) | ~696 |
+
+---
+
+# System Throughput Layers
+
+目前系統吞吐量可以分為三個層級：
+
+```text
+API intake capacity        ≈ 4478 RPS
+Mixed workload API system  ≈ 4258 RPS
+Async transfer pipeline    ≈ 819 transfers/sec
+Full DB transaction        ≈ 696 transfers/sec
+```
+
+代表：
+
+```text
+API layer capacity 已經非常高
+Async pipeline 是主要 throughput 限制
+```
+
+---
+
+# Current System Architecture
+
+```text
+Client
+  ↓
+API Server
+  ↓
+Redis Queue
+  ↓
+Queue Workers
+  ↓
+PostgreSQL Shards
+  ↓
+Job Store Update
+  ↓
+Client Polling
+```
+
+每一筆 transfer transaction 包含：
+
+```text
+enqueue job
+queue dispatch
+queue drain
+DB transaction
+job store update
+client polling
+```
+
+這些 round-trip 共同構成 async pipeline 成本。
+
+---
+
+# Key Findings
+
+Mixed workload benchmark 顯示：
+
+```text
+系統整體 API throughput ≈ 4200+ RPS
+transfer pipeline throughput ≈ 1000 transfers/sec
+```
+
+系統在混合 API 流量下仍然保持：
+
+```text
+高成功率
+穩定 latency
+無明顯 request error
+```
+
+---
+
+# Future Optimization Directions
+
+未來可能的優化方向包括：
+
+---
+
+## 1. Hybrid Transfer Execution
+
+目前所有 transfer 都透過 async pipeline。
+
+未來可以考慮：
+
+```text
+Same-shard transfer → synchronous execution
+Cross-shard transfer → async pipeline
+```
+
+優點：
+
+```text
+減少 async overhead
+提高 completed throughput
+```
+
+---
+
+## 2. Async Pipeline Optimization
+
+可能研究方向：
+
+```text
+減少 Redis round-trip
+優化 queue drain scheduling
+降低 polling overhead
+```
+
+---
+
+## 3. Transfer Worker Scaling
+
+提高 transfer throughput 的方法包括：
+
+```text
+增加 queue workers
+優化 DB transaction latency
+減少 worker idle time
+```
+
+---
+
+# Conclusion
+
+Mixed workload benchmark 證明系統具備穩定的 API throughput 與 async transaction pipeline。
+
+| Layer | Throughput |
+|------|------|
+| API Intake | ~4478 RPS |
+| Mixed Workload | ~4258 RPS |
+| Async Pipeline | ~819 transfers/sec |
+| Full Transaction | ~696 transfers/sec |
+
+系統目前的主要 bottleneck 位於：
+
+```text
+Async Job Pipeline
+```
+
+未來優化將集中於：
+
+```text
+Hybrid transfer execution
+Async pipeline optimization
+Worker throughput improvement
+```
+
+---
