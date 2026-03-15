@@ -296,12 +296,12 @@ class AccountsRepo {
     return result.rows;
   }
 
-  // 轉帳（fake benchmark 用，暫時不碰 DB）
   async transfer(fromId, toId, amount) {
     const fromAccountId = Number(fromId);
     const toAccountId = Number(toId);
     const transferAmount = Number(amount);
 
+    // 檢查參數
     if (!Number.isInteger(fromAccountId) || !Number.isInteger(toAccountId)) {
       const err = new Error('fromId/toId must be integer');
       err.status = 400;
@@ -320,19 +320,28 @@ class AccountsRepo {
       throw err;
     }
 
+    // 計算 shard
     const fromShardId = this.calcShardIdByAccountId(fromAccountId);
     const toShardId = this.calcShardIdByAccountId(toAccountId);
 
-    return {
-      transferId: 1,
-      fromId: fromAccountId,
-      toId: toAccountId,
-      amount: transferAmount,
-      status: 'COMPLETED',
+    // same shard
+    if (fromShardId === toShardId) {
+      return await this.transferSameShard({
+        fromAccountId,
+        toAccountId,
+        transferAmount,
+        shardId: fromShardId,
+      });
+    }
+
+    // cross shard
+    return await this.transferCrossShard({
+      fromAccountId,
+      toAccountId,
+      transferAmount,
       fromShardId,
       toShardId,
-      type: fromShardId === toShardId ? 'same-shard' : 'cross-shard',
-    };
+    });
   }
 
   // same-shard 轉帳
