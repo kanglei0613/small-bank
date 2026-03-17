@@ -1,610 +1,1096 @@
-# Small Bank (Node.js / Egg.js + PostgreSQL + Redis)
+# Small Bank
 
-## 專案說明
+一個以 **Node.js + Egg.js + PostgreSQL + Redis** 實作的高併發銀行系統實驗專案。  
+本專案的重點不只是 CRUD API，而是針對 **高併發轉帳、Sharding、Async Queue、Worker 分離、Benchmark 調校** 進行系統化設計與驗證。
 
-本專案實作一個簡化版銀行系統（Small Bank），使用：
+目前系統已具備：
 
-- Node.js
-- Egg.js
-- PostgreSQL
-- Redis
-
-本專案的重點在於探索 **高併發轉帳系統的設計與優化**，包含：
-
-- Transaction + Row-level Lock
-- Redis queue-based transfer architecture
-- Admission control（避免系統過載）
-- Batch queue processing
-- Queue metrics
-- Benchmark-driven performance testing
-
-系統主要功能：
-
-- 建立使用者
-- 建立帳戶
-- 查詢帳戶餘額
-- 轉帳
-- 查詢轉帳紀錄
-- 高併發壓力測試
+```text
+- PostgreSQL Sharding（4 shards）
+- Redis Transfer Queue
+- Same-Shard Fast Path
+- Cross-Shard Async Pipeline
+- General API / Transfer API / Queue Worker 分離
+- Account Redis Cache
+- 多組 Benchmark 與 Worker Scaling 實驗
+```
 
 ---
 
-# 系統架構
+# 專案目標
 
-## High Level Architecture
+本專案的主要目標是驗證在單機環境下，如何透過：
 
+```text
+Sharding
+Async Queue
+Worker Role Separation
+Same-Shard Fast Path
+Cross-Shard Transaction Design
 ```
+
+提升系統在高併發 transfer workload 下的吞吐量與穩定性。
+
+重點不只是：
+
+```text
+能不能接住很多 request
+```
+
+而是：
+
+```text
+1. request intake throughput 能到多少
+2. 真正 completed transfer throughput 能到多少
+3. bottleneck 在哪一層
+4. 什麼 worker 配比最合理
+```
+
+---
+
+# 系統架構總覽
+
+目前系統採用單機多角色分離架構：
+
+```text
 Client
    │
-   ▼
-HTTP API (Egg.js)
+   ├── General API (Port 7001)
+   │      - Users API
+   │      - Accounts API
+   │      - Transfer History API
+   │      - Transfer Job Query API
+   │      - Queue Stats API
+   │      - Benchmark APIs
    │
-   │ enqueue transfer job
-   ▼
-Redis Transfer Queue
-   │
-   ▼
-Queue Worker (Background)
-   │
-   ▼
-PostgreSQL
-(Transaction + Row-level Lock)
-```
-
-設計目標：
-
-在高併發情境下減少 **資料庫 lock contention**，並提升系統吞吐量。
-
----
-
-## Architecture Diagram
-
-```
-                +-------------+
-                |   Client    |
-                +-------------+
-                       │
-                       ▼
-              +------------------+
-              |   Egg.js API     |
-              |   (Cluster x8)   |
-              +------------------+
-                       │
-                       │ enqueue transfer job
-                       ▼
-               +----------------+
-               | Redis Transfer |
-               |     Queue      |
-               +----------------+
-                       │
-                       ▼
-               +----------------+
-               | Queue Workers  |
-               |  (Batch Drain) |
-               +----------------+
-                       │
-                       ▼
-               +----------------+
-               |  PostgreSQL    |
-               | Transactions + |
-               | Row-level Lock |
-               +----------------+
-```
-
-系統將流程拆成三個階段：
-
-```
-API 接收請求
-        ↓
-Redis Queue 緩衝請求
-        ↓
-Worker 執行轉帳
-        ↓
-PostgreSQL Transaction
-```
-
-這樣可以避免 API worker 在高併發時被資料庫 transaction block。
-
----
-
-# 為什麼使用 Queue 架構
-
-如果 API 直接執行轉帳：
-
-```
-API → PostgreSQL → Transaction
-```
-
-在高併發下可能出現：
-
-- row-level lock 競爭
-- API worker 被 transaction block
-- throughput 不穩定
-- latency 上升
-
-因此改為：
-
-```
-API → Redis Queue → Worker → DB
-```
-
-角色分工如下：
-
-| 元件 | 職責 |
-|-----|-----|
-| API Worker | 接收 request，建立 transfer job |
-| Redis Queue | 暫存轉帳任務 |
-| Queue Worker | 背景執行轉帳 |
-| PostgreSQL | 保證資料一致性 |
-
-優點：
-
-- 減少 DB lock contention
-- 平滑處理高併發流量
-- 提升系統穩定度
-- 提高 sustained throughput
-
----
-
-# Concurrency Control Strategy
-
-轉帳系統最大的挑戰是 **併發一致性（Concurrency + Consistency）**。
-
-本系統採用三層策略：
-
----
-
-## 1️⃣ PostgreSQL Transaction + Row-level Lock
-
-每筆轉帳使用：
-
-```
-BEGIN
-SELECT ... FOR UPDATE
-UPDATE balance
-INSERT transfer record
-COMMIT
-```
-
-Row-level lock 確保：
-
-- 同一帳戶餘額不會被同時修改
-- 轉帳具有原子性
-- 資料一致性
-
----
-
-## 2️⃣ Redis Queue Serialization
-
-Redis queue 將同一帳戶的轉帳 **序列化處理**。
-
-例如：
-
-```
-transfer:queue:from:6
-```
-
-所有 `fromId = 6` 的轉帳會排入同一 queue：
-
-```
-transfer1
-transfer2
-transfer3
-```
-
-Worker 會依序處理。
-
-好處：
-
-- 避免 DB lock 競爭
-- 減少 transaction 衝突
-- 提升 throughput
-
----
-
-## 3️⃣ Admission Control
-
-為避免 queue 過長導致系統過載：
-
-```
-maxQueueLengthPerFromId
-```
-
-當 queue 超過 threshold：
-
-```
-API 會直接拒絕 request
-```
-
-好處：
-
-- 保護資料庫
-- 防止系統雪崩
-- 維持穩定吞吐
-
----
-
-# Transfer Flow
-
-## Step 1：Client 發送轉帳
-
-```
-POST /transfers
-```
-
-範例：
-
-```json
-{
-  "fromId": 6,
-  "toId": 7,
-  "amount": 1
-}
+   └── Transfer API (Port 7010)
+          - POST /transfers
+                │
+                ├── Same-Shard → Sync Fast Path
+                └── Cross-Shard → Redis Queue
+                                  │
+                                  ▼
+                           Queue Workers
+                                  │
+                                  ▼
+                           PostgreSQL Shards
 ```
 
 ---
 
-## Step 2：API 建立 Transfer Job
+# 核心設計概念
 
-API 不直接執行轉帳，而是將 job 放入 Redis queue：
+本系統把 transfer request 分成兩條路：
 
+## 1. Same-Shard Transfer
+
+如果 `fromId` 與 `toId` 屬於同一個 shard：
+
+```text
+- 不進 Redis queue
+- 不建立 async job
+- API worker 直接同步執行 DB transaction
+- 立即回傳 200
 ```
-transfer:queue:from:{fromId}
+
+這是目前系統的 **fast path**。
+
+---
+
+## 2. Cross-Shard Transfer
+
+如果 `fromId` 與 `toId` 屬於不同 shard：
+
+```text
+- 建立 transfer job
+- 寫入 Redis job store
+- push 進 Redis queue
+- 由 queue worker 非同步處理
+- API 立即回傳 202 + jobId
+- client 可透過 polling 查詢結果
 ```
 
-例如：
+這是目前系統的 **slow path / async path**。
 
+---
+
+# Sharding 設計
+
+## Shard Routing 規則
+
+帳戶的 shard 由以下規則決定：
+
+```text
+shardId = accountId % shardCount
 ```
-transfer:queue:from:6
+
+目前設定：
+
+```text
+shardCount = 4
+```
+
+也就是：
+
+```text
+accountId % 4
 ```
 
 ---
 
-## Step 3：Queue Worker 處理
+## 資料分布
 
-Worker 會從 queue 取出 job，並執行：
+### Meta DB
 
+Meta DB 負責存放全域資訊：
+
+```text
+- users
+- account_shards
+- global_account_id_seq
 ```
-PostgreSQL Transaction
-+
-Row-level Lock
+
+其中：
+
+```text
+account_shards
 ```
 
-確保：
+用來記錄：
 
-- 轉帳原子性
-- 餘額一致性
-- 交易紀錄正確
+```text
+account_id -> shard_id
+```
 
 ---
 
-# Redis Transfer Queue
+### Shard DB
 
-每個帳戶有自己的 queue：
+每個 shard DB 存放：
 
-```
-transfer:queue:from:{accountId}
-```
-
-例如：
-
-```
-transfer:queue:from:6
+```text
+- accounts
+- transfers
 ```
 
-這樣可以避免：
+目前配置為：
 
-- 多 request 競爭同一帳戶
-- hot account lock contention
+```text
+small_bank_s0
+small_bank_s1
+small_bank_s2
+small_bank_s3
+```
 
 ---
 
-# Admission Control
+## Account 建立流程
 
-為避免 queue 無限制成長：
+建立帳戶時：
 
-```
-maxQueueLengthPerFromId
-```
-
-當 queue 超過 threshold：
-
-```
-request 會被拒絕
+```text
+1. 先在 meta DB 取得 global account id
+2. 依 accountId % shardCount 計算 shardId
+3. 在 meta DB 寫入 account_shards
+4. 在對應 shard DB 寫入 accounts
 ```
 
-這可以：
+這樣可以確保：
 
-- 保護資料庫
-- 防止系統過載
-- 維持整體穩定
+```text
+- account id 全域唯一
+- shard routing 可預測
+```
 
 ---
 
-# Batch Queue Processing
+# Transfer 設計
 
-Queue worker 會批次處理 queue：
+## Same-Shard Transfer
 
-```
-batchSize = 20
-```
+same-shard transfer 採用同步 DB fast path：
 
-優點：
-
-- 減少 Redis round-trip
-- 提升處理效率
-- 提高吞吐量
-
----
-
-# Queue Metrics
-
-系統提供 Queue Metrics API。
-
----
-
-## 查詢單一 Queue
-
-```
-GET /queue/stats?fromId=6
+```text
+1. debit source account
+2. credit destination account
+3. COMMIT
 ```
 
-範例：
+特性：
 
-```json
+```text
+- 不走 Redis queue
+- 不建立 transfer job
+- 不寫 transfers log
+- response body 較小
+- latency 較低
+```
+
+回應：
+
+```text
+HTTP 200
 {
   "ok": true,
   "data": {
-    "fromId": 6,
-    "queueLength": 2
+    "mode": "sync-same-shard",
+    "status": "completed"
   }
 }
 ```
 
 ---
 
-## 查詢整體 Queue 狀態
+## Cross-Shard Transfer
 
-```
-GET /queue/global-stats
+cross-shard transfer 採用非同步 queue pipeline。
+
+### API 階段
+
+```text
+1. 建立 jobId
+2. 寫入 Redis job store（status = queued）
+3. push 進 per-fromId queue
+4. 若 queue 從空變成非空，補一筆 fromId 到 ready queue
+5. API 回傳 202 + jobId
 ```
 
-範例：
+### Worker 階段
+
+queue worker 會從 ready queue 阻塞式取出 fromId，然後 drain 該 fromId queue。
+
+真正交易流程如下：
+
+```text
+Step 1: source shard reserve funds
+Step 2: destination shard credit funds
+Step 3: source shard finalize reserved funds
+```
+
+若中途失敗，會執行補償流程：
+
+```text
+release reserved funds
+mark transfer failed
+```
+
+---
+
+## Cross-Shard Transfer 狀態
+
+目前 transfer log 主要狀態包含：
+
+```text
+RESERVED
+COMPLETED
+FAILED
+```
+
+---
+
+# Redis Transfer Queue 設計
+
+目前 queue 採用：
+
+```text
+per-fromId queue + ready queue + owner lock
+```
+
+---
+
+## Per-fromId Queue
+
+每個來源帳戶一條 queue：
+
+```text
+transfer:queue:from:{fromId}
+```
+
+目的：
+
+```text
+避免同一個 fromId 被多個 worker 同時併發處理
+```
+
+---
+
+## Ready Queue
+
+ready queue 只存：
+
+```text
+目前有工作可做的 fromId
+```
+
+key：
+
+```text
+transfer:queue:ready:fromIds
+```
+
+worker 不再掃 active set，而是直接：
+
+```text
+BRPOP ready queue
+```
+
+這樣可以減少：
+
+```text
+無效掃描
+Redis round-trip
+worker idle polling cost
+```
+
+---
+
+## Owner Lock
+
+每條 per-fromId queue 都有 owner lock：
+
+```text
+transfer:queue:owner:from:{fromId}
+```
+
+目的：
+
+```text
+確保同一時間只有一個 worker 可以 drain 某個 fromId queue
+```
+
+並搭配 heartbeat 定期刷新 TTL。
+
+---
+
+## Admission Control
+
+enqueue 時會先檢查 queue 長度：
+
+```text
+rejectThresholdPerFromId = 320
+maxQueueLengthPerFromId = 400
+```
+
+行為：
+
+```text
+- queue 長度 >= rejectThreshold → 429 queue admission rejected
+- queue 長度 >= maxQueueLength → 429 queue full
+```
+
+這些 429 屬於 **系統保護機制**，用來避免 queue 與 DB 被打爆。
+
+---
+
+# Transfer Job Store 設計
+
+job store 存在 Redis，key 格式為：
+
+```text
+transfer:job:{jobId}
+```
+
+TTL：
+
+```text
+24 hours
+```
+
+目前主要狀態：
+
+```text
+queued
+success
+failed
+```
+
+內容包含：
+
+```text
+jobId
+fromId
+toId
+amount
+createdAt
+updatedAt
+result
+error
+```
+
+client 可透過：
+
+```text
+GET /transfer-jobs/:jobId
+```
+
+查詢 job 狀態。
+
+---
+
+# Account Redis Cache
+
+帳戶查詢有做 Redis cache。
+
+cache key：
+
+```text
+account:{id}
+```
+
+TTL：
+
+```text
+30 seconds
+```
+
+查詢流程：
+
+```text
+1. 先查 Redis
+2. cache hit → 直接回傳
+3. cache miss → 查 PostgreSQL
+4. 寫回 Redis
+```
+
+當 transfer 成功後，可透過 invalidate 移除舊 cache，避免讀到 stale data。
+
+---
+
+# API 分工
+
+## General API
+
+General API 負責：
+
+```text
+- Users API
+- Accounts API
+- Transfer History API
+- Transfer Job Query API
+- Queue Stats API
+- Benchmark APIs（非 /transfers）
+```
+
+---
+
+## Transfer API
+
+Transfer API 只負責：
+
+```text
+POST /transfers
+```
+
+這樣做的原因是：
+
+```text
+避免 transfer intake 與 read / CRUD API 互相競爭 worker 資源
+```
+
+---
+
+## Queue Worker
+
+Queue worker 不提供 HTTP API，專門做：
+
+```text
+- block pop ready queue
+- drain per-fromId queue
+- process cross-shard transfer jobs
+- update transfer job store
+```
+
+---
+
+# API 文件
+
+## Health Check
+
+### GET /health
+
+用途：
+
+```text
+檢查系統是否正常運作
+```
+
+---
+
+## Users API
+
+### POST /users
+
+建立使用者。
+
+Request:
+
+```json
+{
+  "name": "Alice"
+}
+```
+
+Response:
 
 ```json
 {
   "ok": true,
   "data": {
-    "totalQueues": 3,
-    "totalJobs": 8,
-    "hotAccounts": [
-      { "fromId": 6, "queueLength": 5 }
+    "id": 1,
+    "name": "Alice",
+    "created_at": "..."
+  }
+}
+```
+
+---
+
+### GET /users/:id
+
+查詢使用者。
+
+---
+
+## Accounts API
+
+### POST /accounts
+
+建立帳戶。
+
+Request:
+
+```json
+{
+  "userId": 1,
+  "initialBalance": 1000
+}
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "data": {
+    "id": "1",
+    "user_id": "1",
+    "balance": "1000",
+    "availableBalance": "1000",
+    "reservedBalance": "0",
+    "totalBalance": "1000",
+    "createdAt": "...",
+    "updatedAt": "..."
+  }
+}
+```
+
+---
+
+### GET /accounts/:id
+
+查詢帳戶餘額。
+
+---
+
+## Transfers API
+
+### POST /transfers
+
+建立轉帳。
+
+Request:
+
+```json
+{
+  "fromId": 1,
+  "toId": 5,
+  "amount": 1
+}
+```
+
+### Same-Shard Response
+
+```json
+{
+  "ok": true,
+  "data": {
+    "mode": "sync-same-shard",
+    "status": "completed"
+  }
+}
+```
+
+HTTP status:
+
+```text
+200
+```
+
+### Cross-Shard Response
+
+```json
+{
+  "ok": true,
+  "data": {
+    "mode": "async-cross-shard",
+    "jobId": "1700000000000-abcd1234",
+    "status": "queued"
+  }
+}
+```
+
+HTTP status:
+
+```text
+202
+```
+
+---
+
+### GET /transfers?accountId=...&limit=...
+
+查詢指定帳戶的歷史交易紀錄。
+
+Response:
+
+```json
+{
+  "ok": true,
+  "data": {
+    "items": [
+      {
+        "id": 123,
+        "fromId": 1,
+        "toId": 5,
+        "amount": 1,
+        "status": "COMPLETED",
+        "createdAt": "...",
+        "updatedAt": "..."
+      }
     ]
   }
 }
 ```
 
-可以觀察：
-
-- queue 壓力
-- hot accounts
-- worker 活動
-
 ---
 
-# API 使用方式
+## Transfer Jobs API
 
-## Users
+### GET /transfer-jobs/:jobId
 
-建立使用者
+查詢 async transfer job 狀態。
 
-```
-POST /users
-```
+可能狀態：
 
-查詢使用者
-
-```
-GET /users/:id
+```text
+queued
+success
+failed
 ```
 
 ---
 
-## Accounts
+## Queue API
 
-建立帳戶
+### GET /queue/stats?fromId=6
 
+查看某個 fromId queue 的狀態。
+
+---
+
+### GET /queue/global-stats
+
+查看整體 queue 狀態。
+
+---
+
+## Bench API
+
+目前專案內建多個 benchmark endpoints：
+
+```text
+GET  /bench/noop
+POST /bench/redis-rpush
+POST /bench/redis-set-rpush
+POST /bench/redis-formal-push
+POST /bench/redis-formal-push-with-job
+POST /bench/transfers-enqueue-no-log
+POST /bench/redis-pipeline-push
+POST /bench/db-transfer
 ```
-POST /accounts
-```
 
-查詢帳戶
+主要用途：
 
-```
-GET /accounts/:id
+```text
+- benchmark intake path
+- benchmark Redis enqueue cost
+- benchmark same-shard DB throughput
+- isolate bottleneck
 ```
 
 ---
 
-## Transfers
+# 執行環境
 
-建立轉帳 job
+## Node.js
 
-```
-POST /transfers
-```
-
-查詢轉帳紀錄
-
-```
-GET /transfers
+```text
+>= 18.0.0
 ```
 
 ---
 
-## Transfer Job
+## 主要依賴
 
-查詢 job 狀態
-
-```
-GET /transfer-jobs/:jobId
-```
-
----
-
-# Benchmark
-
-Benchmark scripts 位於：
-
-```
-scripts/
+```text
+egg
+egg-redis
+egg-scripts
+pg
+axios
 ```
 
 ---
 
-## Full Benchmark
+# 安裝方式
 
-執行完整測試：
-
-```
-./scripts/full_benchmark.sh
-```
-
-流程：
-
-1. Reset database
-2. 建立 1000 accounts
-3. 執行 random transfer benchmark
-
----
-
-## Random Transfer Benchmark
-
-Script：
-
-```
-scripts/random_transfer_test.js
-```
-
-特性：
-
-- 隨機 fromId
-- 隨機 toId
-- 分散 workload
-- 模擬真實交易
-
-設定範例：
-
-```
-MAX_ACCOUNT_ID = 1000
-CONCURRENCY = 200
-DURATION_SECONDS = 10
-AMOUNT = 1
+```bash
+npm install
 ```
 
 ---
 
-# Benchmark Results
+# 啟動方式
 
-## 測試環境
+## 開發模式
 
+### General API
+
+```bash
+npm run dev:general-api
 ```
-Egg.js cluster workers: 8
-Redis transfer queue
-PostgreSQL transactions
-Batch size: 20
-Accounts: 1000
+
+### Transfer API
+
+```bash
+npm run dev:transfer-api
+```
+
+### Queue Workers
+
+```bash
+npm run dev:queue-worker-1
+npm run dev:queue-worker-2
+npm run dev:queue-worker-3
+npm run dev:queue-worker-4
+npm run dev:queue-worker-5
+npm run dev:queue-worker-6
 ```
 
 ---
 
-# Burst Throughput（短時間吞吐）
+## Benchmark / Daemon 模式
 
-測試：
+### 啟動 General API
 
+```bash
+npm run start:general-api
 ```
-CONCURRENCY = 200
-DURATION = 10 seconds
+
+### 啟動 Transfer API
+
+```bash
+npm run start:transfer-api
+```
+
+### 啟動 Queue Workers
+
+```bash
+npm run start:queue-worker-1
+npm run start:queue-worker-2
+npm run start:queue-worker-3
+npm run start:queue-worker-4
+npm run start:queue-worker-5
+npm run start:queue-worker-6
+```
+
+### 停止
+
+```bash
+npm run stop:general-api
+npm run stop:transfer-api
+npm run stop:queue-worker-1
+npm run stop:queue-worker-2
+npm run stop:queue-worker-3
+npm run stop:queue-worker-4
+npm run stop:queue-worker-5
+npm run stop:queue-worker-6
+```
+
+---
+
+## 一次啟動完整 benchmark stack
+
+### Queue Workers = 2
+
+```bash
+npm run start:benchmark-stack-q2
+```
+
+### Queue Workers = 4
+
+```bash
+npm run start:benchmark-stack-q4
+```
+
+### Queue Workers = 6
+
+```bash
+npm run start:benchmark-stack-q6
+```
+
+---
+
+# 測試資料建立
+
+建立 100 個測試帳戶：
+
+```bash
+npm run create-test-accounts-100
+```
+
+建立 1000 個測試帳戶：
+
+```bash
+npm run create-test-accounts-1000
+```
+
+重置測試資料：
+
+```bash
+npm run reset-test-data
+```
+
+---
+
+# Benchmark Scripts
+
+目前 final benchmark scripts 包含：
+
+```text
+scripts/FinalBenchmark/final_api_intake_benchmark.sh
+scripts/FinalBenchmark/final_random_request_benchmark.sh
+scripts/FinalBenchmark/final_random_transfer_benchmark.sh
+scripts/FinalBenchmark/final_same_shard_db_benchmark.sh
+```
+
+對應 npm scripts：
+
+```bash
+npm run final-api-intake-benchmark
+npm run final-random-request-benchmark
+npm run final-random-transfer-benchmark
+npm run final-same-shard-db-benchmark
+```
+
+---
+
+# Benchmark 重點結果摘要
+
+詳細數據請參考：
+
+```text
+BENCHMARK.md
+```
+
+目前已確認的系統行為包括：
+
+---
+
+## API Intake Capacity
+
+只做 enqueue、不做 transaction 時：
+
+```text
+API intake capacity ≈ 12.8k RPS
+```
+
+代表：
+
+```text
+API routing
+request parsing
+Redis enqueue
+```
+
+不是目前主 bottleneck。
+
+---
+
+## Same-Shard Pure DB Throughput
+
+只做 same-shard DB transaction 時：
+
+```text
+~6.9k TPS
+```
+
+代表 PostgreSQL same-shard transaction 本身仍有更高 capacity。
+
+---
+
+## Full Transfer Pipeline
+
+在 hybrid transfer 模式下：
+
+```text
+request throughput 可以到 8k ~ 10k+ RPS
+completed transfer throughput 約落在 3k ~ 4k TPS
+```
+
+---
+
+## Worker Scaling 結論
+
+在 General API / Transfer API / Queue Worker 分離後，  
+目前已驗證出兩種不同 operating mode：
+
+### Completion Optimized
+
+```text
+6 / 2 / 4
+```
+
+代表：
+
+```text
+General API workers = 6
+Transfer API workers = 2
+Queue workers = 4
 ```
 
 結果：
 
+```text
+Completed TPS ≈ 4021
 ```
-Total Requests: 85600
-Success Requests: 85600
-Success Rate: 100%
 
-Average Success RPS ≈ 8547
-```
+這是目前 **最高 completed transfer throughput** 配置。
 
 ---
 
-# Sustained Throughput（長時間穩定吞吐）
+### Intake Optimized
 
-測試：
-
-```
-CONCURRENCY = 200
-DURATION = 30 seconds
+```text
+6 / 6 / 4
 ```
 
 結果：
 
-```
-Total Requests: 193800
-Success Requests: 193800
-Success Rate: 100%
-
-Average Success RPS ≈ 6459
+```text
+Request RPS ≈ 8591
 ```
 
-系統可在 distributed workload 下 **穩定維持約 6k+ RPS**。
+這是目前 **最高 request intake throughput** 配置。
+
+但同時：
+
+```text
+429 / non2xx 也會明顯增加
+```
 
 ---
 
-# 未來優化方向
+## Queue Worker Sweet Spot
 
-## Database Sharding
+目前 benchmark 顯示：
 
-目前所有帳戶仍在單一 PostgreSQL database。
-
-未來可透過 **database sharding**：
-
-```
-accounts_0
-accounts_1
-accounts_2
+```text
+Queue workers ≈ 4
 ```
 
-透過 shard routing：
+是比較合理的 sweet spot。
 
+再往上增加到 6，throughput 並未持續提升，反而可能因為：
+
+```text
+PostgreSQL contention
+Redis contention
+context switching
+connection pool pressure
 ```
-accountId % shardCount
-```
 
-優點：
-
-- 分散 DB load
-- 降低單一 database bottleneck
-- 提升系統整體吞吐量
+導致退化。
 
 ---
 
-# 總結
+# 目前系統 bottleneck
 
-本專案展示如何設計一個 **高併發轉帳系統**，包含：
+目前主要 bottleneck 已集中在：
 
-- Redis queue-based architecture
-- PostgreSQL transaction + row-level locking
-- admission control
-- batch queue processing
-- queue metrics
-- benchmark-driven optimization
-
-目前系統可在 **distributed random workload** 下穩定達到：
-
-```
-~6k+ RPS sustained transfer throughput
+```text
+Cross-shard async transfer pipeline
 ```
 
-並為未來 **database sharding 架構**打下基礎。
+具體包含：
+
+```text
+- Redis queue dispatch
+- Queue worker scheduling
+- Cross-shard transaction coordination
+- Transfer state persistence
+- finalize / compensation path
+```
+
+而不再是：
+
+```text
+API routing
+Redis enqueue
+same-shard DB transaction
+```
+
+---
+
+# 專案目前的工程重點
+
+這個專案的重點不是單純做出銀行 CRUD，而是驗證以下系統設計：
+
+```text
+1. API throughput 與 completed throughput 是不同層級的問題
+2. same-shard 與 cross-shard 應該走不同 execution path
+3. queue 設計與 worker 配比會直接影響實際 completed TPS
+4. worker role separation 可以顯著改善資源競爭
+5. single-machine tuning 也可以做出明顯的 throughput improvement
+```
+
+---
+
+# 後續優化方向
+
+根據目前 benchmark 結果，未來優化方向包括：
+
+```text
+1. 進一步瘦身 cross-shard transaction path
+2. 降低 Redis queue / job status round-trip
+3. 優化 queue worker scheduling
+4. 重新設計 cross-shard execution model
+5. 研究更進一步的 multi-machine distributed architecture
+```
+
+---
+
+# 備註
+
+本專案目前屬於：
+
+```text
+系統設計 / 效能驗證 / 架構演進型專案
+```
+
+README 主要說明目前架構與執行方式；  
+若要查看完整 benchmark 過程、數據與分析，請搭配閱讀：
+
+```text
+BENCHMARK.md
+```
