@@ -9,6 +9,7 @@
   "dependencies": {
     "axios": "^1.13.6",
     "egg": "^3.17.5",
+    "egg-cors": "^3.0.1",
     "egg-redis": "^2.6.1",
     "egg-scripts": "^2.17.0",
     "pg": "^8.19.0"
@@ -32,19 +33,15 @@
     "cov": "egg-bin cov",
     "lint": "eslint .",
     "ci": "npm run lint && npm run cov",
-
     "hotspot-test": "node scripts/hotspot_test.sh",
     "hotspot-test-light": "node scripts/hotspot_test_light.sh",
     "reset-test-data": "node scripts/reset_test_data.js",
     "random-transfer-test": "node scripts/random_transfer_test.js",
     "create-test-accounts-100": "node scripts/create_test_accounts_100.js",
     "create-test-accounts-1000": "node scripts/create_test_accounts_1000.js",
-
     "dev:api-cluster-worker": "bash scripts/run/start_workers.sh $npm_config_workers",
-
     "dev:general-api": "APP_API_ROLE=general egg-bin dev --port=7001",
     "dev:transfer-api": "APP_API_ROLE=transfer egg-bin dev --port=7010",
-
     "dev:queue-worker-1": "APP_ROLE=queue egg-bin dev --port=7002",
     "dev:queue-worker-2": "APP_ROLE=queue egg-bin dev --port=7003",
     "dev:queue-worker-3": "APP_ROLE=queue egg-bin dev --port=7004",
@@ -53,43 +50,30 @@
     "dev:queue-worker-6": "APP_ROLE=queue egg-bin dev --port=7007",
     "dev:queue-worker-7": "APP_ROLE=queue egg-bin dev --port=7008",
     "dev:queue-worker-8": "APP_ROLE=queue egg-bin dev --port=7009",
-
     "start:general-api": "APP_API_ROLE=general APP_PORT=7001 egg-scripts start --daemon --workers=6 --title=small-bank-general-api",
     "stop:general-api": "egg-scripts stop --title=small-bank-general-api",
-
     "start:transfer-api": "APP_API_ROLE=transfer APP_PORT=7010 egg-scripts start --daemon --workers=6 --title=small-bank-transfer-api",
     "stop:transfer-api": "egg-scripts stop --title=small-bank-transfer-api",
-
     "start:queue-worker-1": "APP_ROLE=queue APP_PORT=7002 egg-scripts start --daemon --workers=1 --title=small-bank-queue-worker-1",
     "stop:queue-worker-1": "egg-scripts stop --title=small-bank-queue-worker-1",
-
     "start:queue-worker-2": "APP_ROLE=queue APP_PORT=7003 egg-scripts start --daemon --workers=1 --title=small-bank-queue-worker-2",
     "stop:queue-worker-2": "egg-scripts stop --title=small-bank-queue-worker-2",
-
     "start:queue-worker-3": "APP_ROLE=queue APP_PORT=7004 egg-scripts start --daemon --workers=1 --title=small-bank-queue-worker-3",
     "stop:queue-worker-3": "egg-scripts stop --title=small-bank-queue-worker-3",
-
     "start:queue-worker-4": "APP_ROLE=queue APP_PORT=7005 egg-scripts start --daemon --workers=1 --title=small-bank-queue-worker-4",
     "stop:queue-worker-4": "egg-scripts stop --title=small-bank-queue-worker-4",
-
     "start:queue-worker-5": "APP_ROLE=queue APP_PORT=7006 egg-scripts start --daemon --workers=1 --title=small-bank-queue-worker-5",
     "stop:queue-worker-5": "egg-scripts stop --title=small-bank-queue-worker-5",
-
     "start:queue-worker-6": "APP_ROLE=queue APP_PORT=7007 egg-scripts start --daemon --workers=1 --title=small-bank-queue-worker-6",
     "stop:queue-worker-6": "egg-scripts stop --title=small-bank-queue-worker-6",
-
     "start:benchmark-stack-q2": "npm run start:general-api && npm run start:transfer-api && npm run start:queue-worker-1 && npm run start:queue-worker-2",
     "stop:benchmark-stack-q2": "npm run stop:general-api && npm run stop:transfer-api && npm run stop:queue-worker-1 && npm run stop:queue-worker-2",
-
     "start:benchmark-stack-q4": "npm run start:general-api && npm run start:transfer-api && npm run start:queue-worker-1 && npm run start:queue-worker-2 && npm run start:queue-worker-3 && npm run start:queue-worker-4",
     "stop:benchmark-stack-q4": "npm run stop:general-api && npm run stop:transfer-api && npm run stop:queue-worker-1 && npm run stop:queue-worker-2 && npm run stop:queue-worker-3 && npm run stop:queue-worker-4",
-
     "start:benchmark-stack-q6": "npm run start:general-api && npm run start:transfer-api && npm run start:queue-worker-1 && npm run start:queue-worker-2 && npm run start:queue-worker-3 && npm run start:queue-worker-4 && npm run start:queue-worker-5 && npm run start:queue-worker-6",
     "stop:benchmark-stack-q6": "npm run stop:general-api && npm run stop:transfer-api && npm run stop:queue-worker-1 && npm run stop:queue-worker-2 && npm run stop:queue-worker-3 && npm run stop:queue-worker-4 && npm run stop:queue-worker-5 && npm run stop:queue-worker-6",
-
     "random-bench": "node scripts/random_bench.js",
     "random-bench-same-shard": "node scripts/random_bench_same_shard.js",
-
     "final-random-transfer-benchmark": "bash scripts/FinalBenchmark/final_random_transfer_benchmark.sh",
     "final-random-request-benchmark": "bash scripts/FinalBenchmark/final_random_request_benchmark.sh",
     "final-api-intake-benchmark": "bash scripts/FinalBenchmark/final_api_intake_benchmark.sh",

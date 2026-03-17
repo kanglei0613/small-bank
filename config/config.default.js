@@ -36,6 +36,11 @@ module.exports = appInfo => {
     csrf: { enable: false },
   };
 
+  config.cors = {
+    origin: '*',
+    allowMethods: 'GET,HEAD,PUT,POST,DELETE,PATCH,OPTIONS',
+  };
+
   // =========================
   // API Role 設定
   // =========================

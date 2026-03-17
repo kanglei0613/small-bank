@@ -7,4 +7,9 @@ module.exports = {
     package: 'egg-redis',
   },
 
+  // CORS plugin
+  cors: {
+    enable: true,
+    package: 'egg-cors',
+  },
 };
