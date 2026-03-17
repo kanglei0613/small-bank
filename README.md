@@ -1,7 +1,7 @@
 # Small Bank
 
-一個以 **Node.js + Egg.js + PostgreSQL + Redis** 實作的高併發銀行系統實驗專案。  
-本專案的重點不只是 CRUD API，而是針對 **高併發轉帳、Sharding、Async Queue、Worker 分離、Benchmark 調校** 進行系統化設計與驗證。
+一個以 **Node.js + Egg.js + PostgreSQL + Redis + React** 實作的高併發銀行系統實驗專案。  
+本專案的重點不只是 CRUD API，而是針對 **高併發轉帳、Sharding、Async Queue、Worker 分離、Benchmark 調校、前端操作體驗** 進行系統化設計與驗證。
 
 目前系統已具備：
 
@@ -12,6 +12,8 @@
 - Cross-Shard Async Pipeline
 - General API / Transfer API / Queue Worker 分離
 - Account Redis Cache
+- 使用者查詢回傳帳戶列表（user -> accounts）
+- 前端網路銀行介面（React）
 - 多組 Benchmark 與 Worker Scaling 實驗
 ```
 
@@ -27,6 +29,7 @@ Async Queue
 Worker Role Separation
 Same-Shard Fast Path
 Cross-Shard Transaction Design
+Frontend Integration
 ```
 
 提升系統在高併發 transfer workload 下的吞吐量與穩定性。
@@ -44,6 +47,7 @@ Cross-Shard Transaction Design
 2. 真正 completed transfer throughput 能到多少
 3. bottleneck 在哪一層
 4. 什麼 worker 配比最合理
+5. 系統在前端實際操作下是否合理
 ```
 
 ---
@@ -53,7 +57,7 @@ Cross-Shard Transaction Design
 目前系統採用單機多角色分離架構：
 
 ```text
-Client
+Client（React Frontend）
    │
    ├── General API (Port 7001)
    │      - Users API
@@ -108,6 +112,7 @@ Client
 - 由 queue worker 非同步處理
 - API 立即回傳 202 + jobId
 - client 可透過 polling 查詢結果
+- 前端自動 polling，不顯示 jobId，只顯示最終結果
 ```
 
 這是目前系統的 **slow path / async path**。
@@ -549,6 +554,27 @@ Response:
 
 查詢使用者。
 
+Response:
+
+```json
+{
+  "ok": true,
+  "data": {
+    "id": 1,
+    "name": "Alice",
+    "created_at": "...",
+    "accounts": [1, 2]
+  }
+}
+```
+
+用途：
+
+```text
+- 查詢使用者基本資料
+- 查詢該使用者底下所有帳戶 ID
+```
+
 ---
 
 ## Accounts API
@@ -730,6 +756,69 @@ POST /bench/db-transfer
 
 ---
 
+# 前端系統
+
+本專案新增簡易網路銀行前端（React），用於驗證整體系統行為。
+
+---
+
+## 前端功能
+
+```text
+- 建立使用者（支援中文）
+- 查詢使用者（顯示帳戶列表）
+- 建立帳戶
+- 查詢帳戶餘額
+- 發送轉帳（自動處理 same-shard / cross-shard）
+- 查詢轉帳歷史
+- 顯示操作結果（modal）
+```
+
+---
+
+## 前端互動設計
+
+```text
+- 使用者查詢會顯示 accounts 列表
+- cross-shard 交易由前端自動 polling，隱藏 jobId
+- 所有操作結果透過彈出式視窗顯示
+- modal 支援上下捲動，避免訊息太長看不完
+- modal 提供 OK 按鈕關閉
+- 欄位名稱使用中文（使用者編號、帳戶編號、轉出帳戶、轉入帳戶、轉帳金額）
+- 輸入欄位預設為空值，避免測試值干擾操作
+```
+
+---
+
+## 前端執行方式
+
+前端目錄：
+
+```text
+frontend
+```
+
+安裝：
+
+```bash
+cd frontend
+npm install
+```
+
+啟動：
+
+```bash
+npm run dev
+```
+
+預設網址：
+
+```text
+http://localhost:5173
+```
+
+---
+
 # 執行環境
 
 ## Node.js
@@ -748,6 +837,8 @@ egg-redis
 egg-scripts
 pg
 axios
+react
+vite
 ```
 
 ---
@@ -1062,6 +1153,7 @@ same-shard DB transaction
 3. queue 設計與 worker 配比會直接影響實際 completed TPS
 4. worker role separation 可以顯著改善資源競爭
 5. single-machine tuning 也可以做出明顯的 throughput improvement
+6. frontend integration 可以驗證系統在實際操作上的完整性
 ```
 
 ---
@@ -1076,6 +1168,7 @@ same-shard DB transaction
 3. 優化 queue worker scheduling
 4. 重新設計 cross-shard execution model
 5. 研究更進一步的 multi-machine distributed architecture
+6. 持續優化前端操作體驗與系統展示能力
 ```
 
 ---
