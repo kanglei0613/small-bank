@@ -54,10 +54,10 @@ class QueueWorker extends Subscription {
         return;
       }
 
-      logger.info(
-        '[QueueWorker] scanning queues: count=%s',
-        keys.length
-      );
+      // logger.info(
+      //   '[QueueWorker] scanning queues: count=%s',
+      //   keys.length
+      // );
 
       for (const key of keys) {
 

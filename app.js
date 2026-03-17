@@ -5,6 +5,7 @@ const { Pool } = require('pg');
 
 // app 啟動時，建立 meta DB 與各 shard 的 PostgreSQL connection pool
 module.exports = app => {
+
   // meta DB
   const metaPg = new Pool(app.config.pgMeta);
 
@@ -26,13 +27,13 @@ module.exports = app => {
 
   // 在 server 啟動前測試 DB 連線
   app.beforeStart(async () => {
-    app.logger.info('[app] current role = %s', app.role);
+    // app.logger.info('[app] current role = %s', app.role);
 
     // 測試 meta DB
     const metaClient = await app.metaPg.connect();
     try {
       await metaClient.query('SELECT 1');
-      app.logger.info('[pg] meta DB connected');
+      // app.logger.info('[pg] meta DB connected');
     } finally {
       metaClient.release();
     }
@@ -43,7 +44,7 @@ module.exports = app => {
 
       try {
         await shardClient.query('SELECT 1');
-        app.logger.info('[pg] shard DB connected: shardId=%s', shardId);
+        // app.logger.info('[pg] shard DB connected: shardId=%s', shardId);
       } finally {
         shardClient.release();
       }
@@ -55,7 +56,7 @@ module.exports = app => {
     // - API role 不會啟動 queue worker
     // - queue role 會在 app 啟動後進入背景 loop，持續掃描 queue 並 drain
     if (app.role === 'queue') {
-      app.logger.info('[queue worker] queue role detected, worker will start');
+      // app.logger.info('[queue worker] queue role detected, worker will start');
 
       // 使用 setImmediate，避免阻塞 beforeStart 完成
       setImmediate(async () => {
@@ -71,7 +72,7 @@ module.exports = app => {
         }
       });
     } else {
-      app.logger.info('[queue worker] api role detected, worker will not start');
+      // app.logger.info('[queue worker] api role detected, worker will not start');
     }
   });
 

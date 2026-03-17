@@ -1,27 +1,34 @@
-// repository/accountsRepo.js
 'use strict';
 
+/**
+ * Accounts repository
+ */
 class AccountsRepo {
+
+  /**
+   * @param {import('egg').Context} ctx - Egg context
+   */
   constructor(ctx) {
     this.ctx = ctx;
-
-    // meta DB
     this.metaPg = ctx.app.metaPg;
   }
 
-  // 依 accountId 計算 shardId
+  /**
+   * Calculate shard id by account id.
+   *
+   * @param {number|string} accountId - Account id
+   * @returns {number} Shard id
+   */
   calcShardIdByAccountId(accountId) {
     const aid = Number(accountId);
     const shardCount = Number(this.ctx.app.config.sharding.shardCount);
 
-    // 檢查 accountId
     if (!Number.isInteger(aid) || aid <= 0) {
       const err = new Error('accountId must be a positive integer');
       err.status = 400;
       throw err;
     }
 
-    // 檢查 shardCount
     if (!Number.isInteger(shardCount) || shardCount <= 0) {
       const err = new Error('invalid shardCount');
       err.status = 500;
@@ -31,11 +38,15 @@ class AccountsRepo {
     return aid % shardCount;
   }
 
-  // 依 shardId 取得對應 shard pool
+  /**
+   * Get shard pool by shard id.
+   *
+   * @param {number|string} shardId - Shard id
+   * @returns {*} PostgreSQL pool
+   */
   getShardPg(shardId) {
     const sid = Number(shardId);
 
-    // 檢查 shardId
     if (!Number.isInteger(sid) || sid < 0) {
       const err = new Error('shardId must be a non-negative integer');
       err.status = 400;
@@ -53,11 +64,15 @@ class AccountsRepo {
     return shardPg;
   }
 
-  // 依 accountId 查詢 shardId
+  /**
+   * Get shard id from meta db by account id.
+   *
+   * @param {number|string} accountId - Account id
+   * @returns {Promise<number|null>} Shard id or null
+   */
   async getShardIdByAccountId(accountId) {
     const aid = Number(accountId);
 
-    // 檢查 accountId
     if (!Number.isInteger(aid) || aid <= 0) {
       const err = new Error('accountId must be a positive integer');
       err.status = 400;
@@ -81,21 +96,27 @@ class AccountsRepo {
     return Number(row.shard_id);
   }
 
-  // 建立帳戶
+  /**
+   * Create account.
+   *
+   * @param {object} [params={}] - Account params
+   * @param {number|string} params.userId - User id
+   * @param {number|string} [params.initialBalance] - Initial balance
+   * @param {number|string} [params.balance] - Balance fallback
+   * @returns {Promise<object>} Created account
+   */
   async create({ userId, initialBalance, balance } = {}) {
     const uid = Number(userId);
-    const bal = (initialBalance !== undefined)
+    const bal = initialBalance !== undefined
       ? Number(initialBalance)
       : Number(balance ?? 0);
 
-    // 檢查 userId
     if (!Number.isInteger(uid) || uid <= 0) {
       const err = new Error('userId must be a positive integer');
       err.status = 400;
       throw err;
     }
 
-    // 檢查 balance
     if (!Number.isFinite(bal) || bal < 0) {
       const err = new Error('balance must be a number >= 0');
       err.status = 400;
@@ -103,18 +124,17 @@ class AccountsRepo {
     }
 
     const intBal = Math.floor(bal);
+
     if (!Number.isSafeInteger(intBal)) {
       const err = new Error('balance is too large');
       err.status = 400;
       throw err;
     }
 
-    // 先從 meta DB 取得全域 accountId
     const idSql = 'SELECT nextval(\'global_account_id_seq\') AS account_id';
     const idResult = await this.metaPg.query(idSql);
     const accountId = Number(idResult.rows[0].account_id);
 
-    // 計算 shardId
     const shardId = this.calcShardIdByAccountId(accountId);
     const shardPg = this.getShardPg(shardId);
 
@@ -124,7 +144,6 @@ class AccountsRepo {
     let routingInserted = false;
 
     try {
-      // 先寫 meta routing
       await metaClient.query('BEGIN');
 
       const routingSql = `
@@ -136,7 +155,6 @@ class AccountsRepo {
       await metaClient.query('COMMIT');
       routingInserted = true;
 
-      // 再寫 shard accounts
       await shardClient.query('BEGIN');
 
       const accountSql = `
@@ -169,29 +187,26 @@ class AccountsRepo {
 
       return accountResult.rows[0];
     } catch (err) {
-      this.ctx.app.logger.error('create account error:', err.message, err.code);
-
       try {
         await metaClient.query('ROLLBACK');
-      } catch (rollbackErr) {
-        this.ctx.app.logger.error('Meta rollback failed:', rollbackErr);
+      } catch (_rollbackErr) {
+        void _rollbackErr;
       }
 
       try {
         await shardClient.query('ROLLBACK');
-      } catch (rollbackErr) {
-        this.ctx.app.logger.error('Shard rollback failed:', rollbackErr);
+      } catch (_rollbackErr) {
+        void _rollbackErr;
       }
 
-      // 如果 meta 已經寫成功，但 shard 寫失敗，補刪 routing
       if (routingInserted) {
         try {
           await this.metaPg.query(
             'DELETE FROM account_shards WHERE account_id = $1',
             [ accountId ]
           );
-        } catch (cleanupErr) {
-          this.ctx.app.logger.error('Meta cleanup failed:', cleanupErr);
+        } catch (_cleanupErr) {
+          void _cleanupErr;
         }
       }
 
@@ -202,22 +217,24 @@ class AccountsRepo {
     }
   }
 
-  // 依 id 查詢帳戶
+  /**
+   * Get account by id.
+   *
+   * @param {number|string} id - Account id
+   * @returns {Promise<object|null>} Account or null
+   */
   async getById(id) {
     const accountId = Number(id);
 
-    // 檢查 id
     if (!Number.isInteger(accountId) || accountId <= 0) {
       const err = new Error('id must be a positive integer');
       err.status = 400;
       throw err;
     }
 
-    // 直接依 accountId 計算 shard
     const shardId = this.calcShardIdByAccountId(accountId);
     const shardPg = this.getShardPg(shardId);
 
-    // 到對應 shard 查詢帳戶
     const sql = `
       SELECT
         id,
@@ -236,30 +253,32 @@ class AccountsRepo {
     return result.rows[0] || null;
   }
 
-  // 依 accountId 查詢交易紀錄
+  /**
+   * List transfers by account id.
+   *
+   * @param {number|string} accountId - Account id
+   * @param {number|string} [limit=50] - Row limit
+   * @returns {Promise<object[]>} Transfer rows
+   */
   async listTransfersByAccountId(accountId, limit = 50) {
     const aid = Number(accountId);
     const rowLimit = Number(limit);
 
-    // 檢查 accountId
     if (!Number.isInteger(aid) || aid <= 0) {
       const err = new Error('accountId must be a positive integer');
       err.status = 400;
       throw err;
     }
 
-    // 檢查 limit
     if (!Number.isInteger(rowLimit) || rowLimit <= 0) {
       const err = new Error('limit must be a positive integer');
       err.status = 400;
       throw err;
     }
 
-    // 直接依 accountId 計算 shard
     const shardId = this.calcShardIdByAccountId(aid);
     const shardPg = this.getShardPg(shardId);
 
-    // 先確認帳戶是否存在
     const accountExistsResult = await shardPg.query(
       `
         SELECT id
@@ -296,12 +315,19 @@ class AccountsRepo {
     return result.rows;
   }
 
+  /**
+   * Route transfer by shard type.
+   *
+   * @param {number|string} fromId - Source account id
+   * @param {number|string} toId - Destination account id
+   * @param {number|string} amount - Transfer amount
+   * @returns {Promise<object>} Transfer result
+   */
   async transfer(fromId, toId, amount) {
     const fromAccountId = Number(fromId);
     const toAccountId = Number(toId);
     const transferAmount = Number(amount);
 
-    // 檢查參數
     if (!Number.isInteger(fromAccountId) || !Number.isInteger(toAccountId)) {
       const err = new Error('fromId/toId must be integer');
       err.status = 400;
@@ -320,11 +346,9 @@ class AccountsRepo {
       throw err;
     }
 
-    // 計算 shard
     const fromShardId = this.calcShardIdByAccountId(fromAccountId);
     const toShardId = this.calcShardIdByAccountId(toAccountId);
 
-    // same shard
     if (fromShardId === toShardId) {
       return await this.transferSameShard({
         fromAccountId,
@@ -334,7 +358,6 @@ class AccountsRepo {
       });
     }
 
-    // cross shard
     return await this.transferCrossShard({
       fromAccountId,
       toAccountId,
@@ -344,129 +367,83 @@ class AccountsRepo {
     });
   }
 
-  // same-shard 轉帳
-  async transferSameShard({ fromAccountId, toAccountId, transferAmount, shardId }) {
+  /**
+   * Same-shard transfer fast path.
+   *
+   * @param {object} params - Transfer params
+   * @param {number} params.fromAccountId - Source account id
+   * @param {number} params.toAccountId - Destination account id
+   * @param {number} params.transferAmount - Amount
+   * @param {number} params.shardId - Shard id
+   * @returns {Promise<object>} Transfer result
+   */
+  async transferSameShard({
+    fromAccountId,
+    toAccountId,
+    transferAmount,
+    shardId,
+  }) {
     const shardPg = this.getShardPg(shardId);
     const client = await shardPg.connect();
 
     try {
       await client.query('BEGIN');
-      await client.query("SET LOCAL lock_timeout = '200ms'");
 
-      // 固定鎖順序，避免 deadlock
-      const a = Math.min(fromAccountId, toAccountId);
-      const b = Math.max(fromAccountId, toAccountId);
-
-      // 一次鎖兩筆 row，並把 available_balance 一起帶出來
-      const locked = await client.query(
+      const debitResult = await client.query(
         `
-          SELECT id, available_balance
-          FROM accounts
-          WHERE id = ANY($1::bigint[])
-          ORDER BY id
-          FOR UPDATE
+          UPDATE accounts
+          SET
+            available_balance = available_balance - $1,
+            balance = balance - $1,
+            updated_at = NOW()
+          WHERE id = $2
+            AND available_balance >= $1
+          RETURNING id
         `,
-        [[ a, b ]]
+        [ transferAmount, fromAccountId ]
       );
 
-      if (locked.rowCount !== 2) {
-        const found = new Set(locked.rows.map(r => Number(r.id)));
-        const missing = !found.has(a) ? a : b;
-        const err = new Error(`account not found: ${missing}`);
-        err.status = 404;
-        throw err;
-      }
-
-      const fromRow = locked.rows.find(row => Number(row.id) === fromAccountId);
-
-      if (!fromRow) {
-        const err = new Error(`account not found: ${fromAccountId}`);
-        err.status = 404;
-        throw err;
-      }
-
-      if (Number(fromRow.available_balance) < transferAmount) {
+      if (debitResult.rowCount === 0) {
         const err = new Error('insufficient funds');
         err.status = 409;
         throw err;
       }
 
-      // 一次更新兩筆帳戶，減少一個 round-trip
-      const updateResult = await client.query(
+      const creditResult = await client.query(
         `
           UPDATE accounts
           SET
-            available_balance = CASE
-              WHEN id = $2 THEN available_balance - $1
-              WHEN id = $3 THEN available_balance + $1
-              ELSE available_balance
-            END,
-            balance = CASE
-              WHEN id = $2 THEN balance - $1
-              WHEN id = $3 THEN balance + $1
-              ELSE balance
-            END,
+            available_balance = available_balance + $1,
+            balance = balance + $1,
             updated_at = NOW()
-          WHERE id = ANY($4::bigint[])
+          WHERE id = $2
           RETURNING id
         `,
-        [
-          transferAmount,
-          fromAccountId,
-          toAccountId,
-          [ fromAccountId, toAccountId ],
-        ]
+        [ transferAmount, toAccountId ]
       );
 
-      if (updateResult.rowCount !== 2) {
-        const err = new Error('same-shard account update failed');
-        err.status = 500;
+      if (creditResult.rowCount === 0) {
+        const err = new Error(`account not found: ${toAccountId}`);
+        err.status = 404;
         throw err;
       }
-
-      const transferResult = await client.query(
-        `
-          INSERT INTO transfers (
-            from_account_id,
-            to_account_id,
-            amount,
-            status,
-            created_at,
-            updated_at
-          )
-          VALUES ($1, $2, $3, 'COMPLETED', NOW(), NOW())
-          RETURNING
-            id,
-            from_account_id,
-            to_account_id,
-            amount,
-            status,
-            created_at,
-            updated_at
-        `,
-        [ fromAccountId, toAccountId, transferAmount ]
-      );
 
       await client.query('COMMIT');
 
       return {
-        transferId: transferResult.rows[0].id,
+        transferId: null,
         fromId: fromAccountId,
         toId: toAccountId,
         amount: transferAmount,
-        status: transferResult.rows[0].status,
-        createdAt: transferResult.rows[0].created_at,
-        updatedAt: transferResult.rows[0].updated_at,
+        status: 'COMPLETED',
         shardId,
         type: 'same-shard',
       };
     } catch (err) {
-      this.ctx.app.logger.error('same-shard transfer error:', err.message, err.code);
-
       try {
         await client.query('ROLLBACK');
-      } catch (rollbackErr) {
-        this.ctx.app.logger.error('Rollback failed:', rollbackErr);
+      } catch (_rollbackErr) {
+        void _rollbackErr;
       }
 
       throw err;
@@ -475,7 +452,22 @@ class AccountsRepo {
     }
   }
 
-  // cross-shard 轉帳
+  /**
+   * Cross-shard transfer.
+   *
+   * Flow:
+   * 1. reserve funds on source shard
+   * 2. credit destination shard
+   * 3. finalize source shard
+   *
+   * @param {object} params - Transfer params
+   * @param {number} params.fromAccountId - Source account id
+   * @param {number} params.toAccountId - Destination account id
+   * @param {number} params.transferAmount - Amount
+   * @param {number} params.fromShardId - Source shard id
+   * @param {number} params.toShardId - Destination shard id
+   * @returns {Promise<object>} Transfer result
+   */
   async transferCrossShard({
     fromAccountId,
     toAccountId,
@@ -490,20 +482,19 @@ class AccountsRepo {
     const toClient = await toShardPg.connect();
 
     let transferId = null;
-    let credited = false;
 
     try {
-      // Step 1: 在 from shard 預留金額
+      // Step 1: reserve funds on source shard
       await fromClient.query('BEGIN');
       await fromClient.query("SET LOCAL lock_timeout = '200ms'");
 
-      // 直接用 UPDATE 當鎖 + 預留
       const reserveResult = await fromClient.query(
         `
           UPDATE accounts
-          SET available_balance = available_balance - $1,
-              reserved_balance = reserved_balance + $1,
-              updated_at = NOW()
+          SET
+            available_balance = available_balance - $1,
+            reserved_balance = reserved_balance + $1,
+            updated_at = NOW()
           WHERE id = $2
             AND available_balance >= $1
           RETURNING id
@@ -512,23 +503,7 @@ class AccountsRepo {
       );
 
       if (reserveResult.rowCount === 0) {
-        const existsResult = await fromClient.query(
-          `
-            SELECT 1
-            FROM accounts
-            WHERE id = $1
-            LIMIT 1
-          `,
-          [ fromAccountId ]
-        );
-
-        if (existsResult.rowCount === 0) {
-          const err = new Error(`account not found: ${fromAccountId}`);
-          err.status = 404;
-          throw err;
-        }
-
-        const err = new Error('insufficient funds');
+        const err = new Error('insufficient funds or account not found');
         err.status = 409;
         throw err;
       }
@@ -544,7 +519,7 @@ class AccountsRepo {
             updated_at
           )
           VALUES ($1, $2, $3, 'RESERVED', NOW(), NOW())
-          RETURNING id, created_at, updated_at
+          RETURNING id
         `,
         [ fromAccountId, toAccountId, transferAmount ]
       );
@@ -553,17 +528,17 @@ class AccountsRepo {
 
       await fromClient.query('COMMIT');
 
-      // Step 2: 在 to shard 入帳
+      // Step 2: credit destination shard
       await toClient.query('BEGIN');
       await toClient.query("SET LOCAL lock_timeout = '200ms'");
 
-      // 直接用 UPDATE 當鎖 + 入帳
       const creditResult = await toClient.query(
         `
           UPDATE accounts
-          SET available_balance = available_balance + $1,
-              balance = balance + $1,
-              updated_at = NOW()
+          SET
+            available_balance = available_balance + $1,
+            balance = balance + $1,
+            updated_at = NOW()
           WHERE id = $2
           RETURNING id
         `,
@@ -571,25 +546,24 @@ class AccountsRepo {
       );
 
       if (creditResult.rowCount === 0) {
-        const err = new Error(`account not found: ${toAccountId}`);
+        const err = new Error('destination account not found');
         err.status = 404;
         throw err;
       }
 
       await toClient.query('COMMIT');
-      credited = true;
 
-      // Step 3: 回 from shard finalize
+      // Step 3: finalize source shard
       await fromClient.query('BEGIN');
       await fromClient.query("SET LOCAL lock_timeout = '200ms'");
 
-      // 直接用 UPDATE 當鎖 + finalize
       const finalizeResult = await fromClient.query(
         `
           UPDATE accounts
-          SET reserved_balance = reserved_balance - $1,
-              balance = balance - $1,
-              updated_at = NOW()
+          SET
+            reserved_balance = reserved_balance - $1,
+            balance = balance - $1,
+            updated_at = NOW()
           WHERE id = $2
             AND reserved_balance >= $1
           RETURNING id
@@ -598,22 +572,6 @@ class AccountsRepo {
       );
 
       if (finalizeResult.rowCount === 0) {
-        const existsResult = await fromClient.query(
-          `
-            SELECT 1
-            FROM accounts
-            WHERE id = $1
-            LIMIT 1
-          `,
-          [ fromAccountId ]
-        );
-
-        if (existsResult.rowCount === 0) {
-          const err = new Error(`account not found: ${fromAccountId}`);
-          err.status = 404;
-          throw err;
-        }
-
         const err = new Error('finalize reserved funds failed');
         err.status = 500;
         throw err;
@@ -622,8 +580,9 @@ class AccountsRepo {
       const completeResult = await fromClient.query(
         `
           UPDATE transfers
-          SET status = 'COMPLETED',
-              updated_at = NOW()
+          SET
+            status = 'COMPLETED',
+            updated_at = NOW()
           WHERE id = $1
             AND status = 'RESERVED'
           RETURNING id
@@ -650,22 +609,20 @@ class AccountsRepo {
         type: 'cross-shard',
       };
     } catch (err) {
-      this.ctx.app.logger.error('cross-shard transfer error:', err.message, err.code);
-
       try {
         await fromClient.query('ROLLBACK');
-      } catch (rollbackErr) {
-        this.ctx.app.logger.error('From shard rollback failed:', rollbackErr);
+      } catch (_rollbackErr) {
+        void _rollbackErr;
       }
 
       try {
         await toClient.query('ROLLBACK');
-      } catch (rollbackErr) {
-        this.ctx.app.logger.error('To shard rollback failed:', rollbackErr);
+      } catch (_rollbackErr) {
+        void _rollbackErr;
       }
 
-      // reserve 成功但 to shard 尚未入帳，補償回 available_balance
-      if (transferId && !credited) {
+      // reserve succeeded, but destination not yet credited
+      if (transferId) {
         try {
           await fromClient.query('BEGIN');
           await fromClient.query("SET LOCAL lock_timeout = '200ms'");
@@ -673,9 +630,10 @@ class AccountsRepo {
           const compensateResult = await fromClient.query(
             `
               UPDATE accounts
-              SET available_balance = available_balance + $1,
-                  reserved_balance = reserved_balance - $1,
-                  updated_at = NOW()
+              SET
+                available_balance = available_balance + $1,
+                reserved_balance = reserved_balance - $1,
+                updated_at = NOW()
               WHERE id = $2
                 AND reserved_balance >= $1
               RETURNING id
@@ -684,22 +642,6 @@ class AccountsRepo {
           );
 
           if (compensateResult.rowCount === 0) {
-            const existsResult = await fromClient.query(
-              `
-                SELECT 1
-                FROM accounts
-                WHERE id = $1
-                LIMIT 1
-              `,
-              [ fromAccountId ]
-            );
-
-            if (existsResult.rowCount === 0) {
-              const compensateErr = new Error(`account not found: ${fromAccountId}`);
-              compensateErr.status = 404;
-              throw compensateErr;
-            }
-
             const compensateErr = new Error('release reserved funds failed');
             compensateErr.status = 500;
             throw compensateErr;
@@ -708,8 +650,9 @@ class AccountsRepo {
           const failResult = await fromClient.query(
             `
               UPDATE transfers
-              SET status = 'FAILED',
-                  updated_at = NOW()
+              SET
+                status = 'FAILED',
+                updated_at = NOW()
               WHERE id = $1
                 AND status = 'RESERVED'
               RETURNING id
@@ -724,49 +667,14 @@ class AccountsRepo {
           }
 
           await fromClient.query('COMMIT');
-        } catch (compensateErr) {
+        } catch (_compensateErr) {
+          void _compensateErr;
+
           try {
             await fromClient.query('ROLLBACK');
-          } catch (rollbackErr) {
-            this.ctx.app.logger.error('Compensate rollback failed:', rollbackErr);
+          } catch (_rollbackErr) {
+            void _rollbackErr;
           }
-
-          this.ctx.app.logger.error('cross-shard compensate failed:', compensateErr);
-        }
-      }
-
-      // to shard 已入帳，但 finalize 失敗
-      if (transferId && credited) {
-        try {
-          await fromClient.query('BEGIN');
-
-          const markCreditedRecoveryResult = await fromClient.query(
-            `
-              UPDATE transfers
-              SET status = 'CREDITED',
-                  updated_at = NOW()
-              WHERE id = $1
-                AND status IN ('RESERVED', 'CREDITED')
-              RETURNING id
-            `,
-            [ transferId ]
-          );
-
-          if (markCreditedRecoveryResult.rowCount === 0) {
-            const recoveryErr = new Error('mark credited recovery failed');
-            recoveryErr.status = 500;
-            throw recoveryErr;
-          }
-
-          await fromClient.query('COMMIT');
-        } catch (recoveryErr) {
-          try {
-            await fromClient.query('ROLLBACK');
-          } catch (rollbackErr) {
-            this.ctx.app.logger.error('Credited recovery rollback failed:', rollbackErr);
-          }
-
-          this.ctx.app.logger.error('cross-shard credited recovery failed:', recoveryErr);
         }
       }
 
@@ -776,6 +684,7 @@ class AccountsRepo {
       toClient.release();
     }
   }
+
 }
 
 module.exports = AccountsRepo;

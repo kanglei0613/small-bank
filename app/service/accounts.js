@@ -77,11 +77,11 @@ class AccountsService {
       const cached = await app.redis.get(key);
 
       if (cached) {
-        logger.info('[Redis] account cache hit: %s', key);
+        // logger.info('[Redis] account cache hit: %s', key);
         return cache.parseJSON(cached);
       }
 
-      logger.info('[Redis] account cache miss: %s', key);
+      // logger.info('[Redis] account cache miss: %s', key);
     } catch (err) {
       // Redis 失敗時不要中斷主流程，直接 fallback 到 DB
       logger.error('[Redis] get error, key=%s, err=%s', key, err.message);
@@ -104,10 +104,10 @@ class AccountsService {
         cache.accountTTL()
       );
 
-      logger.info('[Redis] account cache set: %s', key);
+      // logger.info('[Redis] account cache set: %s', key);
     } catch (err) {
       // Redis set 失敗也不要影響正常回傳
-      logger.error('[Redis] set error, key=%s, err=%s', key, err.message);
+      // logger.error('[Redis] set error, key=%s, err=%s', key, err.message);
     }
 
     return account;
@@ -125,15 +125,15 @@ class AccountsService {
       throw err;
     }
 
-    const { app, logger } = this.ctx;
+    const { app } = this.ctx;
     const key = cache.accountKey(aid);
 
     // 刪除 Redis cache
     try {
       await app.redis.del(key);
-      logger.info('[Redis] account cache deleted: %s', key);
+      // logger.info('[Redis] account cache deleted: %s', key);
     } catch (err) {
-      logger.error('[Redis] del error, key=%s, err=%s', key, err.message);
+      // logger.error('[Redis] del error, key=%s, err=%s', key, err.message);
     }
   }
 }

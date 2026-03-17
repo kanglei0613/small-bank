@@ -7,40 +7,44 @@ class TransferController extends Controller {
   // POST /transfers
   //
   // 作用：
-  // - 接收轉帳請求
-  // - 建立 transfer job
-  // - 立刻回傳 jobId
-  //
-  // 注意：
-  // - 這裡不會直接回傳最終 transfer 結果
-  // - client 需要再呼叫 GET /transfer-jobs/:jobId 查詢狀態
+  // - same-shard: 直接同步完成（fast path）
+  // - cross-shard: 建立 transfer job，立刻回傳 jobId（slow path）
   async create() {
     const { ctx } = this;
 
-    // 避免 request body 不存在時直接報錯
     const body = ctx.request.body || {};
 
-    // 從 request body 取出欄位，並轉成 Number
     const fromId = Number(body.fromId);
     const toId = Number(body.toId);
     const amount = Number(body.amount);
 
     try {
-      // 建立 transfer job
-      const result = await ctx.service.transfers.enqueueTransfer({
+      const result = await ctx.service.transfers.submitTransfer({
         fromId,
         toId,
         amount,
       });
 
-      // Async Job API：建立成功後回傳 jobId
+      // same-shard：同步完成
+      if (result.mode === 'sync-same-shard') {
+        ctx.status = 200;
+        ctx.body = {
+          ok: true,
+          data: {
+            mode: 'sync-same-shard',
+            status: 'completed',
+          },
+        };
+        return;
+      }
+
+      // cross-shard：排入 async queue
       ctx.status = 202;
       ctx.body = {
         ok: true,
         data: result,
       };
     } catch (e) {
-      // 記錄錯誤 log，方便 debug
       ctx.app.logger.error('transfers.create error:', e);
 
       // 503 Service Unavailable
@@ -75,7 +79,8 @@ class TransferController extends Controller {
       ctx.status = 500;
       ctx.body = {
         ok: false,
-        message: 'internal server error',
+        message: e.message,
+        stack: e.stack,
       };
     }
   }
