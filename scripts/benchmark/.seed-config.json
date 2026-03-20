@@ -1,0 +1,10 @@
+{
+  "minId": 1,
+  "maxId": 50000,
+  "minUserId": 1,
+  "maxUserId": 50000,
+  "initBal": 1000000,
+  "totalAccounts": 50000,
+  "totalUsers": 50000,
+  "createdAt": "2026-03-20T09:47:43.621Z"
+}

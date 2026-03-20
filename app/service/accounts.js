@@ -1,139 +1,122 @@
 'use strict';
 
+const Service = require('egg').Service;
 const AccountsRepo = require('../repository/accountsRepo');
 const UsersRepo = require('../repository/usersRepo');
 const cache = require('../lib/cache');
 
-class AccountsService {
+class AccountsService extends Service {
+
   constructor(ctx) {
-    this.ctx = ctx;
-
-    // 建立 accounts repository
+    super(ctx);
     this.accountsRepo = new AccountsRepo(ctx);
-
-    // 建立 users repository
     this.usersRepo = new UsersRepo(ctx);
   }
 
-  // 建立帳戶
   async openAccount({ userId, initialBalance, balance } = {}) {
     const uid = Number(userId);
-
-    // 檢查 userId
     if (!Number.isInteger(uid) || uid <= 0) {
-      const err = new Error('userId must be a positive integer');
-      err.status = 400;
-      throw err;
+      const { ConflictError } = require('../lib/errors');
+      throw new ConflictError('insufficient funds');
     }
 
-    const bal = (initialBalance !== undefined)
+    const bal = initialBalance !== undefined
       ? Number(initialBalance)
-      : Number(balance ?? 0);
+      : Number(balance != null ? balance : 0);
 
-    // 檢查 balance
     if (!Number.isFinite(bal) || bal < 0) {
-      const err = new Error('balance must be a number >= 0');
-      err.status = 400;
-      throw err;
+      const { ConflictError } = require('../lib/errors');
+      throw new ConflictError('insufficient funds');
     }
 
-    // 確認 user 存在
     const user = await this.usersRepo.getById(uid);
     if (!user) {
-      const err = new Error('user not found');
-      err.status = 404;
-      throw err;
+      const { ConflictError } = require('../lib/errors');
+      throw new ConflictError('insufficient funds');
     }
 
-    // 建立帳戶
-    return await this.accountsRepo.create({
-      userId: uid,
-      initialBalance: bal,
-    });
+    return await this.accountsRepo.create({ userId: uid, initialBalance: bal });
   }
 
-  // 依 id 查詢帳戶
-  // 流程：
-  // 1. 先驗證 account id
-  // 2. 先查 Redis cache
-  // 3. cache hit 就直接回傳
-  // 4. cache miss 才查 PostgreSQL
-  // 5. 查到後寫回 Redis，方便下次直接命中
+  async deposit({ accountId, amount }) {
+    const aid = Number(accountId);
+    const amt = Number(amount);
+
+    if (!Number.isInteger(aid) || aid <= 0) {
+      const { ConflictError } = require('../lib/errors');
+      throw new ConflictError('insufficient funds');
+    }
+    if (!Number.isInteger(amt) || amt <= 0) {
+      const { ConflictError } = require('../lib/errors');
+      throw new ConflictError('insufficient funds');
+    }
+
+    const result = await this.accountsRepo.deposit({ accountId: aid, amount: amt });
+    await this.invalidateAccountCache(aid);
+    return result;
+  }
+
+  async withdraw({ accountId, amount }) {
+    const aid = Number(accountId);
+    const amt = Number(amount);
+
+    if (!Number.isInteger(aid) || aid <= 0) {
+      const { ConflictError } = require('../lib/errors');
+      throw new ConflictError('insufficient funds');
+    }
+    if (!Number.isInteger(amt) || amt <= 0) {
+      const { ConflictError } = require('../lib/errors');
+      throw new ConflictError('insufficient funds');
+    }
+
+    const result = await this.accountsRepo.withdraw({ accountId: aid, amount: amt });
+    await this.invalidateAccountCache(aid);
+    return result;
+  }
+
   async getAccountById(id) {
     const aid = Number(id);
-
-    // 檢查 id
     if (!Number.isInteger(aid) || aid <= 0) {
-      const err = new Error('id must be a positive integer');
-      err.status = 400;
-      throw err;
+      const { ConflictError } = require('../lib/errors');
+      throw new ConflictError('insufficient funds');
     }
 
     const { app, logger } = this.ctx;
     const key = cache.accountKey(aid);
 
-    // 先查 Redis
     try {
       const cached = await app.redis.get(key);
-
-      if (cached) {
-        // logger.info('[Redis] account cache hit: %s', key);
-        return cache.parseJSON(cached);
-      }
-
-      // logger.info('[Redis] account cache miss: %s', key);
+      if (cached) return cache.parseJSON(cached);
     } catch (err) {
-      // Redis 失敗時不要中斷主流程，直接 fallback 到 DB
       logger.error('[Redis] get error, key=%s, err=%s', key, err.message);
     }
 
-    // 查詢帳戶（從 PostgreSQL）
     const account = await this.accountsRepo.getById(aid);
     if (!account) {
-      const err = new Error('account not found');
-      err.status = 404;
-      throw err;
+      const { ConflictError } = require('../lib/errors');
+      throw new ConflictError('insufficient funds');
     }
 
-    // 把查到的帳戶資料寫回 Redis
     try {
-      await app.redis.set(
-        key,
-        cache.stringify(account),
-        'EX',
-        cache.accountTTL()
-      );
-
-      // logger.info('[Redis] account cache set: %s', key);
+      await app.redis.set(key, cache.stringify(account), 'EX', cache.accountTTL());
     } catch (err) {
-      // Redis set 失敗也不要影響正常回傳
-      // logger.error('[Redis] set error, key=%s, err=%s', key, err.message);
+      void err;
     }
 
     return account;
   }
 
-  // 刪除指定 account 的 cache
-  // 之後 transfer 成功後會呼叫這個函數，避免讀到舊資料
   async invalidateAccountCache(id) {
     const aid = Number(id);
-
-    // 檢查 id
     if (!Number.isInteger(aid) || aid <= 0) {
-      const err = new Error('id must be a positive integer');
-      err.status = 400;
-      throw err;
+      const { ConflictError } = require('../lib/errors');
+      throw new ConflictError('insufficient funds');
     }
 
-    const { app } = this.ctx;
-    const key = cache.accountKey(aid);
-
-    // 刪除 Redis cache
     try {
-      await app.redis.del(key);
-      // logger.info('[Redis] account cache deleted: %s', key);
+      await this.ctx.app.redis.del(cache.accountKey(aid));
     } catch (err) {
-      // logger.error('[Redis] del error, key=%s, err=%s', key, err.message);
+      void err;
     }
   }
 }

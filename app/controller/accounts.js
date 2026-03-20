@@ -1,70 +1,53 @@
 'use strict';
 
 const Controller = require('egg').Controller;
-const AccountsService = require('../service/accounts');
 
 class AccountsController extends Controller {
 
-  // POST /accounts 建立帳戶
+  // POST /accounts
   async create() {
     const { ctx } = this;
+    const { userId, initialBalance } = ctx.request.body || {};
 
-    try {
-      // 建立service
-      const service = new AccountsService(ctx);
+    const account = await ctx.service.accounts.openAccount({ userId, initialBalance });
 
-      // 取得request body
-      const { userId, initialBalance } = ctx.request.body || {};
-
-      // 呼叫service建立帳戶
-      const account = await service.openAccount({
-        userId,
-        initialBalance,
-      });
-
-      // 回傳成功結果
-      ctx.status = 201;
-      ctx.body = {
-        ok: true,
-        data: account,
-      };
-
-    } catch (err) {
-      // 錯誤處理
-      ctx.status = err.status || 500;
-      ctx.body = {
-        ok: false,
-        message: err.message,
-      };
-    }
+    ctx.status = 201;
+    ctx.body = { ok: true, data: account };
   }
 
-  // GET /accounts/:id 查詢帳戶
+  // POST /accounts/:id/deposit
+  async deposit() {
+    const { ctx } = this;
+    const { amount } = ctx.request.body || {};
+
+    const result = await ctx.service.accounts.deposit({
+      accountId: ctx.params.id,
+      amount,
+    });
+
+    ctx.body = { ok: true, data: result };
+  }
+
+  // POST /accounts/:id/withdraw
+  async withdraw() {
+    const { ctx } = this;
+    const { amount } = ctx.request.body || {};
+
+    const result = await ctx.service.accounts.withdraw({
+      accountId: ctx.params.id,
+      amount,
+    });
+
+    ctx.body = { ok: true, data: result };
+  }
+
+  // GET /accounts/:id
   async show() {
     const { ctx } = this;
 
-    try {
-      // 建立service
-      const service = new AccountsService(ctx);
+    const account = await ctx.service.accounts.getAccountById(ctx.params.id);
 
-      // 查詢帳戶
-      const account = await service.getAccountById(ctx.params.id);
-
-      // 回傳成功結果
-      ctx.status = 200;
-      ctx.body = {
-        ok: true,
-        data: account,
-      };
-
-    } catch (err) {
-      // 錯誤處理
-      ctx.status = err.status || 500;
-      ctx.body = {
-        ok: false,
-        message: err.message,
-      };
-    }
+    ctx.body = { ok: true, data: account };
   }
 }
 

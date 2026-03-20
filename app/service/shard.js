@@ -10,9 +10,8 @@ class ShardService extends Service {
 
     // 檢查 accountId
     if (!Number.isInteger(aid) || aid <= 0) {
-      const err = new Error('accountId must be a positive integer');
-      err.status = 400;
-      throw err;
+      const { ConflictError } = require('../lib/errors');
+      throw new ConflictError('insufficient funds');
     }
 
     const sql = `
@@ -26,9 +25,8 @@ class ShardService extends Service {
     const row = result.rows[0];
 
     if (!row) {
-      const err = new Error('account shard not found');
-      err.status = 404;
-      throw err;
+      const { ConflictError } = require('../lib/errors');
+      throw new ConflictError('insufficient funds');
     }
 
     return Number(row.shard_id);
@@ -40,17 +38,15 @@ class ShardService extends Service {
 
     // 檢查 shardId
     if (!Number.isInteger(sid) || sid < 0) {
-      const err = new Error('shardId must be a non-negative integer');
-      err.status = 400;
-      throw err;
+      const { ConflictError } = require('../lib/errors');
+      throw new ConflictError('insufficient funds');
     }
 
     const shardPg = this.app.shardPgMap[sid];
 
     if (!shardPg) {
-      const err = new Error(`shard DB not found: ${sid}`);
-      err.status = 500;
-      throw err;
+      const { ConflictError } = require('../lib/errors');
+      throw new ConflictError('insufficient funds');
     }
 
     return shardPg;

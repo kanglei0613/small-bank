@@ -88,6 +88,13 @@ module.exports = app => {
     // client 可透過輪詢這個 API 取得最終轉帳結果
     router.get('/transfer-jobs/:jobId', 'transferJobs.show');
 
+    // 存款 / 提款 API
+    // 這兩條路徑不走 queue，直接做單帳戶 DB transaction，
+    // 主要用於：
+    // - 系統管理員操作（例如：補帳）
+    // - 使用者操作（例如：線上儲值 / 提款到銀行帳戶）
+    router.post('/accounts/:id/deposit', 'accounts.deposit');
+    router.post('/accounts/:id/withdraw', 'accounts.withdraw');
 
     // =========================
     // Queue API
@@ -143,6 +150,8 @@ module.exports = app => {
   if (apiRole === 'all' || apiRole === 'transfer') {
 
     // 建立轉帳（只建立 job，不直接執行轉帳）
-    router.post('/transfers', 'transfers.create');
+    router.post('/transfers', 'transfers.submit');
   }
+
+  router.get('/transfer-jobs/:jobId/stream', 'transferJobs.stream');
 };

@@ -1,643 +1,1015 @@
-import React, { useState, useMemo } from "react";
+import React, { useState, useCallback } from "react";
 
 const GENERAL_API = "http://127.0.0.1:7001";
 const TRANSFER_API = "http://127.0.0.1:7010";
 
-async function request(url, options) {
+async function request(url, options = {}) {
   const res = await fetch(url, {
     headers: { "Content-Type": "application/json" },
     ...options,
   });
-
   const data = await res.json().catch(() => null);
-
-  if (!res.ok) {
-    throw new Error(data?.message || `HTTP ${res.status}`);
-  }
-
+  if (!res.ok) throw new Error(data?.message || `HTTP ${res.status}`);
   return data;
-}
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function formatMoney(v) {
   return new Intl.NumberFormat("zh-TW").format(Number(v || 0));
 }
 
+function formatDate(ts) {
+  if (!ts) return "";
+  return new Date(ts).toLocaleString("zh-TW", {
+    month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit",
+  });
+}
+
+const STATUS_LABEL = {
+  COMPLETED: "完成",
+  RESERVED:  "預留",
+  FAILED:    "失敗",
+  PENDING:   "處理中",
+};
+
+const STATUS_COLOR = {
+  COMPLETED: "#16a34a",
+  RESERVED:  "#d97706",
+  FAILED:    "#dc2626",
+  PENDING:   "#6366f1",
+};
+
+// ─── CopyBtn ──────────────────────────────────────────────
+function CopyBtn({ value }) {
+  const [copied, setCopied] = useState(false);
+  const handleCopy = () => {
+    navigator.clipboard.writeText(String(value)).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1800);
+    });
+  };
+  return (
+    <button onClick={handleCopy} style={{
+      padding: "2px 10px",
+      borderRadius: 6,
+      border: "1px solid #d1d5db",
+      background: copied ? "#f0fdf4" : "#f9fafb",
+      color: copied ? "#16a34a" : "#6b7280",
+      fontSize: 12,
+      cursor: "pointer",
+      fontWeight: 500,
+      transition: "all 0.15s",
+      whiteSpace: "nowrap",
+    }}>
+      {copied ? "已複製" : "複製"}
+    </button>
+  );
+}
+
+// ─── ResultModal ──────────────────────────────────────────
+// 通用彈出式結果視窗，支援滑動、底部確定按鈕
+function ResultModal({ modal, onClose }) {
+  if (!modal) return null;
+  const isError = modal.type === "error";
+  return (
+    <div style={{
+      position: "fixed", inset: 0,
+      background: "rgba(15,23,42,0.5)",
+      display: "flex", alignItems: "center", justifyContent: "center",
+      zIndex: 9998,
+      padding: "20px 16px",
+    }}>
+      <div style={{
+        background: "#fff", borderRadius: 18,
+        width: "100%", maxWidth: 400,
+        maxHeight: "80vh",
+        boxShadow: "0 20px 60px rgba(0,0,0,0.18)",
+        display: "flex", flexDirection: "column",
+        overflow: "hidden",
+      }}>
+        {/* 標題 */}
+        <div style={{
+          padding: "20px 22px 14px",
+          borderBottom: "1px solid #f3f4f6",
+          flexShrink: 0,
+        }}>
+          <div style={{
+            fontSize: 17, fontWeight: 700,
+            color: isError ? "#991b1b" : "#111827",
+          }}>
+            {isError ? "操作失敗" : modal.title || "操作成功"}
+          </div>
+        </div>
+
+        {/* 內容（可滑動） */}
+        <div style={{
+          padding: "16px 22px",
+          overflowY: "auto",
+          flex: 1,
+          fontSize: 14,
+          color: "#374151",
+          lineHeight: 1.7,
+        }}>
+          {modal.content}
+        </div>
+
+        {/* 底部確定按鈕 */}
+        <div style={{
+          padding: "14px 22px",
+          borderTop: "1px solid #f3f4f6",
+          flexShrink: 0,
+        }}>
+          <button onClick={onClose} style={{
+            width: "100%", padding: "11px 0",
+            background: isError ? "#dc2626" : "#2563eb",
+            color: "#fff", border: "none",
+            borderRadius: 10, fontSize: 15, fontWeight: 600,
+            cursor: "pointer",
+          }}>確定</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Toast ────────────────────────────────────────────────
+function Toast({ toasts }) {
+  return (
+    <div style={{ position: "fixed", top: 20, right: 20, zIndex: 9999, display: "flex", flexDirection: "column", gap: 10 }}>
+      {toasts.map(t => (
+        <div key={t.id} style={{
+          background: t.type === "error" ? "#fef2f2" : "#f0fdf4",
+          border: `1px solid ${t.type === "error" ? "#fca5a5" : "#86efac"}`,
+          color: t.type === "error" ? "#991b1b" : "#166534",
+          padding: "12px 18px",
+          borderRadius: 12,
+          fontSize: 14,
+          maxWidth: 340,
+          boxShadow: "0 4px 20px rgba(0,0,0,0.10)",
+          animation: "slideIn 0.2s ease",
+        }}>
+          {t.msg}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ─── Card ─────────────────────────────────────────────────
+function Card({ title, children, accent }) {
+  return (
+    <div style={{
+      background: "#fff",
+      borderRadius: 16,
+      boxShadow: "0 1px 4px rgba(0,0,0,0.06), 0 4px 16px rgba(0,0,0,0.04)",
+      overflow: "hidden",
+      marginBottom: 20,
+    }}>
+      {title && (
+        <div style={{
+          padding: "14px 20px",
+          borderBottom: "1px solid #f3f4f6",
+          display: "flex",
+          alignItems: "center",
+          gap: 10,
+        }}>
+          {accent && <span style={{ width: 4, height: 18, background: accent, borderRadius: 2, display: "inline-block" }} />}
+          <span style={{ fontWeight: 600, fontSize: 15, color: "#111827" }}>{title}</span>
+        </div>
+      )}
+      <div style={{ padding: "16px 20px" }}>{children}</div>
+    </div>
+  );
+}
+
+// ─── Input ────────────────────────────────────────────────
+function Input({ label, ...props }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 5, flex: 1, minWidth: 160 }}>
+      {label && <label style={{ fontSize: 12, fontWeight: 500, color: "#6b7280" }}>{label}</label>}
+      <input style={{
+        padding: "9px 13px",
+        borderRadius: 9,
+        border: "1.5px solid #e5e7eb",
+        fontSize: 14,
+        color: "#111827",
+        outline: "none",
+        transition: "border 0.15s",
+        background: "#fafafa",
+        width: "100%",
+        boxSizing: "border-box",
+      }}
+        onFocus={e => e.target.style.border = "1.5px solid #2563eb"}
+        onBlur={e => e.target.style.border = "1.5px solid #e5e7eb"}
+        {...props}
+      />
+    </div>
+  );
+}
+
+// ─── Button ───────────────────────────────────────────────
+function Btn({ children, variant = "primary", loading, ...props }) {
+  const styles = {
+    primary: { background: "#111827", color: "#fff", border: "none" },
+    blue:    { background: "#2563eb", color: "#fff", border: "none" },
+    outline: { background: "#fff", color: "#374151", border: "1.5px solid #e5e7eb" },
+    green:   { background: "#16a34a", color: "#fff", border: "none" },
+    danger:  { background: "#dc2626", color: "#fff", border: "none" },
+  };
+  return (
+    <button
+      disabled={loading}
+      style={{
+        padding: "9px 18px",
+        borderRadius: 9,
+        fontSize: 14,
+        fontWeight: 500,
+        cursor: loading ? "not-allowed" : "pointer",
+        opacity: loading ? 0.65 : 1,
+        transition: "opacity 0.15s, transform 0.1s",
+        whiteSpace: "nowrap",
+        ...styles[variant],
+      }}
+      onMouseDown={e => !loading && (e.currentTarget.style.transform = "scale(0.97)")}
+      onMouseUp={e => (e.currentTarget.style.transform = "scale(1)")}
+      {...props}
+    >
+      {loading ? "處理中..." : children}
+    </button>
+  );
+}
+
+// ─── InfoRow ──────────────────────────────────────────────
+function InfoRow({ label, value, copy }) {
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "7px 0", borderBottom: "1px solid #f3f4f6" }}>
+      <span style={{ fontSize: 13, color: "#6b7280" }}>{label}</span>
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <span style={{ fontSize: 14, fontWeight: 500, color: "#111827" }}>{value}</span>
+        {copy && <CopyBtn value={value} />}
+      </div>
+    </div>
+  );
+}
+
+// ─── Account Card ─────────────────────────────────────────
+function AccountCard({ account }) {
+  if (!account) return null;
+  return (
+    <div style={{
+      marginTop: 14,
+      background: "linear-gradient(135deg, #0f172a 0%, #1e40af 100%)",
+      borderRadius: 14,
+      padding: "20px 22px",
+      color: "#fff",
+      position: "relative",
+      overflow: "hidden",
+    }}>
+      <div style={{
+        position: "absolute", top: -30, right: -30,
+        width: 120, height: 120,
+        background: "rgba(255,255,255,0.04)",
+        borderRadius: "50%",
+      }} />
+      <div style={{ fontSize: 11, opacity: 0.6, letterSpacing: 1, textTransform: "uppercase", marginBottom: 4 }}>
+        帳戶編號 · {account.id}
+      </div>
+      <div style={{ fontSize: 28, fontWeight: 700, letterSpacing: -0.5, marginBottom: 14, fontVariantNumeric: "tabular-nums" }}>
+        NT$ {formatMoney(account.balance)}
+      </div>
+      <div style={{ display: "flex", gap: 20, fontSize: 12, opacity: 0.75 }}>
+        <div>
+          <div style={{ marginBottom: 2 }}>可用餘額</div>
+          <div style={{ fontWeight: 600, fontSize: 14 }}>NT$ {formatMoney(account.availableBalance)}</div>
+        </div>
+        {account.reservedBalance > 0 && (
+          <div>
+            <div style={{ marginBottom: 2 }}>預留金額</div>
+            <div style={{ fontWeight: 600, fontSize: 14, color: "#fbbf24" }}>NT$ {formatMoney(account.reservedBalance)}</div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Transfer Row ─────────────────────────────────────────
+function TransferRow({ item, currentAccountId }) {
+  const isOut = String(item.fromId) === String(currentAccountId);
+  return (
+    <div style={{
+      display: "flex", alignItems: "center",
+      padding: "12px 0",
+      borderBottom: "1px solid #f9fafb",
+    }}>
+      <div style={{
+        width: 36, height: 36, borderRadius: "50%",
+        background: isOut ? "#fef2f2" : "#f0fdf4",
+        display: "flex", alignItems: "center", justifyContent: "center",
+        fontSize: 16, marginRight: 12, flexShrink: 0,
+      }}>
+        {isOut ? "↑" : "↓"}
+      </div>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ fontSize: 14, fontWeight: 500, color: "#111827" }}>
+          {isOut ? `轉出至 ${item.toId}` : `轉入自 ${item.fromId}`}
+        </div>
+        <div style={{ fontSize: 12, color: "#9ca3af", marginTop: 2 }}>
+          #{item.id} · {formatDate(item.createdAt)}
+        </div>
+      </div>
+      <div style={{ textAlign: "right" }}>
+        <div style={{
+          fontSize: 15, fontWeight: 600,
+          color: isOut ? "#dc2626" : "#16a34a",
+          fontVariantNumeric: "tabular-nums",
+        }}>
+          {isOut ? "-" : "+"}NT$ {formatMoney(item.amount)}
+        </div>
+        <div style={{ fontSize: 11, color: STATUS_COLOR[item.status] || "#6b7280", marginTop: 2 }}>
+          {STATUS_LABEL[item.status] || item.status}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Transfer Progress Modal ──────────────────────────────
+function TransferModal({ state, onClose }) {
+  if (!state) return null;
+  const isDone = state.status === "success" || state.status === "failed";
+  return (
+    <div style={{
+      position: "fixed", inset: 0,
+      background: "rgba(15,23,42,0.5)",
+      display: "flex", alignItems: "center", justifyContent: "center",
+      zIndex: 9999, padding: "20px 16px",
+    }}>
+      <div style={{
+        background: "#fff", borderRadius: 18,
+        width: "100%", maxWidth: 400,
+        maxHeight: "80vh",
+        boxShadow: "0 20px 60px rgba(0,0,0,0.18)",
+        display: "flex", flexDirection: "column",
+        overflow: "hidden",
+      }}>
+        <div style={{ padding: "24px 24px 16px", overflowY: "auto", flex: 1, textAlign: "center" }}>
+          {!isDone && (
+            <>
+              <div style={{
+                width: 48, height: 48,
+                border: "4px solid #e5e7eb",
+                borderTop: "4px solid #2563eb",
+                borderRadius: "50%",
+                margin: "0 auto 14px",
+                animation: "spin 0.8s linear infinite",
+              }} />
+              <div style={{ fontSize: 16, fontWeight: 600, color: "#111827" }}>轉帳處理中</div>
+              <div style={{ fontSize: 13, color: "#6b7280", marginTop: 6 }}>
+                NT$ {formatMoney(state.amount)} &nbsp;{state.fromId} → {state.toId}
+              </div>
+              <div style={{ fontSize: 12, color: "#9ca3af", marginTop: 10 }}>
+                {state.attempts > 0 ? `已等待 ${(state.attempts * 0.5).toFixed(1)} 秒` : "正在送出..."}
+              </div>
+            </>
+          )}
+          {state.status === "success" && (
+            <>
+              <div style={{ fontSize: 40, marginBottom: 10 }}>✓</div>
+              <div style={{ fontSize: 18, fontWeight: 700, color: "#166534", marginBottom: 6 }}>轉帳成功</div>
+              <div style={{ fontSize: 14, color: "#374151", marginBottom: 6 }}>
+                NT$ {formatMoney(state.amount)} &nbsp;{state.fromId} → {state.toId}
+              </div>
+              {state.balance != null && (
+                <div style={{ fontSize: 13, color: "#6b7280" }}>
+                  轉出帳戶餘額：NT$ {formatMoney(state.balance)}
+                </div>
+              )}
+            </>
+          )}
+          {state.status === "failed" && (
+            <>
+              <div style={{ fontSize: 40, marginBottom: 10 }}>✕</div>
+              <div style={{ fontSize: 18, fontWeight: 700, color: "#991b1b", marginBottom: 6 }}>轉帳失敗</div>
+              <div style={{ fontSize: 14, color: "#6b7280" }}>{state.errorMsg || "請稍後再試"}</div>
+            </>
+          )}
+        </div>
+        {isDone && (
+          <div style={{ padding: "14px 24px", borderTop: "1px solid #f3f4f6", flexShrink: 0 }}>
+            <button onClick={onClose} style={{
+              width: "100%", padding: "11px 0",
+              background: state.status === "success" ? "#2563eb" : "#dc2626",
+              color: "#fff", border: "none",
+              borderRadius: 10, fontSize: 15, fontWeight: 600,
+              cursor: "pointer",
+            }}>確定</button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Nav Tab ──────────────────────────────────────────────
+function NavTab({ tabs, active, onChange }) {
+  return (
+    <div style={{
+      display: "flex", gap: 4,
+      background: "#f3f4f6", borderRadius: 10,
+      padding: 4, marginBottom: 20,
+    }}>
+      {tabs.map(t => (
+        <button key={t.key} onClick={() => onChange(t.key)} style={{
+          flex: 1, padding: "8px 0",
+          borderRadius: 8, border: "none",
+          fontSize: 14, fontWeight: active === t.key ? 600 : 400,
+          background: active === t.key ? "#fff" : "transparent",
+          color: active === t.key ? "#111827" : "#6b7280",
+          cursor: "pointer",
+          boxShadow: active === t.key ? "0 1px 4px rgba(0,0,0,0.08)" : "none",
+          transition: "all 0.15s",
+        }}>
+          {t.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// ─── Main App ─────────────────────────────────────────────
 export default function App() {
+  const [tab, setTab] = useState("account");
+  const [toasts, setToasts] = useState([]);
+  const [resultModal, setResultModal] = useState(null);
+
+  // User
   const [userName, setUserName] = useState("");
   const [userId, setUserId] = useState("");
+  const [userInfo, setUserInfo] = useState(null);
 
+  // Account
   const [accountUserId, setAccountUserId] = useState("");
   const [initialBalance, setInitialBalance] = useState("");
   const [accountId, setAccountId] = useState("");
   const [account, setAccount] = useState(null);
 
+  // Deposit / Withdraw
+  const [depositAmount, setDepositAmount] = useState("");
+  const [withdrawAmount, setWithdrawAmount] = useState("");
+
+  // Transfer
   const [fromId, setFromId] = useState("");
   const [toId, setToId] = useState("");
   const [amount, setAmount] = useState("");
+  const [transferModal, setTransferModal] = useState(null);
 
+  // History
   const [historyId, setHistoryId] = useState("");
   const [history, setHistory] = useState([]);
 
-  const [result, setResult] = useState(null);
   const [loading, setLoading] = useState("");
 
-  const status = useMemo(() => {
-    if (!result) return null;
-    return result.status;
-  }, [result]);
+  const toast = useCallback((msg, type = "success") => {
+    const id = Date.now();
+    setToasts(prev => [...prev, { id, msg, type }]);
+    setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 3500);
+  }, []);
 
+  const showResult = useCallback((title, content, type = "success") => {
+    setResultModal({ title, content, type });
+  }, []);
+
+  // ── User actions ──
   async function createUser() {
-    setLoading("user");
-
+    if (!userName.trim()) return toast("請輸入使用者名稱", "error");
+    setLoading("createUser");
     try {
       const res = await request(`${GENERAL_API}/users`, {
         method: "POST",
-        body: JSON.stringify({ name: userName }),
+        body: JSON.stringify({ name: userName.trim() }),
       });
-
-      const newUser = res?.data;
-
-      setUserId(String(newUser?.id || ""));
-
-      setResult({
-        status: "success",
-        msg: `使用者建立成功：${newUser?.name || userName}（使用者編號：${newUser?.id}）`,
-      });
+      const u = res?.data;
+      setUserId(String(u?.id || ""));
+      setUserInfo(u);
+      showResult("建立使用者成功", (
+        <div>
+          <InfoRow label="名稱" value={u?.name} />
+          <InfoRow label="使用者編號" value={u?.id} copy />
+        </div>
+      ));
     } catch (e) {
-      setResult({
-        status: "error",
-        msg: `建立使用者失敗：${e.message}`,
-      });
+      showResult("建立使用者失敗", <div style={{ color: "#6b7280" }}>{e.message}</div>, "error");
     } finally {
       setLoading("");
     }
   }
 
   async function getUser() {
-    setLoading("user");
-
+    if (!userId.trim()) return toast("請輸入使用者編號", "error");
+    setLoading("getUser");
     try {
-      const res = await request(`${GENERAL_API}/users/${userId}`);
-
-      const user = res?.data;
-
-      setResult({
-      status: "success",
-      msg: `查詢使用者成功
-
-  使用者名稱：${user?.name || ""}
-  使用者編號：${user?.id || ""}
-
-  帳戶列表：
-  ${user?.accounts?.length ? user.accounts.map(id => `- 帳戶 ${id}`).join("\n") : "無帳戶"}`,
-      });
+      const res = await request(`${GENERAL_API}/users/${userId.trim()}`);
+      const u = res?.data;
+      setUserInfo(u);
+      showResult("使用者資訊", (
+        <div>
+          <InfoRow label="名稱" value={u?.name} />
+          <InfoRow label="使用者編號" value={u?.id} copy />
+          <div style={{ marginTop: 12, fontSize: 13, color: "#6b7280", marginBottom: 6 }}>帳戶列表</div>
+          {u?.accounts?.length > 0 ? (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+              {u.accounts.map(aid => (
+                <span key={aid}
+                  onClick={() => { setAccountId(String(aid)); setTab("account"); setResultModal(null); }}
+                  style={{
+                    padding: "3px 10px", background: "#e0e7ff",
+                    color: "#3730a3", borderRadius: 20,
+                    fontSize: 12, fontWeight: 500, cursor: "pointer",
+                  }}>
+                  帳戶 {aid}
+                </span>
+              ))}
+            </div>
+          ) : (
+            <div style={{ color: "#9ca3af", fontSize: 13 }}>無帳戶</div>
+          )}
+        </div>
+      ));
     } catch (e) {
-      setResult({
-        status: "error",
-        msg: `查詢使用者失敗：${e.message}`,
-      });
-  } finally {
-    setLoading("");
+      showResult("查詢失敗", <div style={{ color: "#6b7280" }}>{e.message}</div>, "error");
+    } finally {
+      setLoading("");
+    }
   }
-}
 
+  // ── Account actions ──
   async function createAccount() {
-    setLoading("account");
-
+    if (!accountUserId) return toast("請輸入使用者編號", "error");
+    setLoading("createAccount");
     try {
       const res = await request(`${GENERAL_API}/accounts`, {
         method: "POST",
         body: JSON.stringify({
           userId: Number(accountUserId),
-          initialBalance: Number(initialBalance),
+          initialBalance: Number(initialBalance || 0),
         }),
       });
-
-      setAccount(res?.data || null);
-      setAccountId(String(res?.data?.id || ""));
-
-      setResult({
-        status: "success",
-        msg: `帳戶建立成功：帳戶編號 ${res?.data?.id}`,
-      });
+      const a = res?.data;
+      setAccount(a);
+      setAccountId(String(a?.id || ""));
+      showResult("開立帳戶成功", (
+        <div>
+          <InfoRow label="帳戶編號" value={a?.id} copy />
+          <InfoRow label="初始餘額" value={`NT$ ${formatMoney(a?.balance)}`} />
+        </div>
+      ));
     } catch (e) {
-      setResult({
-        status: "error",
-        msg: `建立帳戶失敗：${e.message}`,
-      });
+      showResult("開立帳戶失敗", <div style={{ color: "#6b7280" }}>{e.message}</div>, "error");
     } finally {
       setLoading("");
     }
   }
 
   async function getAccount() {
-    setLoading("account");
-
+    if (!accountId.trim()) return toast("請輸入帳戶編號", "error");
+    setLoading("getAccount");
     try {
-      const res = await request(`${GENERAL_API}/accounts/${accountId}`);
-
-      setAccount(res?.data || null);
-
-      setResult({
-        status: "success",
-        msg: `查詢帳戶成功：帳戶編號 ${res?.data?.id}`,
-      });
+      const res = await request(`${GENERAL_API}/accounts/${accountId.trim()}`);
+      setAccount(res?.data);
+      toast("帳戶資訊已更新");
     } catch (e) {
-      setResult({
-        status: "error",
-        msg: `查詢帳戶失敗：${e.message}`,
-      });
+      toast(e.message, "error");
     } finally {
       setLoading("");
     }
   }
 
-  async function transfer() {
-    setLoading("transfer");
+  // ── Deposit ──
+  async function doDeposit() {
+    if (!accountId.trim()) return toast("請先查詢帳戶", "error");
+    const amt = Number(depositAmount);
+    if (!Number.isInteger(amt) || amt <= 0) return toast("金額必須為正整數", "error");
+    setLoading("deposit");
+    try {
+      const res = await request(`${GENERAL_API}/accounts/${accountId.trim()}/deposit`, {
+        method: "POST",
+        body: JSON.stringify({ amount: amt }),
+      });
+      const a = res?.data?.account;
+      setAccount(prev => prev ? { ...prev, ...a } : a);
+      showResult("存款成功", (
+        <div>
+          <InfoRow label="帳戶編號" value={accountId} copy />
+          <InfoRow label="存入金額" value={`NT$ ${formatMoney(amt)}`} />
+          <InfoRow label="目前餘額" value={`NT$ ${formatMoney(a?.balance)}`} />
+          <InfoRow label="可用餘額" value={`NT$ ${formatMoney(a?.availableBalance)}`} />
+        </div>
+      ));
+      setDepositAmount("");
+    } catch (e) {
+      showResult("存款失敗", <div style={{ color: "#6b7280" }}>{e.message}</div>, "error");
+    } finally {
+      setLoading("");
+    }
+  }
+
+  // ── Withdraw ──
+  async function doWithdraw() {
+    if (!accountId.trim()) return toast("請先查詢帳戶", "error");
+    const amt = Number(withdrawAmount);
+    if (!Number.isInteger(amt) || amt <= 0) return toast("金額必須為正整數", "error");
+    setLoading("withdraw");
+    try {
+      const res = await request(`${GENERAL_API}/accounts/${accountId.trim()}/withdraw`, {
+        method: "POST",
+        body: JSON.stringify({ amount: amt }),
+      });
+      const a = res?.data?.account;
+      setAccount(prev => prev ? { ...prev, ...a } : a);
+      showResult("提款成功", (
+        <div>
+          <InfoRow label="帳戶編號" value={accountId} copy />
+          <InfoRow label="提取金額" value={`NT$ ${formatMoney(amt)}`} />
+          <InfoRow label="目前餘額" value={`NT$ ${formatMoney(a?.balance)}`} />
+          <InfoRow label="可用餘額" value={`NT$ ${formatMoney(a?.availableBalance)}`} />
+        </div>
+      ));
+      setWithdrawAmount("");
+    } catch (e) {
+      showResult("提款失敗", <div style={{ color: "#6b7280" }}>{e.message}</div>, "error");
+    } finally {
+      setLoading("");
+    }
+  }
+
+  // ── Transfer ──
+  async function doTransfer() {
+    if (!fromId || !toId || !amount) return toast("請填寫完整轉帳資訊", "error");
+    const amt = Number(amount);
+    if (!Number.isInteger(amt) || amt <= 0) return toast("金額必須為正整數", "error");
+
+    setTransferModal({ status: "pending", fromId, toId, amount: amt, attempts: 0 });
 
     try {
       const init = await request(`${TRANSFER_API}/transfers`, {
         method: "POST",
-        body: JSON.stringify({
-          fromId: Number(fromId),
-          toId: Number(toId),
-          amount: Number(amount),
-        }),
+        body: JSON.stringify({ fromId: Number(fromId), toId: Number(toId), amount: amt }),
       });
 
-      if (init?.data?.mode === "sync-same-shard") {
-        setResult({
-          status: "success",
-          msg: `轉帳成功（同 shard）：${fromId} → ${toId}，金額 ${formatMoney(amount)}`,
-        });
-
+      // 同 shard：直接回結果
+      if (init?.data?.mode === "sync") {
+        const balance = init?.data?.balance?.balance;
+        setTransferModal({ status: "success", fromId, toId, amount: amt, balance });
         if (String(accountId) === String(fromId) || String(accountId) === String(toId)) {
-          try {
-            const refreshed = await request(`${GENERAL_API}/accounts/${accountId}`);
-            setAccount(refreshed?.data || null);
-          } catch (err) {
-            console.error("refresh account failed:", err);
-          }
+          request(`${GENERAL_API}/accounts/${accountId}`)
+            .then(res => setAccount(res?.data || null))
+            .catch(() => {});
         }
-
         return;
       }
 
+      // 跨 shard：SSE 等待完成通知
       const jobId = init?.data?.jobId;
+      if (!jobId) throw new Error("未取得 jobId");
 
-      for (let i = 0; i < 60; i += 1) {
-        await sleep(500);
-
-        const r = await request(`${GENERAL_API}/transfer-jobs/${jobId}`);
-
-        if (r?.data?.status === "success") {
-          setResult({
-            status: "success",
-            msg: `轉帳成功（跨 shard）：${fromId} → ${toId}，金額 ${formatMoney(amount)}`,
-          });
-
+      const handleJobResult = (job) => {
+        if (job.status === "success") {
+          const balance = job?.result?.balance?.balance;
+          setTransferModal({ status: "success", fromId, toId, amount: amt, balance });
           if (String(accountId) === String(fromId) || String(accountId) === String(toId)) {
-            try {
-              const refreshed = await request(`${GENERAL_API}/accounts/${accountId}`);
-              setAccount(refreshed?.data || null);
-            } catch (err) {
-              console.error("refresh account failed:", err);
-            }
+            request(`${GENERAL_API}/accounts/${accountId}`)
+              .then(res => setAccount(res?.data || null))
+              .catch(() => {});
           }
-
-          return;
+          return true;
         }
+        return false;
+      };
 
-        if (r?.data?.status === "failed") {
-          throw new Error(r?.data?.error?.message || "轉帳失敗");
-        }
-      }
+      await new Promise((resolve, reject) => {
+        const es = new EventSource(`${GENERAL_API}/transfer-jobs/${jobId}/stream`);
+        let closed = false;
+        const cleanup = () => { if (!closed) { closed = true; es.close(); } };
 
-      throw new Error("轉帳處理逾時");
-    } catch (e) {
-      setResult({
-        status: "error",
-        msg: `轉帳失敗：${e.message}`,
+        // job 已完成時後端直接回 JSON，EventSource 觸發 onerror
+        // 改用輪詢等到有結果為止（最多 30 秒，每 500ms 查一次）
+        es.onerror = async () => {
+          cleanup();
+          const deadline = Date.now() + 30000;
+          const poll = async () => {
+            try {
+              const check = await request(`${GENERAL_API}/transfer-jobs/${jobId}`);
+              const job = check?.data;
+              if (job?.status === "success") {
+                handleJobResult(job);
+                resolve();
+              } else if (job?.status === "failed") {
+                reject(new Error(job?.error?.message || "轉帳失敗"));
+              } else if (Date.now() < deadline) {
+                setTimeout(poll, 500);
+              } else {
+                reject(new Error("轉帳處理逾時（30 秒）"));
+              }
+            } catch {
+              reject(new Error("查詢轉帳狀態失敗"));
+            }
+          };
+          poll();
+        };
+
+        es.onmessage = (e) => {
+          try {
+            const job = JSON.parse(e.data);
+            if (job.status === "timeout") {
+              // SSE 連線逾時，但 job 可能還在處理中，改用輪詢繼續等
+              cleanup();
+              const deadline = Date.now() + 60000;
+              const poll = async () => {
+                try {
+                  const check = await request(`${GENERAL_API}/transfer-jobs/${jobId}`);
+                  const j = check?.data;
+                  if (j?.status === "success") {
+                    handleJobResult(j);
+                    resolve();
+                  } else if (j?.status === "failed") {
+                    reject(new Error(j?.error?.message || "轉帳失敗"));
+                  } else if (Date.now() < deadline) {
+                    setTimeout(poll, 500);
+                  } else {
+                    reject(new Error("轉帳處理逾時，請至紀錄頁確認結果"));
+                  }
+                } catch {
+                  reject(new Error("查詢轉帳狀態失敗"));
+                }
+              };
+              poll();
+              return;
+            }
+            if (job.status === "success") {
+              handleJobResult(job);
+              cleanup();
+              resolve();
+              return;
+            }
+            if (job.status === "failed") {
+              cleanup();
+              reject(new Error(job?.error?.message || "轉帳失敗"));
+            }
+          } catch {
+            cleanup();
+            reject(new Error("回應解析失敗"));
+          }
+        };
       });
-    } finally {
-      setLoading("");
+    } catch (e) {
+      setTransferModal(prev => prev ? { ...prev, status: "failed", errorMsg: e.message } : prev);
     }
   }
 
+  // ── History ──
   async function fetchHistory() {
+    const id = historyId.trim() || accountId.trim();
+    if (!id) return toast("請輸入帳戶編號", "error");
     setLoading("history");
-
     try {
-      const res = await request(`${GENERAL_API}/transfers?accountId=${historyId}`);
-
+      const res = await request(`${GENERAL_API}/transfers?accountId=${id}`);
       setHistory(res?.data?.items || []);
-
-      setResult({
-        status: "success",
-        msg: `查詢轉帳歷史成功：帳戶編號 ${historyId}`,
-      });
+      setHistoryId(id);
+      if ((res?.data?.items || []).length === 0) toast("此帳戶尚無轉帳紀錄");
+      else toast(`載入 ${res.data.items.length} 筆紀錄`);
     } catch (e) {
-      setResult({
-        status: "error",
-        msg: `查詢轉帳歷史失敗：${e.message}`,
-      });
+      toast(e.message, "error");
     } finally {
       setLoading("");
     }
   }
+
+  const tabs = [
+    { key: "account",  label: "帳戶" },
+    { key: "cashier",  label: "存提款" },
+    { key: "transfer", label: "轉帳" },
+    { key: "history",  label: "紀錄" },
+    { key: "user",     label: "使用者" },
+  ];
 
   return (
-    <div
-      style={{
-        padding: 30,
-        fontFamily: "Arial, sans-serif",
-        backgroundColor: "#f5f7fb",
-        minHeight: "100vh",
-        color: "#1f2937",
-      }}
-    >
-      <div
-        style={{
-          maxWidth: 1000,
-          margin: "0 auto",
-          backgroundColor: "#ffffff",
-          borderRadius: 20,
-          boxShadow: "0 10px 30px rgba(0,0,0,0.08)",
-          overflow: "hidden",
-        }}
-      >
-        <div
-          style={{
-            background: "linear-gradient(135deg, #0f172a, #1d4ed8)",
-            color: "#ffffff",
-            padding: 24,
-          }}
-        >
-          <h1 style={{ margin: 0, fontSize: 32 }}>Small Bank 網路銀行</h1>
-          <p style={{ marginTop: 8, marginBottom: 0, opacity: 0.9 }}>
-            建立使用者、建立帳戶、查詢帳戶、送出轉帳、查詢轉帳歷史
-          </p>
-        </div>
+    <>
+      <style>{`
+        * { box-sizing: border-box; }
+        body { margin: 0; background: #f1f5f9; font-family: -apple-system, "PingFang TC", "Helvetica Neue", sans-serif; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        @keyframes slideIn { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: translateX(0); } }
+        input::placeholder { color: #c4c9d4; }
+      `}</style>
 
-        <div style={{ padding: 24 }}>
-          <section style={{ marginBottom: 28 }}>
-            <h2 style={{ marginBottom: 12 }}>使用者服務</h2>
+      <Toast toasts={toasts} />
+      <TransferModal state={transferModal} onClose={() => setTransferModal(null)} />
+      <ResultModal modal={resultModal} onClose={() => setResultModal(null)} />
 
-            <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 12 }}>
-              <input
-                style={inputStyle}
-                placeholder="請輸入使用者名稱（例如：王小明）"
-                value={userName}
-                onChange={e => setUserName(e.target.value)}
-              />
-              <button style={buttonStyle} onClick={createUser}>
-                {loading === "user" ? "處理中..." : "建立使用者"}
-              </button>
-            </div>
-
-            <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
-              <input
-                style={inputStyle}
-                placeholder="請輸入使用者編號"
-                value={userId}
-                onChange={e => setUserId(e.target.value)}
-              />
-              <button style={buttonOutlineStyle} onClick={getUser}>
-                {loading === "user" ? "處理中..." : "查詢使用者"}
-              </button>
-            </div>
-          </section>
-
-          <section style={{ marginBottom: 28 }}>
-            <h2 style={{ marginBottom: 12 }}>帳戶服務</h2>
-
-            <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 12 }}>
-              <input
-                style={inputStyle}
-                placeholder="請輸入使用者編號"
-                value={accountUserId}
-                onChange={e => setAccountUserId(e.target.value)}
-              />
-              <input
-                style={inputStyle}
-                placeholder="請輸入初始金額"
-                value={initialBalance}
-                onChange={e => setInitialBalance(e.target.value)}
-              />
-              <button style={buttonStyle} onClick={createAccount}>
-                {loading === "account" ? "處理中..." : "建立帳戶"}
-              </button>
-            </div>
-
-            <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 12 }}>
-              <input
-                style={inputStyle}
-                placeholder="請輸入帳戶編號"
-                value={accountId}
-                onChange={e => setAccountId(e.target.value)}
-              />
-              <button style={buttonOutlineStyle} onClick={getAccount}>
-                {loading === "account" ? "處理中..." : "查詢帳戶"}
-              </button>
-            </div>
-
-            {account && (
-              <div
-                style={{
-                  marginTop: 12,
-                  padding: 16,
-                  borderRadius: 14,
-                  background: "linear-gradient(135deg, #111827, #2563eb)",
-                  color: "#ffffff",
-                }}
-              >
-                <div style={{ fontSize: 14, opacity: 0.9 }}>帳戶資訊卡</div>
-                <div style={{ fontSize: 24, fontWeight: "bold", marginTop: 6 }}>
-                  帳戶編號：{account.id}
-                </div>
-                <div style={{ marginTop: 12 }}>餘額：{formatMoney(account.balance)}</div>
-                {account.availableBalance !== undefined && (
-                  <div style={{ marginTop: 6 }}>
-                    可用餘額：{formatMoney(account.availableBalance)}
-                  </div>
-                )}
-                {account.reservedBalance !== undefined && (
-                  <div style={{ marginTop: 6 }}>
-                    保留金額：{formatMoney(account.reservedBalance)}
-                  </div>
-                )}
-                {account.totalBalance !== undefined && (
-                  <div style={{ marginTop: 6 }}>
-                    總餘額：{formatMoney(account.totalBalance)}
-                  </div>
-                )}
-              </div>
-            )}
-          </section>
-
-          <section style={{ marginBottom: 28 }}>
-            <h2 style={{ marginBottom: 12 }}>轉帳服務</h2>
-
-            <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 12 }}>
-              <div>
-                <div style={labelStyle}>轉出帳戶</div>
-                <input
-                  style={inputStyle}
-                  placeholder="請輸入轉出帳戶編號"
-                  value={fromId}
-                  onChange={e => setFromId(e.target.value)}
-                />
-              </div>
-
-              <div>
-                <div style={labelStyle}>轉入帳戶</div>
-                <input
-                  style={inputStyle}
-                  placeholder="請輸入轉入帳戶編號"
-                  value={toId}
-                  onChange={e => setToId(e.target.value)}
-                />
-              </div>
-
-              <div>
-                <div style={labelStyle}>轉帳金額</div>
-                <input
-                  style={inputStyle}
-                  placeholder="請輸入金額（例如：100）"
-                  value={amount}
-                  onChange={e => setAmount(e.target.value)}
-                />
-              </div>
-
-              <div style={{ display: "flex", alignItems: "end" }}>
-                <button style={transferButtonStyle} onClick={transfer}>
-                  {loading === "transfer" ? "處理中..." : "送出轉帳"}
-                </button>
-              </div>
-            </div>
-
-            <div style={{ fontSize: 13, color: "#6b7280" }}>
-              若為跨 shard 交易，前端會自動等待後端完成，不會顯示 jobId，只會顯示最終結果。
-            </div>
-          </section>
-
-          <section style={{ marginBottom: 28 }}>
-            <h2 style={{ marginBottom: 12 }}>轉帳歷史查詢</h2>
-
-            <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 12 }}>
-              <div>
-                <div style={labelStyle}>帳戶編號</div>
-                <input
-                  style={inputStyle}
-                  placeholder="請輸入要查詢的帳戶編號（例如：1）"
-                  value={historyId}
-                  onChange={e => setHistoryId(e.target.value)}
-                />
-              </div>
-
-              <div style={{ display: "flex", alignItems: "end" }}>
-                <button style={buttonOutlineStyle} onClick={fetchHistory}>
-                  {loading === "history" ? "查詢中..." : "查詢轉帳歷史"}
-                </button>
-              </div>
-            </div>
-
-            <div
-              style={{
-                border: "1px solid #e5e7eb",
-                borderRadius: 12,
-                overflow: "hidden",
-                backgroundColor: "#ffffff",
-              }}
-            >
-              <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                <thead>
-                  <tr style={{ backgroundColor: "#f9fafb" }}>
-                    <th style={thStyle}>交易編號</th>
-                    <th style={thStyle}>轉出帳戶</th>
-                    <th style={thStyle}>轉入帳戶</th>
-                    <th style={thStyle}>金額</th>
-                    <th style={thStyle}>狀態</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {history.length === 0 ? (
-                    <tr>
-                      <td style={tdEmptyStyle} colSpan={5}>
-                        尚無轉帳紀錄
-                      </td>
-                    </tr>
-                  ) : (
-                    history.map(h => (
-                      <tr key={h.id}>
-                        <td style={tdStyle}>{h.id}</td>
-                        <td style={tdStyle}>{h.fromId}</td>
-                        <td style={tdStyle}>{h.toId}</td>
-                        <td style={tdStyle}>{formatMoney(h.amount)}</td>
-                        <td style={tdStyle}>{h.status}</td>
-                      </tr>
-                    ))
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </section>
+      {/* Header */}
+      <div style={{
+        background: "linear-gradient(135deg, #0f172a 0%, #1e3a5f 100%)",
+        padding: "18px 20px 28px",
+        color: "#fff",
+      }}>
+        <div style={{ maxWidth: 480, margin: "0 auto" }}>
+          <div style={{ fontSize: 11, opacity: 0.5, letterSpacing: 2, textTransform: "uppercase", marginBottom: 6 }}>
+            Small Bank
+          </div>
+          <div style={{ fontSize: 22, fontWeight: 700 }}>網路銀行</div>
         </div>
       </div>
 
-      {result && (
-        <div style={modalOverlayStyle}>
-          <div style={modalBoxStyle}>
-            <div
-              style={{
-                fontSize: 20,
-                fontWeight: "bold",
-                marginBottom: 12,
-                color: status === "error" ? "#b91c1c" : "#166534",
-              }}
-            >
-              {status === "error" ? "操作失敗" : "操作成功"}
-            </div>
-            
-            <div style={modalContentStyle}>
-              {result.msg}
-            </div>
+      {/* Main */}
+      <div style={{ maxWidth: 480, margin: "-12px auto 0", padding: "0 16px 40px", position: "relative" }}>
 
-            <div
-              style={{
-                fontSize: 15,
-                lineHeight: 1.7,
-                color: "#374151",
-                marginBottom: 20,
-                whiteSpace: "pre-wrap",
-              }}
-            >
-              {result.msg}
-            </div>
-
-            <div style={{ display: "flex", justifyContent: "center" }}>
-              <button
-                style={modalButtonStyle}
-                onClick={() => setResult(null)}
-              >
-                OK
-              </button>
-            </div>
-          </div>
+        {/* Tab nav */}
+        <div style={{
+          background: "#fff",
+          borderRadius: 14,
+          padding: "14px 14px 0",
+          boxShadow: "0 4px 20px rgba(0,0,0,0.08)",
+          marginBottom: 16,
+        }}>
+          <NavTab tabs={tabs} active={tab} onChange={setTab} />
         </div>
-      )}
-    </div>
+
+        {/* ── 帳戶 ── */}
+        {tab === "account" && (
+          <>
+            <Card title="查詢帳戶" accent="#2563eb">
+              <div style={{ display: "flex", gap: 10 }}>
+                <Input label="帳戶編號" placeholder="例：33288" value={accountId}
+                  onChange={e => setAccountId(e.target.value)}
+                  onKeyDown={e => e.key === "Enter" && getAccount()} />
+                <div style={{ display: "flex", alignItems: "flex-end" }}>
+                  <Btn variant="blue" loading={loading === "getAccount"} onClick={getAccount}>查詢</Btn>
+                </div>
+              </div>
+              <AccountCard account={account} />
+            </Card>
+
+            <Card title="開立帳戶" accent="#111827">
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                <div style={{ display: "flex", gap: 10 }}>
+                  <Input label="使用者編號" placeholder="例：1" value={accountUserId}
+                    onChange={e => setAccountUserId(e.target.value)} />
+                  <Input label="初始存款" placeholder="例：10000" value={initialBalance}
+                    onChange={e => setInitialBalance(e.target.value)} />
+                </div>
+                <Btn variant="primary" loading={loading === "createAccount"} onClick={createAccount}>開立帳戶</Btn>
+              </div>
+            </Card>
+          </>
+        )}
+
+        {/* ── 存提款 ── */}
+        {tab === "cashier" && (
+          <>
+            <Card title="查詢帳戶" accent="#2563eb">
+              <div style={{ display: "flex", gap: 10 }}>
+                <Input label="帳戶編號" placeholder="例：33288" value={accountId}
+                  onChange={e => setAccountId(e.target.value)}
+                  onKeyDown={e => e.key === "Enter" && getAccount()} />
+                <div style={{ display: "flex", alignItems: "flex-end" }}>
+                  <Btn variant="blue" loading={loading === "getAccount"} onClick={getAccount}>查詢</Btn>
+                </div>
+              </div>
+              <AccountCard account={account} />
+            </Card>
+
+            {account && (
+              <>
+                <Card title="存款" accent="#16a34a">
+                  <div style={{ display: "flex", gap: 10 }}>
+                    <Input label="存款金額（元）" placeholder="例：1000" value={depositAmount}
+                      onChange={e => setDepositAmount(e.target.value)}
+                      onKeyDown={e => e.key === "Enter" && doDeposit()} />
+                    <div style={{ display: "flex", alignItems: "flex-end" }}>
+                      <Btn variant="green" loading={loading === "deposit"} onClick={doDeposit}>存款</Btn>
+                    </div>
+                  </div>
+                </Card>
+
+                <Card title="提款" accent="#dc2626">
+                  <div style={{ display: "flex", gap: 10 }}>
+                    <Input label="提款金額（元）" placeholder="例：500" value={withdrawAmount}
+                      onChange={e => setWithdrawAmount(e.target.value)}
+                      onKeyDown={e => e.key === "Enter" && doWithdraw()} />
+                    <div style={{ display: "flex", alignItems: "flex-end" }}>
+                      <Btn variant="danger" loading={loading === "withdraw"} onClick={doWithdraw}>提款</Btn>
+                    </div>
+                  </div>
+                </Card>
+              </>
+            )}
+          </>
+        )}
+
+        {/* ── 轉帳 ── */}
+        {tab === "transfer" && (
+          <Card title="轉帳" accent="#2563eb">
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              <div style={{ display: "flex", gap: 10 }}>
+                <Input label="轉出帳戶" placeholder="帳戶編號" value={fromId}
+                  onChange={e => setFromId(e.target.value)} />
+                <Input label="轉入帳戶" placeholder="帳戶編號" value={toId}
+                  onChange={e => setToId(e.target.value)} />
+              </div>
+              <Input label="金額（元）" placeholder="例：100" value={amount}
+                onChange={e => setAmount(e.target.value)}
+                onKeyDown={e => e.key === "Enter" && doTransfer()} />
+              {amount && Number(amount) > 0 && (
+                <div style={{
+                  padding: "10px 14px",
+                  background: "#f0f9ff",
+                  borderRadius: 9,
+                  fontSize: 13,
+                  color: "#0369a1",
+                }}>
+                  確認轉帳：NT$ {formatMoney(amount)} 從帳戶 {fromId || "?"} 至帳戶 {toId || "?"}
+                </div>
+              )}
+              <Btn variant="blue" onClick={doTransfer}>送出轉帳</Btn>
+            </div>
+          </Card>
+        )}
+
+        {/* ── 紀錄 ── */}
+        {tab === "history" && (
+          <Card title="轉帳紀錄" accent="#6366f1">
+            <div style={{ display: "flex", gap: 10, marginBottom: 14 }}>
+              <Input label="帳戶編號" placeholder="例：33288" value={historyId}
+                onChange={e => setHistoryId(e.target.value)}
+                onKeyDown={e => e.key === "Enter" && fetchHistory()} />
+              <div style={{ display: "flex", alignItems: "flex-end" }}>
+                <Btn variant="outline" loading={loading === "history"} onClick={fetchHistory}>查詢</Btn>
+              </div>
+            </div>
+            {history.length === 0 ? (
+              <div style={{ textAlign: "center", padding: "24px 0", color: "#9ca3af", fontSize: 14 }}>
+                尚無紀錄
+              </div>
+            ) : (
+              <div>
+                {history.map(h => (
+                  <TransferRow key={h.id} item={h} currentAccountId={historyId || accountId} />
+                ))}
+              </div>
+            )}
+          </Card>
+        )}
+
+        {/* ── 使用者 ── */}
+        {tab === "user" && (
+          <>
+            <Card title="查詢使用者" accent="#6366f1">
+              <div style={{ display: "flex", gap: 10 }}>
+                <Input label="使用者編號" placeholder="例：1" value={userId}
+                  onChange={e => setUserId(e.target.value)}
+                  onKeyDown={e => e.key === "Enter" && getUser()} />
+                <div style={{ display: "flex", alignItems: "flex-end" }}>
+                  <Btn variant="outline" loading={loading === "getUser"} onClick={getUser}>查詢</Btn>
+                </div>
+              </div>
+              {userInfo && (
+                <div style={{ marginTop: 14, padding: "12px 14px", background: "#f9fafb", borderRadius: 10, fontSize: 14 }}>
+                  <div style={{ fontWeight: 600, marginBottom: 4 }}>{userInfo.name}</div>
+                  <div style={{ color: "#6b7280", fontSize: 12, marginBottom: 8, display: "flex", alignItems: "center", gap: 8 }}>
+                    <span>編號：{userInfo.id}</span>
+                    <CopyBtn value={userInfo.id} />
+                  </div>
+                  {userInfo.accounts?.length > 0 && (
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                      {userInfo.accounts.map(aid => (
+                        <span key={aid}
+                          onClick={() => { setAccountId(String(aid)); setTab("account"); }}
+                          style={{
+                            padding: "3px 10px", background: "#e0e7ff",
+                            color: "#3730a3", borderRadius: 20,
+                            fontSize: 12, fontWeight: 500, cursor: "pointer",
+                          }}>
+                          帳戶 {aid}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </Card>
+
+            <Card title="新增使用者" accent="#111827">
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                <Input label="使用者名稱" placeholder="例：王小明" value={userName}
+                  onChange={e => setUserName(e.target.value)}
+                  onKeyDown={e => e.key === "Enter" && createUser()} />
+                <Btn variant="primary" loading={loading === "createUser"} onClick={createUser}>建立使用者</Btn>
+              </div>
+            </Card>
+          </>
+        )}
+      </div>
+    </>
   );
 }
-
-const labelStyle = {
-  fontSize: 13,
-  marginBottom: 6,
-  color: "#374151",
-  fontWeight: 500,
-};
-
-const inputStyle = {
-  padding: "10px 14px",
-  borderRadius: 10,
-  border: "1px solid #d1d5db",
-  minWidth: 220,
-  fontSize: 14,
-};
-
-const buttonStyle = {
-  padding: "10px 16px",
-  borderRadius: 10,
-  border: "none",
-  backgroundColor: "#111827",
-  color: "#ffffff",
-  cursor: "pointer",
-  fontSize: 14,
-};
-
-const buttonOutlineStyle = {
-  padding: "10px 16px",
-  borderRadius: 10,
-  border: "1px solid #cbd5e1",
-  backgroundColor: "#ffffff",
-  color: "#111827",
-  cursor: "pointer",
-  fontSize: 14,
-};
-
-const transferButtonStyle = {
-  padding: "10px 16px",
-  borderRadius: 10,
-  border: "none",
-  backgroundColor: "#2563eb",
-  color: "#ffffff",
-  cursor: "pointer",
-  fontSize: 14,
-};
-
-const thStyle = {
-  textAlign: "left",
-  padding: "12px 14px",
-  borderBottom: "1px solid #e5e7eb",
-  fontSize: 14,
-};
-
-const tdStyle = {
-  padding: "12px 14px",
-  borderBottom: "1px solid #f3f4f6",
-  fontSize: 14,
-};
-
-const tdEmptyStyle = {
-  padding: "24px 14px",
-  textAlign: "center",
-  color: "#9ca3af",
-  fontSize: 14,
-};
-
-const modalOverlayStyle = {
-  position: "fixed",
-  inset: 0,
-  backgroundColor: "rgba(15, 23, 42, 0.45)",
-  display: "flex",
-  alignItems: "center",
-  justifyContent: "center",
-  zIndex: 9999,
-};
-
-const modalBoxStyle = {
-  width: "90%",
-  maxWidth: 420,
-  backgroundColor: "#ffffff",
-  borderRadius: 16,
-  boxShadow: "0 20px 50px rgba(0, 0, 0, 0.18)",
-  padding: 24,
-  textAlign: "center",
-};
-
-const modalButtonStyle = {
-  padding: "10px 28px",
-  borderRadius: 10,
-  border: "none",
-  backgroundColor: "#2563eb",
-  color: "#ffffff",
-  cursor: "pointer",
-  fontSize: 14,
-  fontWeight: 600,
-};
-
-const modalContentStyle = {
-  fontSize: 15,
-  lineHeight: 1.7,
-  color: "#374151",
-  marginBottom: 20,
-  whiteSpace: "pre-wrap",
-  overflowY: "auto",
-  maxHeight: "50vh",
-  paddingRight: 6,
-};
-

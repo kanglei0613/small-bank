@@ -84,7 +84,10 @@ async function markSuccess(redis, job, result) {
     error: null,
   };
 
-  await setJob(redis, nextJob);
+  const pl = redis.pipeline();
+  pl.set(buildJobKey(nextJob.jobId), JSON.stringify(nextJob), 'EX', JOB_TTL_SECONDS);
+  pl.publish(`transfer:job:done:${job.jobId}`, JSON.stringify(nextJob));
+  await pl.exec();
   return nextJob;
 }
 
@@ -110,7 +113,10 @@ async function markFailed(redis, job, err) {
     },
   };
 
-  await setJob(redis, nextJob);
+  const pl = redis.pipeline();
+  pl.set(buildJobKey(nextJob.jobId), JSON.stringify(nextJob), 'EX', JOB_TTL_SECONDS);
+  pl.publish(`transfer:job:done:${job.jobId}`, JSON.stringify(nextJob));
+  await pl.exec();
   return nextJob;
 }
 

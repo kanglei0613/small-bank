@@ -105,17 +105,13 @@ async function pushJob(redis, fromId, job, options = {}) {
   );
 
   if (result === -2) {
-    const err = new Error('queue admission rejected');
-    err.status = 429;
-    err.code = 'QUEUE_ADMISSION_REJECTED';
-    throw err;
+    const { ConflictError } = require('../lib/errors');
+    throw new ConflictError('insufficient funds');
   }
 
   if (result === -1) {
-    const err = new Error('queue is full for this account');
-    err.status = 429;
-    err.code = 'QUEUE_FULL';
-    throw err;
+    const { ConflictError } = require('../lib/errors');
+    throw new ConflictError('insufficient funds');
   }
 
   return result;
@@ -282,18 +278,17 @@ async function releaseOwner(redis, fromId, ownerValue) {
 // - drain queue 可能會花一點時間
 // - 背景定期刷新 owner TTL
 // - 避免鎖在 drain 過程中自然過期
-function startOwnerHeartbeat({ ctx, fromId, ownerValue, options = {} }) {
-  const { app, logger } = ctx;
-  const redis = app.redis;
+function startOwnerHeartbeat({ ctx, fromId, redis, ownerValue, options = {} }) {
+  const { logger } = ctx;
   const ownerRefreshIntervalMs = options.ownerRefreshIntervalMs || 3000;
   const ownerTtlMs = options.ownerTtlMs || 10000;
+  const onLost = options.onLost || null;
 
   let stopped = false;
+  let timer = null;
 
-  const timer = setInterval(async () => {
-    if (stopped) {
-      return;
-    }
+  const tick = async () => {
+    if (stopped) return;
 
     try {
       const refreshed = await refreshOwner(redis, fromId, ownerValue, {
@@ -306,6 +301,7 @@ function startOwnerHeartbeat({ ctx, fromId, ownerValue, options = {} }) {
           fromId,
           ownerValue
         );
+        if (onLost) onLost();
       }
     } catch (err) {
       logger.error(
@@ -315,25 +311,30 @@ function startOwnerHeartbeat({ ctx, fromId, ownerValue, options = {} }) {
         err && err.message
       );
     }
-  }, ownerRefreshIntervalMs);
+  };
 
-  if (typeof timer.unref === 'function') {
-    timer.unref();
-  }
+  // 第一次 heartbeat 延後到 ownerTtlMs 一半才觸發
+  // 讓主迴圈先執行 popJobs，避免 setInterval 搶先佔用 event loop
+  const initialDelay = ownerTtlMs; // 延後到整個 TTL，讓主迴圈完全不被干擾
+  const initTimer = setTimeout(() => {
+    if (stopped) return;
+    tick();
+    timer = setInterval(tick, ownerRefreshIntervalMs);
+    if (typeof timer.unref === 'function') timer.unref();
+  }, initialDelay);
+
+  if (typeof initTimer.unref === 'function') initTimer.unref();
 
   return {
     stop() {
-      if (stopped) {
-        return;
-      }
-
+      if (stopped) return;
       stopped = true;
-      clearInterval(timer);
+      clearTimeout(initTimer);
+      if (timer) clearInterval(timer);
     },
   };
 }
 
-// 從 ready queue 阻塞式取出一個 fromId
 //
 // worker 會卡在這裡等待，不再掃 active set
 async function blockPopReadyFromId(redis, timeoutSec) {
@@ -365,49 +366,36 @@ async function blockPopReadyFromId(redis, timeoutSec) {
 // 注意：
 // - 這一版不再維護 active set
 // - 也不再在 queue empty 時 removeActiveFromId
-async function drainQueue({ ctx, fromId, handler, ownerValue, options = {} }) {
-  const { app, logger } = ctx;
-  const redis = app.redis;
+async function drainQueue({ ctx, fromId, redis, handler, ownerValue, options = {} }) {
+  const { logger } = ctx;
   const ownerTtlMs = options.ownerTtlMs || 10000;
   const ownerRefreshIntervalMs = options.ownerRefreshIntervalMs || 3000;
   const batchSize = options.batchSize || 5;
 
+  let ownerLost = false;
+
   const heartbeat = startOwnerHeartbeat({
     ctx,
     fromId,
+    redis,
     ownerValue,
     options: {
       ownerTtlMs,
       ownerRefreshIntervalMs,
+      onLost: () => { ownerLost = true; },
     },
   });
 
   try {
-    let shouldContinue = true;
-
-    while (shouldContinue) {
-      const refreshed = await refreshOwner(redis, fromId, ownerValue, {
-        ownerTtlMs,
-      });
-
-      if (!refreshed) {
-        logger.warn(
-          '[RedisQueue] owner lost before pop: fromId=%s owner=%s',
-          fromId,
-          ownerValue
-        );
-        shouldContinue = false;
-        continue;
-      }
-
+    while (!ownerLost) {
       const jobs = await popJobs(redis, fromId, batchSize);
 
       if (jobs.length === 0) {
-        shouldContinue = false;
-        continue;
+        break;
       }
 
       for (const job of jobs) {
+        if (ownerLost) break;
         try {
           await handler(job);
         } catch (err) {
@@ -420,11 +408,20 @@ async function drainQueue({ ctx, fromId, handler, ownerValue, options = {} }) {
         }
       }
     }
+
+    if (ownerLost) {
+      logger.warn(
+        '[RedisQueue] owner lost during drain: fromId=%s owner=%s',
+        fromId,
+        ownerValue
+      );
+    }
   } finally {
     heartbeat.stop();
     await releaseOwner(redis, fromId, ownerValue);
   }
 }
+
 
 // 嘗試啟動 drain
 //
@@ -433,9 +430,8 @@ async function drainQueue({ ctx, fromId, handler, ownerValue, options = {} }) {
 // - 嘗試取得 owner lock
 // - 如果成功，就 drain 該 fromId queue
 // - 如果失敗，表示已有其他 worker 在做，直接跳過
-async function tryStartDrain({ ctx, fromId, handler }) {
+async function tryStartDrain({ ctx, fromId, redis, handler }) {
   const { app } = ctx;
-  const redis = app.redis;
   const ownerValue = buildOwnerValue();
   const transferQueueConfig = getTransferQueueConfig(app);
 
@@ -450,6 +446,7 @@ async function tryStartDrain({ ctx, fromId, handler }) {
   await drainQueue({
     ctx,
     fromId,
+    redis,
     handler,
     ownerValue,
     options: {

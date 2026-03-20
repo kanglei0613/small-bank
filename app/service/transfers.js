@@ -1,124 +1,72 @@
 'use strict';
 
+const Redis = require('ioredis');
 const Service = require('egg').Service;
-const AccountsRepo = require('../repository/accountsRepo');
-const inflight = require('../lib/inflight');
-const redisTransferQueue = require('../lib/redis_transfer_queue');
-const transferJobStore = require('../lib/transfer_job_store');
+const TransfersRepo = require('../repository/transfersRepo');
+const redisTransferQueue = require('../lib/queue/redis_transfer_queue');
+const transferJobStore = require('../lib/queue/transfer_job_store');
+const { BadRequestError } = require('../lib/errors');
 
-// 驗證 transfer 輸入
-//
-// 這裡只做最基本的參數檢查：
-// - fromId / toId 必須是正整數
-// - amount 必須是正整數
-// - 不可自己轉給自己
+function buildJobId() {
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 function validateTransferInput({ fromId, toId, amount }) {
   if (!Number.isInteger(fromId) || fromId <= 0) {
-    const err = new Error('fromId must be a positive integer');
-    err.status = 400;
-    throw err;
+    throw new BadRequestError('fromId must be a positive integer');
   }
-
   if (!Number.isInteger(toId) || toId <= 0) {
-    const err = new Error('toId must be a positive integer');
-    err.status = 400;
-    throw err;
+    throw new BadRequestError('toId must be a positive integer');
   }
-
   if (!Number.isInteger(amount) || amount <= 0) {
-    const err = new Error('amount must be a positive integer');
-    err.status = 400;
-    throw err;
+    throw new BadRequestError('amount must be a positive integer');
   }
-
   if (fromId === toId) {
-    const err = new Error('fromId and toId cannot be the same');
-    err.status = 400;
-    throw err;
+    throw new BadRequestError('fromId and toId cannot be the same');
   }
 }
 
 class TransferService extends Service {
-  // submitTransfer
-  //
-  // 入口邏輯：
-  // - same-shard：直接同步執行，不進 queue
-  // - cross-shard：建立 async job，丟進 Redis queue
-  async submitTransfer({ fromId, toId, amount }) {
-    const { app } = this.ctx;
 
+  constructor(ctx) {
+    super(ctx);
+    this.repo = new TransfersRepo(ctx);
+  }
+
+  async submitTransfer({ fromId, toId, amount }) {
     validateTransferInput({ fromId, toId, amount });
 
-    const repo = new AccountsRepo(this.ctx);
+    const { app } = this.ctx;
     const shardCount = Number(app.config.sharding.shardCount);
     const fromShardId = fromId % shardCount;
     const toShardId = toId % shardCount;
 
-    // same-shard：走同步 fast path
     if (fromShardId === toShardId) {
-      try {
-        await app.redis.incr('bench:transfer:sameShard');
-
-        const result = await repo.transferSameShard({
-          fromAccountId: fromId,
-          toAccountId: toId,
-          transferAmount: amount,
-          shardId: fromShardId,
-        });
-
-        await app.redis.incr('bench:transfer:success');
-
-        return {
-          mode: 'sync-same-shard',
-          status: 'completed',
-          result,
-        };
-      } catch (err) {
-        await app.redis.incr('bench:transfer:failed');
-        throw err;
-      }
+      const result = await this.repo.transferSameShard({
+        fromAccountId: fromId,
+        toAccountId: toId,
+        transferAmount: amount,
+        shardId: fromShardId,
+      });
+      return { mode: 'sync', ...result };
     }
 
-    // cross-shard：維持 async queue
-    await app.redis.incr('bench:transfer:crossShard');
-
     const queued = await this.enqueueTransfer({ fromId, toId, amount });
-
-    return {
-      mode: 'async-cross-shard',
-      ...queued,
-    };
+    return { mode: 'async', ...queued };
   }
 
-  // enqueueTransfer
-  //
-  // 作用：
-  // - 建立 transfer job
-  // - 寫入 job store
-  // - push 進 Redis per-fromId queue
-  //
-  // 注意：
-  // - 這裡不執行 DB transaction
-  // - 真正交易由 queue worker 處理
   async enqueueTransfer({ fromId, toId, amount }) {
     const { app } = this.ctx;
 
     validateTransferInput({ fromId, toId, amount });
 
-    const transferQueueConfig = app.config.transferQueue || {
+    const queueConfig = app.config.transferQueue || {
       rejectThresholdPerFromId: 240,
       maxQueueLengthPerFromId: 300,
     };
 
-    const jobId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-
-    const job = {
-      jobId,
-      fromId,
-      toId,
-      amount,
-      createdAt: Date.now(),
-    };
+    const jobId = buildJobId();
+    const now = Date.now();
 
     await transferJobStore.createJob(app.redis, {
       jobId,
@@ -126,189 +74,143 @@ class TransferService extends Service {
       toId,
       amount,
       status: 'queued',
-      createdAt: job.createdAt,
-      updatedAt: job.createdAt,
+      createdAt: now,
+      updatedAt: now,
     });
 
-    await redisTransferQueue.pushJob(app.redis, fromId, job, {
-      rejectThresholdPerFromId: transferQueueConfig.rejectThresholdPerFromId,
-      maxQueueLengthPerFromId: transferQueueConfig.maxQueueLengthPerFromId,
-    });
+    await redisTransferQueue.pushJob(
+      app.redis,
+      fromId,
+      { jobId, fromId, toId, amount, createdAt: now },
+      {
+        rejectThresholdPerFromId: queueConfig.rejectThresholdPerFromId,
+        maxQueueLengthPerFromId: queueConfig.maxQueueLengthPerFromId,
+      }
+    );
 
-    return {
-      jobId,
-      status: 'queued',
-    };
+    return { jobId, status: 'queued' };
   }
 
-  // transfer
-  //
-  // 真正執行 DB transaction 的入口
-  //
-  // 這裡目前是給 queue worker 處理 cross-shard job 使用，
-  // 因此保留 inflight 保護，避免同一 fromId 同時被過多 transfer 併發打爆
-  async transfer({ fromId, toId, amount }) {
-    const { app, logger } = this.ctx;
-
-    const inflightKey = inflight.transferFromKey(fromId);
-    const inflightCount = await app.redis.incr(inflightKey);
-
-    if (inflightCount > inflight.transferMaxInflight()) {
-      logger.warn(
-        '[Inflight] transfer blocked: fromId=%s inflight=%s',
-        fromId,
-        inflightCount
-      );
-
-      await app.redis.decr(inflightKey);
-
-      const err = new Error('Too many concurrent transfers');
-      err.status = 429;
-      throw err;
-    }
-
-    const repo = new AccountsRepo(this.ctx);
-
-    try {
-      return await repo.transfer(fromId, toId, amount);
-    } finally {
-      await app.redis.decr(inflightKey);
-    }
+  async executeTransfer({ fromId, toId, amount }) {
+    return await this.repo.transfer(fromId, toId, amount);
   }
 
-  // processTransferJob
-  //
-  // 作用：
-  // - queue worker 拿到 job 後呼叫
-  // - 執行真正 transfer
-  // - 更新 job store success / failed
-  async processTransferJob(job) {
-    const { app, logger } = this.ctx;
+  async processJob(job, redis) {
+    const { logger } = this.ctx;
     const { jobId, fromId, toId, amount } = job;
 
-    try {
-      const result = await this.transfer({ fromId, toId, amount });
+    const start = Date.now();
 
-      await transferJobStore.markSuccess(app.redis, job, result);
-      await app.redis.incr('bench:transfer:success');
+    try {
+      const result = await this.repo.transfer(fromId, toId, amount);
+
+      const duration = Date.now() - start;
+      logger.info(
+        '[TransferJob] success: jobId=%s fromId=%s toId=%s duration=%dms',
+        jobId, fromId, toId, duration
+      );
+
+      await transferJobStore.markSuccess(redis, job, result);
+      await redis.incr('bench:transfer:success');
 
       return result;
     } catch (err) {
-      await transferJobStore.markFailed(app.redis, job, err);
-      await app.redis.incr('bench:transfer:failed');
-
+      const duration = Date.now() - start;
       logger.error(
-        '[TransferJob] failed: jobId=%s fromId=%s toId=%s amount=%s err=%s',
-        jobId,
-        fromId,
-        toId,
-        amount,
-        err && err.message
+        '[TransferJob] failed: jobId=%s fromId=%s toId=%s duration=%dms err=%s',
+        jobId, fromId, toId, duration, err && err.message
       );
+
+      await transferJobStore.markFailed(redis, job, err);
+      await redis.incr('bench:transfer:failed');
 
       throw err;
     }
   }
 
-  // sleep
-  //
-  // worker loop 發生 error 時的退避等待
-  async sleep(ms) {
-    await new Promise(resolve => setTimeout(resolve, ms));
-  }
-
-  // tryDrainOneFromIdQueue
-  //
-  // 作用：
-  // - 嘗試取得該 fromId queue 的 owner lock
-  // - 如果成功，drain 該 queue
-  // - 如果失敗，表示別的 worker 已在處理
-  async tryDrainOneFromIdQueue(fromId) {
+  async tryDrainOneFromIdQueue(fromId, redis) {
     return await redisTransferQueue.tryStartDrain({
       ctx: this.ctx,
       fromId,
+      redis,
       handler: async job => {
-        await this.processTransferJob(job);
+        await this.processJob(job, redis);
       },
     });
   }
 
-  // startQueueWorker
-  //
-  // 新版 worker 模式：
-  // - 不再掃 active set
-  // - 直接阻塞等待 ready queue
-  // - 拿到 fromId 後，嘗試 drain 該 queue
   async startQueueWorker() {
     const { app, logger } = this.ctx;
-
     const workerConfig = app.config.transferQueue || {};
     const blockTimeoutSec = Number(workerConfig.readyQueueBlockTimeoutSec || 1);
     const errorSleepMs = Number(workerConfig.workerErrorSleepMs || 1000);
+
+    // 建立獨立的 ioredis 直連，繞過 egg cluster-client IPC 延遲
+    const redisConfig = app.config.redis && app.config.redis.client
+      ? app.config.redis.client
+      : { host: '127.0.0.1', port: 6379, db: 0 };
+
+    const redis = new Redis({
+      host: redisConfig.host || '127.0.0.1',
+      port: redisConfig.port || 6379,
+      password: redisConfig.password || undefined,
+      db: redisConfig.db || 0,
+    });
+
+    redis.on('error', err => {
+      logger.error('[QueueWorker] redis error: %s', err && err.message);
+    });
+
+    logger.info('[QueueWorker] direct redis connected');
 
     // eslint-disable-next-line no-constant-condition
     while (true) {
       try {
         const fromId = await redisTransferQueue.blockPopReadyFromId(
-          app.redis,
+          redis,
           blockTimeoutSec
         );
 
-        if (!fromId) {
-          continue;
-        }
+        if (!fromId) continue;
 
-        try {
-          await this.tryDrainOneFromIdQueue(fromId);
-        } catch (err) {
+        // 不 await drain，讓 loop 立刻取下一個 fromId
+        this.tryDrainOneFromIdQueue(fromId, redis).catch(err => {
           logger.error(
             '[QueueWorker] drain error: fromId=%s err=%s',
             fromId,
             err && (err.stack || err.message)
           );
-        }
+        });
       } catch (err) {
         logger.error(
           '[QueueWorker] loop error: %s',
           err && (err.stack || err.message)
         );
 
-        await this.sleep(errorSleepMs);
+        await new Promise(resolve => setTimeout(resolve, errorSleepMs));
       }
     }
   }
 
-  // listTransfers
-  //
-  // 查詢帳戶歷史交易紀錄
   async listTransfers({ accountId, limit }) {
     const aid = Number(accountId);
     const lim = limit === undefined ? 50 : Number(limit);
 
     if (!Number.isInteger(aid) || aid <= 0) {
-      const err = new Error('accountId must be a positive integer');
-      err.status = 400;
-      throw err;
+      throw new BadRequestError('accountId must be a positive integer');
     }
 
     if (!Number.isInteger(lim) || lim <= 0) {
-      const err = new Error('limit must be a positive integer');
-      err.status = 400;
-      throw err;
+      throw new BadRequestError('limit must be a positive integer');
     }
 
     if (lim > 200) {
-      const err = new Error('limit must be <= 200');
-      err.status = 400;
-      throw err;
+      throw new BadRequestError('limit must be <= 200');
     }
 
-    const repo = new AccountsRepo(this.ctx);
-    const items = await repo.listTransfersByAccountId(aid, lim);
+    const items = await this.repo.listByAccountId(aid, lim);
 
-    return {
-      items,
-    };
+    return { items };
   }
 }
 
