@@ -263,6 +263,9 @@ class TransfersRepo extends baseShardRepo {
 
       if (transferId) {
         if (step2Committed) {
+          // compensate toAccount：無條件扣回，不加 available_balance >= $1 條件
+          // 原本有條件的版本在高併發下可能因 toAccount 已被其他轉帳消耗
+          // 導致 available_balance 不足，compensate 靜默失敗，造成資金憑空增加
           try {
             await toClient.query('BEGIN');
             await toClient.query("SET LOCAL lock_timeout = '200ms'");
@@ -274,14 +277,25 @@ class TransfersRepo extends baseShardRepo {
                   available_balance = available_balance - $1,
                   updated_at = NOW()
                 WHERE id = $2
-                  AND available_balance >= $1
               `,
               [ transferAmount, toAccountId ]
             );
             await toClient.query('COMMIT');
           } catch (e) {
-            void e;
+            // compensate 失敗必須記錄，不能靜默吞掉，否則資金不一致無法追蹤
             try { await toClient.query('ROLLBACK'); } catch (e2) { void e2; }
+            const logger = this.ctx && this.ctx.logger;
+            if (logger) {
+              logger.error(
+                '[CrossShard] CRITICAL: compensate toAccount failed, funds may be leaked: transferId=%s toAccountId=%s amount=%s err=%s',
+                transferId, toAccountId, transferAmount, e && e.message
+              );
+            } else {
+              console.error(
+                '[CrossShard] CRITICAL: compensate toAccount failed, funds may be leaked: transferId=%s toAccountId=%s amount=%s err=%s',
+                transferId, toAccountId, transferAmount, e && e.message
+              );
+            }
           }
         }
 
@@ -310,8 +324,20 @@ class TransfersRepo extends baseShardRepo {
           );
           await fromClient.query('COMMIT');
         } catch (e) {
-          void e;
+          // compensate 失敗必須記錄，不能靜默吞掉
           try { await fromClient.query('ROLLBACK'); } catch (e2) { void e2; }
+          const logger = this.ctx && this.ctx.logger;
+          if (logger) {
+            logger.error(
+              '[CrossShard] CRITICAL: compensate fromAccount failed, reserved balance may be stuck: transferId=%s fromAccountId=%s amount=%s err=%s',
+              transferId, fromAccountId, transferAmount, e && e.message
+            );
+          } else {
+            console.error(
+              '[CrossShard] CRITICAL: compensate fromAccount failed, reserved balance may be stuck: transferId=%s fromAccountId=%s amount=%s err=%s',
+              transferId, fromAccountId, transferAmount, e && e.message
+            );
+          }
         }
       }
 

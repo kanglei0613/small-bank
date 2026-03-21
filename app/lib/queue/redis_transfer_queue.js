@@ -419,6 +419,24 @@ async function drainQueue({ ctx, fromId, redis, handler, ownerValue, options = {
   } finally {
     heartbeat.stop();
     await releaseOwner(redis, fromId, ownerValue);
+
+    // drain 結束後，若 queue 還有剩餘 job（可能是 drain 進行中新進來的）
+    // 重新把 fromId 推回 ready queue，讓 worker 繼續處理
+    // 避免 job 永遠卡在 queue 裡沒人消費
+    try {
+      const queueKey = buildQueueKey(fromId);
+      const remaining = await redis.llen(queueKey);
+      if (remaining > 0) {
+        const readyQueueKey = buildReadyQueueKey();
+        await redis.lpush(readyQueueKey, String(fromId));
+      }
+    } catch (err) {
+      logger.error(
+        '[RedisQueue] failed to re-enqueue fromId after drain: fromId=%s err=%s',
+        fromId,
+        err && err.message
+      );
+    }
   }
 }
 
