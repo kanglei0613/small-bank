@@ -369,7 +369,7 @@ function TransferModal({ state, onClose }) {
                 NT$ {formatMoney(state.amount)} &nbsp;{state.fromId} → {state.toId}
               </div>
               <div style={{ fontSize: 12, color: "#9ca3af", marginTop: 10 }}>
-                {state.attempts > 0 ? `已等待 ${(state.attempts * 0.5).toFixed(1)} 秒` : "正在送出..."}
+                正在處理...
               </div>
             </>
           )}
@@ -649,7 +649,7 @@ export default function App() {
     const amt = Number(amount);
     if (!Number.isInteger(amt) || amt <= 0) return toast("金額必須為正整數", "error");
 
-    setTransferModal({ status: "pending", fromId, toId, amount: amt, attempts: 0 });
+    setTransferModal({ status: "pending", fromId, toId, amount: amt });
 
     try {
       const init = await request(`${TRANSFER_API}/transfers`, {
@@ -669,98 +669,93 @@ export default function App() {
         return;
       }
 
-      // 跨 shard：SSE 等待完成通知
+      // 跨 shard：積極輪詢 + SSE 並行，誰先到誰算
+      //
+      // 設計重點：
+      // - jobId 拿到後立即開始輪詢，不等任何 timer
+      // - 輪詢間隔從 80ms 指數退避到 500ms，避免 server 壓力
+      // - SSE 作為加速路徑，若後端推送更快則優先
+      // - 任一路徑先 settle 後，另一路徑自動放棄
       const jobId = init?.data?.jobId;
       if (!jobId) throw new Error("未取得 jobId");
 
-      const handleJobResult = (job) => {
-        if (job.status === "success") {
-          const balance = job?.result?.balance?.balance;
-          setTransferModal({ status: "success", fromId, toId, amount: amt, balance });
-          if (String(accountId) === String(fromId) || String(accountId) === String(toId)) {
-            request(`${GENERAL_API}/accounts/${accountId}`)
-              .then(res => setAccount(res?.data || null))
-              .catch(() => {});
-          }
-          return true;
+      const handleJobResult = job => {
+        const balance = job?.result?.balance?.balance;
+        setTransferModal({ status: "success", fromId, toId, amount: amt, balance });
+        if (String(accountId) === String(fromId) || String(accountId) === String(toId)) {
+          request(`${GENERAL_API}/accounts/${accountId}`)
+            .then(res => setAccount(res?.data || null))
+            .catch(() => {});
         }
-        return false;
       };
 
       await new Promise((resolve, reject) => {
-        const es = new EventSource(`${GENERAL_API}/transfer-jobs/${jobId}/stream`);
-        let closed = false;
-        const cleanup = () => { if (!closed) { closed = true; es.close(); } };
+        let settled = false;
+        let pollTimer = null;
+        let es = null;
 
-        // job 已完成時後端直接回 JSON，EventSource 觸發 onerror
-        // 改用輪詢等到有結果為止（最多 30 秒，每 500ms 查一次）
-        es.onerror = async () => {
-          cleanup();
-          const deadline = Date.now() + 30000;
-          const poll = async () => {
-            try {
-              const check = await request(`${GENERAL_API}/transfer-jobs/${jobId}`);
-              const job = check?.data;
-              if (job?.status === "success") {
-                handleJobResult(job);
-                resolve();
-              } else if (job?.status === "failed") {
-                reject(new Error(job?.error?.message || "轉帳失敗"));
-              } else if (Date.now() < deadline) {
-                setTimeout(poll, 500);
-              } else {
-                reject(new Error("轉帳處理逾時（30 秒）"));
-              }
-            } catch {
-              reject(new Error("查詢轉帳狀態失敗"));
-            }
-          };
-          poll();
+        const settle = fn => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(pollTimer);
+          if (es) { es.close(); es = null; }
+          fn();
         };
 
-        es.onmessage = (e) => {
+        // 積極輪詢：jobId 拿到後立即執行第一次，間隔指數退避
+        const deadline = Date.now() + 30000;
+        let pollInterval = 80;
+
+        const poll = async () => {
+          if (settled) return;
           try {
-            const job = JSON.parse(e.data);
-            if (job.status === "timeout") {
-              // SSE 連線逾時，但 job 可能還在處理中，改用輪詢繼續等
-              cleanup();
-              const deadline = Date.now() + 60000;
-              const poll = async () => {
-                try {
-                  const check = await request(`${GENERAL_API}/transfer-jobs/${jobId}`);
-                  const j = check?.data;
-                  if (j?.status === "success") {
-                    handleJobResult(j);
-                    resolve();
-                  } else if (j?.status === "failed") {
-                    reject(new Error(j?.error?.message || "轉帳失敗"));
-                  } else if (Date.now() < deadline) {
-                    setTimeout(poll, 500);
-                  } else {
-                    reject(new Error("轉帳處理逾時，請至紀錄頁確認結果"));
-                  }
-                } catch {
-                  reject(new Error("查詢轉帳狀態失敗"));
-                }
-              };
-              poll();
-              return;
-            }
-            if (job.status === "success") {
-              handleJobResult(job);
-              cleanup();
-              resolve();
-              return;
-            }
-            if (job.status === "failed") {
-              cleanup();
-              reject(new Error(job?.error?.message || "轉帳失敗"));
+            const check = await request(`${GENERAL_API}/transfer-jobs/${jobId}`);
+            const job = check?.data;
+            if (job?.status === "success") {
+              settle(() => { handleJobResult(job); resolve(); });
+            } else if (job?.status === "failed") {
+              settle(() => reject(new Error(job?.error?.message || "轉帳失敗")));
+            } else if (Date.now() < deadline) {
+              pollInterval = Math.min(pollInterval * 1.5, 500);
+              pollTimer = setTimeout(poll, pollInterval);
+            } else {
+              settle(() => reject(new Error("轉帳處理逾時，請至紀錄頁確認結果")));
             }
           } catch {
-            cleanup();
-            reject(new Error("回應解析失敗"));
+            if (!settled) {
+              pollInterval = Math.min(pollInterval * 1.5, 500);
+              pollTimer = setTimeout(poll, pollInterval);
+            }
           }
         };
+
+        poll();
+
+        // SSE 作為加速路徑：若後端 pub/sub 推送比輪詢更快則優先
+        try {
+          es = new EventSource(`${GENERAL_API}/transfer-jobs/${jobId}/stream`);
+
+          es.onmessage = e => {
+            try {
+              const job = JSON.parse(e.data);
+              if (job.status === "success") {
+                settle(() => { handleJobResult(job); resolve(); });
+              } else if (job.status === "failed") {
+                settle(() => reject(new Error(job?.error?.message || "轉帳失敗")));
+              }
+              // timeout → 繼續靠輪詢，不需特別處理
+            } catch {
+              // parse error → 繼續靠輪詢
+            }
+          };
+
+          es.onerror = () => {
+            if (es) { es.close(); es = null; }
+            // SSE 失敗不 reject，輪詢會繼續接手
+          };
+        } catch {
+          // EventSource 不支援或被擋，只靠輪詢
+        }
       });
     } catch (e) {
       setTransferModal(prev => prev ? { ...prev, status: "failed", errorMsg: e.message } : prev);

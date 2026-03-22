@@ -101,6 +101,9 @@ class TransferService extends Service {
 
     const start = Date.now();
 
+    const queueWaitMs = start - (job.createdAt || start);
+    logger.info('[TransferJob] queue wait: jobId=%s fromId=%s queueWaitMs=%d', jobId, fromId, queueWaitMs);
+
     try {
       const result = await this.repo.transfer(fromId, toId, amount);
 
@@ -142,7 +145,7 @@ class TransferService extends Service {
   async startQueueWorker() {
     const { app, logger } = this.ctx;
     const workerConfig = app.config.transferQueue || {};
-    const blockTimeoutSec = Number(workerConfig.readyQueueBlockTimeoutSec || 1);
+    const blockTimeoutSec = workerConfig.readyQueueBlockTimeoutSec ?? 1;
     const errorSleepMs = Number(workerConfig.workerErrorSleepMs || 1000);
 
     // 建立獨立的 ioredis 直連，繞過 egg cluster-client IPC 延遲
