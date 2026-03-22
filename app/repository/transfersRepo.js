@@ -147,7 +147,11 @@ class TransfersRepo extends baseShardRepo {
     let step2Committed = false;
 
     try {
-      // Step 1: reserve on from shard
+      // ─────────────────────────────────────────
+      // Step 1: reserve on fromShard
+      // saga_log INSERT 和業務操作在同一個 tx，保證原子性
+      // 若 tx rollback，saga_log 也不會存在，不會有孤立的 log
+      // ─────────────────────────────────────────
       await fromClient.query('BEGIN');
       await fromClient.query("SET LOCAL lock_timeout = '200ms'");
 
@@ -180,9 +184,24 @@ class TransfersRepo extends baseShardRepo {
       );
 
       transferId = insertResult.rows[0].id;
+
+      // saga_log 寫在同一個 tx，和 reserve 一起 commit
+      // recovery worker 掃到 step='RESERVED' 超過 N 秒 → 代表 Step 2 或補償沒完成
+      await fromClient.query(
+        `
+          INSERT INTO saga_log
+            (transfer_id, step, from_account_id, to_account_id, from_shard_id, to_shard_id, amount, updated_at)
+          VALUES ($1, 'RESERVED', $2, $3, $4, $5, $6, NOW())
+          ON CONFLICT (transfer_id) DO NOTHING
+        `,
+        [ transferId, fromAccountId, toAccountId, fromShardId, toShardId, transferAmount ]
+      );
+
       await fromClient.query('COMMIT');
 
-      // Step 2: credit on to shard
+      // ─────────────────────────────────────────
+      // Step 2: credit on toShard
+      // ─────────────────────────────────────────
       await toClient.query('BEGIN');
       await toClient.query("SET LOCAL lock_timeout = '200ms'");
 
@@ -207,7 +226,21 @@ class TransfersRepo extends baseShardRepo {
       await toClient.query('COMMIT');
       step2Committed = true;
 
-      // Step 3: finalize on from shard
+      // Step 2 commit 成功後推進 saga_log 到 CREDITED
+      // 這步失敗沒關係：saga_log 仍是 RESERVED
+      // recovery worker 掃到後會重試 Step 2（冪等：重複 credit 同一 transferId 前會先確認）
+      await this.getShardPg(fromShardId).query(
+        `
+          UPDATE saga_log
+          SET step = 'CREDITED', updated_at = NOW()
+          WHERE transfer_id = $1
+        `,
+        [ transferId ]
+      );
+
+      // ─────────────────────────────────────────
+      // Step 3: finalize on fromShard
+      // ─────────────────────────────────────────
       await fromClient.query('BEGIN');
       await fromClient.query("SET LOCAL lock_timeout = '200ms'");
 
@@ -232,7 +265,7 @@ class TransfersRepo extends baseShardRepo {
 
       if (finalizeResult.rowCount === 0) {
         const { ConflictError } = require('../lib/errors');
-        throw new ConflictError('insufficient funds');
+        throw new ConflictError('finalize failed: reserved balance mismatch');
       }
 
       await fromClient.query(
@@ -240,6 +273,16 @@ class TransfersRepo extends baseShardRepo {
           UPDATE transfers
           SET status = 'COMPLETED', updated_at = NOW()
           WHERE id = $1
+        `,
+        [ transferId ]
+      );
+
+      // saga_log 標記 COMPLETED（終態），recovery worker 不再碰它
+      await fromClient.query(
+        `
+          UPDATE saga_log
+          SET step = 'COMPLETED', updated_at = NOW()
+          WHERE transfer_id = $1
         `,
         [ transferId ]
       );
@@ -257,15 +300,14 @@ class TransfersRepo extends baseShardRepo {
         type: 'cross-shard',
         balance: finalizeResult.rows[0],
       };
+
     } catch (err) {
       try { await fromClient.query('ROLLBACK'); } catch (e) { void e; }
       try { await toClient.query('ROLLBACK'); } catch (e) { void e; }
 
       if (transferId) {
         if (step2Committed) {
-          // compensate toAccount：無條件扣回，不加 available_balance >= $1 條件
-          // 原本有條件的版本在高併發下可能因 toAccount 已被其他轉帳消耗
-          // 導致 available_balance 不足，compensate 靜默失敗，造成資金憑空增加
+          // Step 2 已 commit，先補償 toAccount
           try {
             await toClient.query('BEGIN');
             await toClient.query("SET LOCAL lock_timeout = '200ms'");
@@ -282,26 +324,23 @@ class TransfersRepo extends baseShardRepo {
             );
             await toClient.query('COMMIT');
           } catch (e) {
-            // compensate 失敗必須記錄，不能靜默吞掉，否則資金不一致無法追蹤
             try { await toClient.query('ROLLBACK'); } catch (e2) { void e2; }
             const logger = this.ctx && this.ctx.logger;
-            if (logger) {
-              logger.error(
-                '[CrossShard] CRITICAL: compensate toAccount failed, funds may be leaked: transferId=%s toAccountId=%s amount=%s err=%s',
-                transferId, toAccountId, transferAmount, e && e.message
-              );
-            } else {
-              console.error(
-                '[CrossShard] CRITICAL: compensate toAccount failed, funds may be leaked: transferId=%s toAccountId=%s amount=%s err=%s',
-                transferId, toAccountId, transferAmount, e && e.message
-              );
-            }
+            (logger || console).error(
+              '[CrossShard] CRITICAL: compensate toAccount failed, saga_log remains CREDITED for recovery: transferId=%s toAccountId=%s amount=%s err=%s',
+              transferId, toAccountId, transferAmount, e && e.message
+            );
+            // saga_log 仍是 CREDITED，recovery worker 之後掃到會重試補償
+            throw err;
           }
         }
 
+        // 補償 fromAccount：還原 reserved → available
+        // 移除原本的 AND reserved_balance >= $1 條件，避免靜默失敗（UPDATE 0 rows）
         try {
           await fromClient.query('BEGIN');
           await fromClient.query("SET LOCAL lock_timeout = '200ms'");
+
           await fromClient.query(
             `
               UPDATE accounts
@@ -310,10 +349,10 @@ class TransfersRepo extends baseShardRepo {
                 reserved_balance = reserved_balance - $1,
                 updated_at = NOW()
               WHERE id = $2
-                AND reserved_balance >= $1
             `,
             [ transferAmount, fromAccountId ]
           );
+
           await fromClient.query(
             `
               UPDATE transfers
@@ -322,22 +361,26 @@ class TransfersRepo extends baseShardRepo {
             `,
             [ transferId ]
           );
+
+          // saga_log 標記 FAILED（終態），recovery worker 不再處理
+          await fromClient.query(
+            `
+              UPDATE saga_log
+              SET step = 'FAILED', updated_at = NOW()
+              WHERE transfer_id = $1
+            `,
+            [ transferId ]
+          );
+
           await fromClient.query('COMMIT');
         } catch (e) {
-          // compensate 失敗必須記錄，不能靜默吞掉
           try { await fromClient.query('ROLLBACK'); } catch (e2) { void e2; }
           const logger = this.ctx && this.ctx.logger;
-          if (logger) {
-            logger.error(
-              '[CrossShard] CRITICAL: compensate fromAccount failed, reserved balance may be stuck: transferId=%s fromAccountId=%s amount=%s err=%s',
-              transferId, fromAccountId, transferAmount, e && e.message
-            );
-          } else {
-            console.error(
-              '[CrossShard] CRITICAL: compensate fromAccount failed, reserved balance may be stuck: transferId=%s fromAccountId=%s amount=%s err=%s',
-              transferId, fromAccountId, transferAmount, e && e.message
-            );
-          }
+          (logger || console).error(
+            '[CrossShard] CRITICAL: compensate fromAccount failed, saga_log remains for recovery: transferId=%s fromAccountId=%s amount=%s err=%s',
+            transferId, fromAccountId, transferAmount, e && e.message
+          );
+          // saga_log 仍是 RESERVED，recovery worker 之後掃到會重試
         }
       }
 

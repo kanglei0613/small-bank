@@ -116,6 +116,7 @@ module.exports = app => {
     } else {
       // app.logger.info('[queue worker] api role detected, worker will not start');
     }
+
   });
 
   // 當 app 發生 error 時，log error
