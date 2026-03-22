@@ -15,5 +15,9 @@ typings/
 .nyc_output/
 .env
 .env.*
-node_modules/
-local DB dump
+
+# benchmark runtime 產生的檔案
+scripts/benchmark/.seed-config.json
+
+# 暫存壓縮檔
+*.zip
