@@ -4,6 +4,7 @@ const Service = require('egg').Service;
 const TransfersRepo = require('../repository/transfersRepo');
 const redisTransferQueue = require('../lib/queue/redis_transfer_queue');
 const transferJobStore = require('../lib/queue/transfer_job_store');
+const { BadRequestError } = require('../lib/errors');
 
 const BENCH_QUEUE_KEY = 'bench:transfer:queue';
 const BENCH_JOB_TTL_SECONDS = 60 * 60;
@@ -18,20 +19,16 @@ function buildJobId() {
 
 function validateInput({ fromId, toId, amount }) {
   if (!Number.isInteger(fromId) || fromId <= 0) {
-    const { ConflictError } = require('../lib/errors');
-    throw new ConflictError('insufficient funds');
+    throw new BadRequestError('fromId must be a positive integer');
   }
   if (!Number.isInteger(toId) || toId <= 0) {
-    const { ConflictError } = require('../lib/errors');
-    throw new ConflictError('insufficient funds');
+    throw new BadRequestError('toId must be a positive integer');
   }
   if (!Number.isInteger(amount) || amount <= 0) {
-    const { ConflictError } = require('../lib/errors');
-    throw new ConflictError('insufficient funds');
+    throw new BadRequestError('amount must be a positive integer');
   }
   if (fromId === toId) {
-    const { ConflictError } = require('../lib/errors');
-    throw new ConflictError('insufficient funds');
+    throw new BadRequestError('fromId and toId cannot be the same');
   }
 }
 

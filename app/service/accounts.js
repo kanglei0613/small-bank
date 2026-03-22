@@ -4,6 +4,7 @@ const Service = require('egg').Service;
 const AccountsRepo = require('../repository/accountsRepo');
 const UsersRepo = require('../repository/usersRepo');
 const cache = require('../lib/cache');
+const { BadRequestError, NotFoundError } = require('../lib/errors');
 
 class AccountsService extends Service {
 
@@ -16,8 +17,7 @@ class AccountsService extends Service {
   async openAccount({ userId, initialBalance, balance } = {}) {
     const uid = Number(userId);
     if (!Number.isInteger(uid) || uid <= 0) {
-      const { ConflictError } = require('../lib/errors');
-      throw new ConflictError('insufficient funds');
+      throw new BadRequestError('userId must be a positive integer');
     }
 
     const bal = initialBalance !== undefined
@@ -25,14 +25,12 @@ class AccountsService extends Service {
       : Number(balance != null ? balance : 0);
 
     if (!Number.isFinite(bal) || bal < 0) {
-      const { ConflictError } = require('../lib/errors');
-      throw new ConflictError('insufficient funds');
+      throw new BadRequestError('initialBalance must be a non-negative number');
     }
 
     const user = await this.usersRepo.getById(uid);
     if (!user) {
-      const { ConflictError } = require('../lib/errors');
-      throw new ConflictError('insufficient funds');
+      throw new NotFoundError('user not found');
     }
 
     return await this.accountsRepo.create({ userId: uid, initialBalance: bal });
@@ -43,12 +41,10 @@ class AccountsService extends Service {
     const amt = Number(amount);
 
     if (!Number.isInteger(aid) || aid <= 0) {
-      const { ConflictError } = require('../lib/errors');
-      throw new ConflictError('insufficient funds');
+      throw new BadRequestError('accountId must be a positive integer');
     }
     if (!Number.isInteger(amt) || amt <= 0) {
-      const { ConflictError } = require('../lib/errors');
-      throw new ConflictError('insufficient funds');
+      throw new BadRequestError('amount must be a positive integer');
     }
 
     const result = await this.accountsRepo.deposit({ accountId: aid, amount: amt });
@@ -61,12 +57,10 @@ class AccountsService extends Service {
     const amt = Number(amount);
 
     if (!Number.isInteger(aid) || aid <= 0) {
-      const { ConflictError } = require('../lib/errors');
-      throw new ConflictError('insufficient funds');
+      throw new BadRequestError('accountId must be a positive integer');
     }
     if (!Number.isInteger(amt) || amt <= 0) {
-      const { ConflictError } = require('../lib/errors');
-      throw new ConflictError('insufficient funds');
+      throw new BadRequestError('amount must be a positive integer');
     }
 
     const result = await this.accountsRepo.withdraw({ accountId: aid, amount: amt });
@@ -77,8 +71,7 @@ class AccountsService extends Service {
   async getAccountById(id) {
     const aid = Number(id);
     if (!Number.isInteger(aid) || aid <= 0) {
-      const { ConflictError } = require('../lib/errors');
-      throw new ConflictError('insufficient funds');
+      throw new BadRequestError('accountId must be a positive integer');
     }
 
     const { app, logger } = this.ctx;
@@ -93,8 +86,7 @@ class AccountsService extends Service {
 
     const account = await this.accountsRepo.getById(aid);
     if (!account) {
-      const { ConflictError } = require('../lib/errors');
-      throw new ConflictError('insufficient funds');
+      throw new NotFoundError('account not found');
     }
 
     try {
@@ -108,10 +100,7 @@ class AccountsService extends Service {
 
   async invalidateAccountCache(id) {
     const aid = Number(id);
-    if (!Number.isInteger(aid) || aid <= 0) {
-      const { ConflictError } = require('../lib/errors');
-      throw new ConflictError('insufficient funds');
-    }
+    if (!Number.isInteger(aid) || aid <= 0) return;
 
     try {
       await this.ctx.app.redis.del(cache.accountKey(aid));

@@ -1,6 +1,7 @@
 'use strict';
 
 const Service = require('egg').Service;
+const { BadRequestError, NotFoundError, InternalError } = require('../lib/errors');
 
 class ShardService extends Service {
 
@@ -8,10 +9,8 @@ class ShardService extends Service {
   async getShardIdByAccountId(accountId) {
     const aid = Number(accountId);
 
-    // 檢查 accountId
     if (!Number.isInteger(aid) || aid <= 0) {
-      const { ConflictError } = require('../lib/errors');
-      throw new ConflictError('insufficient funds');
+      throw new BadRequestError('accountId must be a positive integer');
     }
 
     const sql = `
@@ -25,8 +24,7 @@ class ShardService extends Service {
     const row = result.rows[0];
 
     if (!row) {
-      const { ConflictError } = require('../lib/errors');
-      throw new ConflictError('insufficient funds');
+      throw new NotFoundError('account not found');
     }
 
     return Number(row.shard_id);
@@ -36,17 +34,14 @@ class ShardService extends Service {
   getShardPg(shardId) {
     const sid = Number(shardId);
 
-    // 檢查 shardId
     if (!Number.isInteger(sid) || sid < 0) {
-      const { ConflictError } = require('../lib/errors');
-      throw new ConflictError('insufficient funds');
+      throw new BadRequestError('shardId must be a non-negative integer');
     }
 
     const shardPg = this.app.shardPgMap[sid];
 
     if (!shardPg) {
-      const { ConflictError } = require('../lib/errors');
-      throw new ConflictError('insufficient funds');
+      throw new InternalError(`shard ${sid} not found`);
     }
 
     return shardPg;
