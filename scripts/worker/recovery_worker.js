@@ -285,6 +285,18 @@ async function compensateCredited(log, shardPgMap) {
       [ log.amount, log.toAccountId ]
     );
 
+    // saga_compensations 和 UPDATE accounts 在同一個 tx
+    // 用來記錄「這筆 transfer 的 toAccount 補償已執行」
+    // recovery worker 重跑時查這張表，有記錄就跳過，避免重複扣款
+    await toClient.query(
+      `
+        INSERT INTO saga_compensations (transfer_id)
+        VALUES ($1)
+        ON CONFLICT (transfer_id) DO NOTHING
+      `,
+      [ log.transferId ]
+    );
+
     await toClient.query('COMMIT');
   } catch (err) {
     try { await toClient.query('ROLLBACK'); } catch (e) { void e; }
@@ -378,42 +390,24 @@ async function compensateCredited(log, shardPgMap) {
 }
 
 // step = COMPENSATING：toAccount 補償已觸發（可能成功或 crash），fromAccount 尚未補償
-// 先查 toAccount 的實際狀態判斷是否需要補償，再補償 fromAccount
+// 查 saga_compensations 確認 toAccount 是否已補償，再決定是否需要補
 async function recoverFromCompensating(log, shardPgMap) {
   const fromShardPg = shardPgMap[log.fromShardId];
   const toShardPg   = shardPgMap[log.toShardId];
 
-  logger.info('COMPENSATING found, checking toAccount: transferId=%s', log.transferId);
+  logger.info('COMPENSATING found, checking saga_compensations: transferId=%s', log.transferId);
 
-  // 查 toAccount 目前的 balance
-  // 若 balance < 原始值（即已被扣回），表示補償 toAccount 已完成
-  // 這裡用一個更直接的方法：查 toShard 是否有對應的 balance 變動記錄
-  // 但因為沒有 compensation_log，改用保守做法：
-  // 嘗試扣 toAccount，若已扣過會讓 balance 多扣，所以改查 balance 是否足夠
-  //
-  // 最安全的判斷方式：直接查 toAccount 的 available_balance
-  // 若 available_balance >= amount，代表補償 toAccount 可能還沒做，需要補
-  // 若 available_balance < amount，代表可能已補償（但這不是絕對準確）
-  //
-  // 真正安全的做法是在 toShard 加一張 saga_compensations 表，
-  // 但目前用保守策略：直接嘗試補償 toAccount，但先查 balance 避免扣到負數
-  const toAccountResult = await toShardPg.query(
-    'SELECT balance, available_balance AS "availableBalance" FROM accounts WHERE id = $1',
-    [ log.toAccountId ]
+  // 查 toShard 的 saga_compensations 表
+  // 若有記錄，代表 toAccount 補償已在同一個 tx 裡完成，直接跳到補償 fromAccount
+  // 若沒有記錄，代表補償 toAccount 還沒完成（crash 在 tx commit 之前），需要補
+  const compensationResult = await toShardPg.query(
+    'SELECT id FROM saga_compensations WHERE transfer_id = $1 LIMIT 1',
+    [ log.transferId ]
   );
 
-  if (toAccountResult.rowCount === 0) {
-    logger.error('toAccount not found during COMPENSATING recovery: transferId=%s', log.transferId);
-    return;
-  }
+  const alreadyCompensated = compensationResult.rowCount > 0;
 
-  const { balance, availableBalance } = toAccountResult.rows[0];
-  const balanceNum = Number(balance);
-  const availableNum = Number(availableBalance);
-
-  // 若 toAccount 的 available_balance >= amount，代表補償可能還沒做，繼續補
-  // 若 available_balance < amount，代表可能已補償，直接跳去補償 fromAccount
-  if (availableNum >= log.amount) {
+  if (!alreadyCompensated) {
     logger.info('toAccount not yet compensated, compensating: transferId=%s', log.transferId);
 
     const toClient = await toShardPg.connect();
@@ -433,6 +427,16 @@ async function recoverFromCompensating(log, shardPgMap) {
         [ log.amount, log.toAccountId ]
       );
 
+      // 寫入 saga_compensations，和 UPDATE accounts 同一個 tx
+      await toClient.query(
+        `
+          INSERT INTO saga_compensations (transfer_id)
+          VALUES ($1)
+          ON CONFLICT (transfer_id) DO NOTHING
+        `,
+        [ log.transferId ]
+      );
+
       await toClient.query('COMMIT');
       logger.info('toAccount compensated in COMPENSATING recovery: transferId=%s', log.transferId);
     } catch (err) {
@@ -446,8 +450,7 @@ async function recoverFromCompensating(log, shardPgMap) {
       toClient.release();
     }
   } else {
-    logger.info('toAccount already compensated (availableBalance=%d < amount=%s), skipping: transferId=%s',
-      availableNum, log.amount, log.transferId);
+    logger.info('toAccount already compensated (saga_compensations exists), skipping: transferId=%s', log.transferId);
   }
 
   // 補償 fromAccount（和原本 compensateCredited 後半段相同）
