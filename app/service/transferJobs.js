@@ -1,10 +1,10 @@
 'use strict';
 
-const Redis = require('ioredis');
-const { PassThrough } = require('stream');
-const Service = require('egg').Service;
-const transferJobStore = require('../lib/queue/transfer_job_store');
-const { BadRequestError, NotFoundError } = require('../lib/errors');
+const Redis = require('ioredis'); // 引入 Redis 套件
+const { PassThrough } = require('stream'); // 引用串流套件以實作 SSE
+const Service = require('egg').Service; // 繼承 Egg.js 的 service 資料
+const transferJobStore = require('../lib/queue/transfer_job_store'); // 操作 Job 狀態的工具
+const { BadRequestError, NotFoundError } = require('../lib/errors'); // 自定義錯誤類型
 
 class TransferJobsService extends Service {
 
@@ -16,18 +16,20 @@ class TransferJobsService extends Service {
   async getJobById(jobId) {
     const { app } = this.ctx;
 
+    // 確保 jobId 存在且為字串
     if (!jobId || typeof jobId !== 'string') {
       throw new BadRequestError('jobId is required');
     }
 
-    const redis = app.redisDb || app.redis;
-    const job = await transferJobStore.getJob(redis, jobId);
+    const redis = app.redisDb || app.redis; // 優先使用 app.redisDb ，否則用預設的 app.redis
+    const job = await transferJobStore.getJob(redis, jobId); // 從 Redis 中取得 Job 詳情
 
+    // 若查無任務，回傳錯誤
     if (!job) {
       throw new NotFoundError('transfer job not found');
     }
 
-    return job;
+    return job; // 回傳 JSON 格式的 Job 狀態
   }
 
   // streamJobById(jobId)
@@ -63,21 +65,22 @@ class TransferJobsService extends Service {
     }
 
     // 設定 SSE headers
-    ctx.set('Content-Type', 'text/event-stream');
-    ctx.set('Cache-Control', 'no-cache');
-    ctx.set('Connection', 'keep-alive');
-    ctx.set('X-Accel-Buffering', 'no');
+    ctx.set('Content-Type', 'text/event-stream'); // 告訴瀏覽器這是串流資料
+    ctx.set('Cache-Control', 'no-cache'); // 禁用 cache ，保證資料即時正確
+    ctx.set('Connection', 'keep-alive'); // 保持連線
+    ctx.set('X-Accel-Buffering', 'no'); // 禁用代理伺服器的緩衝
     ctx.status = 200;
 
-    const stream = new PassThrough();
-    ctx.body = stream;
+    const stream = new PassThrough(); // 建立直通串流
+    ctx.body = stream; // 將串流綁到 Response body
 
-    // 建立獨立的 ioredis subscriber 連線，繞過共享 app.redisSub 的競態問題
-    // 連線設定沿用 app.redis.client，確保連到同一台 Redis
+    // 取得 Redis 設定
     const redisConfig = app.config.redis && app.config.redis.client
       ? app.config.redis.client
       : { host: '127.0.0.1', port: 6379, db: 0 };
 
+    // 建立獨立的 ioredis subscriber 連線，繞過共享 app.redisSub 的競態問題
+    // 連線設定沿用 app.redis.client，確保連到同一台 Redis
     const sub = new Redis({
       host: redisConfig.host || '127.0.0.1',
       port: redisConfig.port || 6379,
@@ -85,34 +88,37 @@ class TransferJobsService extends Service {
       db: redisConfig.db || 0,
     });
 
-    const channel = `transfer:job:done:${jobId}`;
-    let cleaned = false;
-    let timer;
+    const channel = `transfer:job:done:${jobId}`; // 定義監聽的頻道
+    let cleaned = false; // 標記是否清理
+    let timer; // 超時計時器
 
+    // 定義送資料給前端的方法
     const send = data => {
       if (!stream.writableEnded) {
-        stream.write(`data: ${JSON.stringify(data)}\n\n`);
-        stream.end();
+        stream.write(`data: ${JSON.stringify(data)}\n\n`); // SSE 標準格式
+        stream.end(); // 推送完畢後關閉串流
       }
     };
 
+    // 斷開 Redis 和清除計時器
     const cleanup = () => {
       if (cleaned) return;
       cleaned = true;
       ctx.logger.info('[TransferJobsService] cleanup called: jobId=%s stack=%s', jobId, new Error().stack.split('\n')[2].trim());
       clearTimeout(timer);
-      sub.quit().catch(() => {});
+      sub.quit().catch(() => {}); // 退出 Redis 連線
     };
 
+    // 監聽 Redis 訊息
     sub.on('message', (ch, message) => {
       if (ch !== channel) return;
       try {
-        send(JSON.parse(message));
+        send(JSON.parse(message)); // 收到通知，發給前端
       } catch (err) {
         this.ctx.logger.error('[TransferJobsService] message parse error: jobId=%s err=%s', jobId, err && err.message);
         send({ status: 'failed', error: { message: 'parse error' } });
       }
-      cleanup();
+      cleanup(); // 完成後清理
     });
 
     // sub 連線異常時推送 timeout，讓前端 fallback 輪詢
@@ -122,13 +128,13 @@ class TransferJobsService extends Service {
       cleanup();
     });
 
-    await sub.subscribe(channel);
+    await sub.subscribe(channel); // 訂閱頻道
 
     // 訂閱後再查一次，避免訂閱期間 job 剛好完成導致漏掉通知
     const latestJob = await transferJobStore.getJob(redis, jobId);
 
     if (latestJob && (latestJob.status === 'success' || latestJob.status === 'failed')) {
-      send(latestJob);
+      send(latestJob); // 如果發現已經做完了，立即推送和清理
       cleanup();
       return;
     }

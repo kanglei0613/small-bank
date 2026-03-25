@@ -3,8 +3,6 @@
 const Service = require('egg').Service;
 const redisTransferQueue = require('../lib/queue/redis_transfer_queue');
 
-const ACTIVE_FROM_IDS_KEY = 'transfer:queue:active:fromIds';
-
 class QueueService extends Service {
 
   async getQueueStats(fromId) {
@@ -17,42 +15,42 @@ class QueueService extends Service {
       batchSize: 20,
     };
 
-    return await redisTransferQueue.getQueueStats(app.redis, fromId, {
-      rejectThresholdPerFromId: queueConfig.rejectThresholdPerFromId,
-      maxQueueLengthPerFromId: queueConfig.maxQueueLengthPerFromId,
-      ownerTtlMs: queueConfig.ownerTtlMs,
-      ownerRefreshIntervalMs: queueConfig.ownerRefreshIntervalMs,
-      batchSize: queueConfig.batchSize,
-    });
+    return await redisTransferQueue.getQueueStats(app.redis, fromId, queueConfig);
   }
 
+  // Scan all active per-fromId queue keys to compute global stats.
   async getGlobalStats() {
     const { app } = this.ctx;
     const { redis } = app;
 
-    const fromIds = await redis.smembers(ACTIVE_FROM_IDS_KEY);
+    // SCAN for all per-fromId queue keys (non-blocking, cursor-based)
+    const queueKeys = [];
+    let cursor = '0';
+    do {
+      const [ nextCursor, keys ] = await redis.scan(cursor, 'MATCH', 'transfer:queue:from:*', 'COUNT', 100);
+      cursor = nextCursor;
+      queueKeys.push(...keys);
+    } while (cursor !== '0');
 
     let totalJobs = 0;
     const hotAccounts = [];
 
-    for (const fromId of fromIds) {
-      const queueKey = `transfer:queue:from:${fromId}`;
-      const queueLength = await redis.llen(queueKey);
-
+    for (const key of queueKeys) {
+      const fromId = Number(key.replace('transfer:queue:from:', ''));
+      const queueLength = await redis.llen(key);
       totalJobs += queueLength;
-
       if (queueLength > 0) {
-        hotAccounts.push({ fromId: Number(fromId), queueLength });
+        hotAccounts.push({ fromId, queueLength });
       }
     }
 
     hotAccounts.sort((a, b) => b.queueLength - a.queueLength);
 
     return {
-      totalQueues: fromIds.length,
+      totalQueues: queueKeys.length,
       totalJobs,
       hotAccounts,
-      workers: app.config.cluster && app.config.cluster.workers || 1,
+      workers: (app.config.cluster && app.config.cluster.workers) || 1,
     };
   }
 }

@@ -15,7 +15,7 @@
 // Redis key 範例：
 // transfer:job:abc123
 
-const JOB_TTL_SECONDS = 60 * 60 * 24;
+const JOB_TTL_SECONDS = 60 * 60 * 24; // Job 的 TTL
 
 // 建立 job key
 function buildJobKey(jobId) {
@@ -36,14 +36,15 @@ async function setJob(redis, job) {
 
 // 從 Redis 讀取 job
 async function getJob(redis, jobId) {
-  const key = buildJobKey(jobId);
-  const raw = await redis.get(key);
+  const key = buildJobKey(jobId); // 建立 Job key
+  const raw = await redis.get(key); // 非同步等待 Redis 回傳 key 對應值
 
+  // 空值處理
   if (!raw) {
     return null;
   }
 
-  return JSON.parse(raw);
+  return JSON.parse(raw); // 將拿到的 JSON 字串轉回 JS 物件，可以拿到欄位中的物件，方便直接讀取
 }
 
 // 建立新 job
@@ -58,11 +59,11 @@ async function createJob(redis, job) {
     amount: job.amount,
     createdAt: job.createdAt || Date.now(),
     updatedAt: job.updatedAt || job.createdAt || Date.now(),
-    result: job.result || null,
-    error: job.error || null,
+    result: job.result || null, // 尚未有結果
+    error: job.error || null, // 尚未有錯誤
   };
 
-  await setJob(redis, nextJob);
+  await setJob(redis, nextJob); // 寫入 Redis
   return nextJob;
 }
 
@@ -72,6 +73,7 @@ async function createJob(redis, job) {
 async function markSuccess(redis, job, result) {
   const now = Date.now();
 
+  // 把Job 狀態標記為成功
   const nextJob = {
     jobId: job.jobId,
     status: 'success',
@@ -84,9 +86,9 @@ async function markSuccess(redis, job, result) {
     error: null,
   };
 
-  const pl = redis.pipeline();
-  pl.set(buildJobKey(nextJob.jobId), JSON.stringify(nextJob), 'EX', JOB_TTL_SECONDS);
-  pl.publish(`transfer:job:done:${job.jobId}`, JSON.stringify(nextJob));
+  const pl = redis.pipeline(); // 使用 pipeline 減少網路開銷
+  pl.set(buildJobKey(nextJob.jobId), JSON.stringify(nextJob), 'EX', JOB_TTL_SECONDS); // 更新 Redis 裡的 JSON 字串
+  pl.publish(`transfer:job:done:${job.jobId}`, JSON.stringify(nextJob)); // 發佈訊息到特定頻道，通知 SSE 連線
   await pl.exec();
   return nextJob;
 }
@@ -113,10 +115,10 @@ async function markFailed(redis, job, err) {
     },
   };
 
-  const pl = redis.pipeline();
-  pl.set(buildJobKey(nextJob.jobId), JSON.stringify(nextJob), 'EX', JOB_TTL_SECONDS);
-  pl.publish(`transfer:job:done:${job.jobId}`, JSON.stringify(nextJob));
-  await pl.exec();
+  const pl = redis.pipeline(); // 開啟 pipeline 暫存區
+  pl.set(buildJobKey(nextJob.jobId), JSON.stringify(nextJob), 'EX', JOB_TTL_SECONDS); // 把 Job 的最新狀態轉乘 JSON 字串存入 Redis
+  pl.publish(`transfer:job:done:${job.jobId}`, JSON.stringify(nextJob)); // 發動 Pub 給對應的頻道
+  await pl.exec(); // 執行 Pipeline
   return nextJob;
 }
 

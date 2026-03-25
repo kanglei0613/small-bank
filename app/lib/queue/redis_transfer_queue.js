@@ -1,41 +1,13 @@
 'use strict';
 
-// Redis Transfer Queue
-//
-// 作用：
-// - 使用 Redis list 作為 per-fromId queue
-// - 使用 Redis owner lock 避免多個 process 同時 drain 同一條 queue
-// - 使用 ready queue 記錄目前可被 worker 處理的 fromId
-// - worker 不再掃 active set，而是直接 BRPOP ready queue
-// - drain 時依序取出 job
-// - 呼叫 handler(job) 執行真正的 transfer job
+const { TooManyRequestsError } = require('../errors');
 
-// 建立 per-fromId queue key
-function buildQueueKey(fromId) {
-  return `transfer:queue:from:${fromId}`;
-}
+// Key builders
+function buildQueueKey(fromId) { return `transfer:queue:from:${fromId}`; }
+function buildOwnerKey(fromId) { return `transfer:queue:owner:from:${fromId}`; }
+function buildReadyQueueKey() { return 'transfer:queue:ready:fromIds'; }
+function buildOwnerValue() { return `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`; }
 
-// 建立 owner lock key
-function buildOwnerKey(fromId) {
-  return `transfer:queue:owner:from:${fromId}`;
-}
-
-// 建立 ready queue key
-//
-// ready queue 只存「目前有工作可做的 fromId」
-// worker 會阻塞在這條 queue 上，不再掃描 active set
-function buildReadyQueueKey() {
-  return 'transfer:queue:ready:fromIds';
-}
-
-// 建立 owner value
-//
-// 用 pid + timestamp + random string 當 owner value，方便辨識目前持鎖的是誰
-function buildOwnerValue() {
-  return `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-}
-
-// 讀取 transfer queue config
 function getTransferQueueConfig(app) {
   return app.config.transferQueue || {
     rejectThresholdPerFromId: 240,
@@ -47,49 +19,24 @@ function getTransferQueueConfig(app) {
   };
 }
 
-// 將 job push 進 per-fromId queue
+// Push a job into the per-fromId queue.
 //
-// 設計重點：
-// - queue 長度達到 rejectThreshold → 直接拒絕
-// - queue 長度達到 maxLength → 視為 full
-// - 只有 queue 從空變成非空時，才把 fromId 推進 ready queue 一次
-//
-// 為什麼這樣做：
-// - 避免 worker 不斷掃描所有 active fromId
-// - ready queue 只在「這條 queue 原本是空的」時補一次 fromId
-// - 同一條 queue 後續新增 job，不需要一直重複 push fromId 到 ready queue
+// Uses a Lua script for atomicity: length check + push + ready-queue signal are one operation.
+// The fromId is pushed to the ready queue only when the queue transitions from empty → non-empty,
+// so the worker doesn't get redundant signals for every job.
 async function pushJob(redis, fromId, job, options = {}) {
   const queueKey = buildQueueKey(fromId);
   const readyQueueKey = buildReadyQueueKey();
   const payload = JSON.stringify(job);
-
-  const rejectThresholdPerFromId = options.rejectThresholdPerFromId || 240;
-  const maxQueueLengthPerFromId = options.maxQueueLengthPerFromId || 300;
+  const rejectThreshold = options.rejectThresholdPerFromId || 240;
+  const maxLength = options.maxQueueLengthPerFromId || 300;
 
   const lua = `
-    local queueKey = KEYS[1]
-    local readyQueueKey = KEYS[2]
-    local rejectThreshold = tonumber(ARGV[1])
-    local maxLength = tonumber(ARGV[2])
-    local payload = ARGV[3]
-    local fromId = ARGV[4]
-
-    local currentLength = redis.call("LLEN", queueKey)
-
-    if currentLength >= rejectThreshold then
-      return -2
-    end
-
-    if currentLength >= maxLength then
-      return -1
-    end
-
-    local newLength = redis.call("RPUSH", queueKey, payload)
-
-    if newLength == 1 then
-      redis.call("LPUSH", readyQueueKey, fromId)
-    end
-
+    local currentLength = redis.call("LLEN", KEYS[1])
+    if currentLength >= tonumber(ARGV[1]) then return -2 end
+    if currentLength >= tonumber(ARGV[2]) then return -1 end
+    local newLength = redis.call("RPUSH", KEYS[1], ARGV[3])
+    if newLength == 1 then redis.call("LPUSH", KEYS[2], ARGV[4]) end
     return newLength
   `;
 
@@ -98,90 +45,56 @@ async function pushJob(redis, fromId, job, options = {}) {
     2,
     queueKey,
     readyQueueKey,
-    String(rejectThresholdPerFromId),
-    String(maxQueueLengthPerFromId),
+    String(rejectThreshold),
+    String(maxLength),
     payload,
     String(fromId)
   );
 
   if (result === -2) {
-    const { ConflictError } = require('../lib/errors');
-    throw new ConflictError('insufficient funds');
+    throw new TooManyRequestsError('transfer queue is full, please try again later');
   }
 
   if (result === -1) {
-    const { ConflictError } = require('../lib/errors');
-    throw new ConflictError('insufficient funds');
+    throw new TooManyRequestsError('transfer queue is at capacity, please try again later');
   }
 
   return result;
 }
 
-// 從 queue 左邊取出一筆 job
+// Pop a single job from the left of the queue.
 async function popJob(redis, fromId) {
   const jobs = await popJobs(redis, fromId, 1);
   return jobs[0] || null;
 }
 
-// 使用 Lua 一次批次取出多筆 job
-//
-// 流程：
-// - LRANGE 先取前 N 筆
-// - 如果有資料，再用 LTRIM 把前 N 筆切掉
-//
-// 這樣比一筆一筆 LPOP 效率高
+// Atomically pop up to batchSize jobs from the left of the queue.
 async function popJobs(redis, fromId, batchSize) {
   const queueKey = buildQueueKey(fromId);
 
   const lua = `
-    local n = tonumber(ARGV[1])
-    local values = redis.call("LRANGE", KEYS[1], 0, n - 1)
-
-    if #values == 0 then
-      return values
-    end
-
-    redis.call("LTRIM", KEYS[1], n, -1)
+    local values = redis.call("LRANGE", KEYS[1], 0, tonumber(ARGV[1]) - 1)
+    if #values == 0 then return values end
+    redis.call("LTRIM", KEYS[1], tonumber(ARGV[1]), -1)
     return values
   `;
 
-  const raws = await redis.eval(
-    lua,
-    1,
-    queueKey,
-    String(batchSize)
-  );
+  const raws = await redis.eval(lua, 1, queueKey, String(batchSize));
 
-  if (!raws || raws.length === 0) {
-    return [];
-  }
-
+  if (!raws || raws.length === 0) return [];
   return raws.map(raw => JSON.parse(raw));
 }
 
-// 取得 queue 長度
 async function getQueueLength(redis, fromId) {
-  const queueKey = buildQueueKey(fromId);
-  return await redis.llen(queueKey);
+  return await redis.llen(buildQueueKey(fromId));
 }
 
-// 取得 queue stats
-//
-// 這裡不再看 active set，而是看：
-// - queue length
-// - owner lock
-// - ready queue length
 async function getQueueStats(redis, fromId, options = {}) {
   const queueKey = buildQueueKey(fromId);
   const ownerKey = buildOwnerKey(fromId);
   const readyQueueKey = buildReadyQueueKey();
 
-  const [
-    queueLength,
-    ownerValue,
-    ownerTTL,
-    readyQueueLength,
-  ] = await Promise.all([
+  const [ queueLength, ownerValue, ownerTTL, readyQueueLength ] = await Promise.all([
     redis.llen(queueKey),
     redis.get(ownerKey),
     redis.pttl(ownerKey),
@@ -206,82 +119,55 @@ async function getQueueStats(redis, fromId, options = {}) {
   };
 }
 
-// 嘗試取得某個 fromId queue 的 owner
-//
-// 只有拿到 owner lock 的 worker，才能 drain 這條 queue
+// Acquire the owner lock for a fromId queue (SET NX PX).
+// Returns true if acquired, false if another worker already holds it.
 async function tryAcquireOwner(redis, fromId, ownerValue, options = {}) {
-  const ownerKey = buildOwnerKey(fromId);
-  const ownerTtlMs = options.ownerTtlMs || 10000;
-
   const result = await redis.set(
-    ownerKey,
+    buildOwnerKey(fromId),
     ownerValue,
-    'PX',
-    ownerTtlMs,
+    'PX', options.ownerTtlMs || 10000,
     'NX'
   );
-
   return result === 'OK';
 }
 
-// 延長 owner lock TTL
-//
-// 只有目前 ownerValue 還一致時才更新 TTL，避免誤刷新別人的鎖
+// Extend the owner lock TTL, but only if ownerValue still matches.
 async function refreshOwner(redis, fromId, ownerValue, options = {}) {
-  const ownerKey = buildOwnerKey(fromId);
-  const ownerTtlMs = options.ownerTtlMs || 10000;
-
   const lua = `
     if redis.call("GET", KEYS[1]) == ARGV[1] then
       return redis.call("PEXPIRE", KEYS[1], ARGV[2])
-    else
-      return 0
     end
+    return 0
   `;
-
   const result = await redis.eval(
-    lua,
-    1,
-    ownerKey,
+    lua, 1,
+    buildOwnerKey(fromId),
     ownerValue,
-    String(ownerTtlMs)
+    String(options.ownerTtlMs || 10000)
   );
-
   return result === 1;
 }
 
-// 釋放 owner lock
-//
-// 只有 ownerValue 還一致時才刪除，避免誤刪別人的鎖
+// Release the owner lock, but only if ownerValue still matches.
 async function releaseOwner(redis, fromId, ownerValue) {
-  const ownerKey = buildOwnerKey(fromId);
-
   const lua = `
     if redis.call("GET", KEYS[1]) == ARGV[1] then
       return redis.call("DEL", KEYS[1])
-    else
-      return 0
     end
+    return 0
   `;
-
-  await redis.eval(
-    lua,
-    1,
-    ownerKey,
-    ownerValue
-  );
+  await redis.eval(lua, 1, buildOwnerKey(fromId), ownerValue);
 }
 
-// 啟動 owner heartbeat
+// Run a background heartbeat that periodically refreshes the owner lock TTL.
+// Returns a { stop() } handle. Call stop() when drain is complete.
 //
-// 作用：
-// - drain queue 可能會花一點時間
-// - 背景定期刷新 owner TTL
-// - 避免鎖在 drain 過程中自然過期
+// The first tick is delayed by ownerTtlMs so the main drain loop runs
+// uninterrupted for a full TTL cycle before heartbeat starts.
 function startOwnerHeartbeat({ ctx, fromId, redis, ownerValue, options = {} }) {
   const { logger } = ctx;
-  const ownerRefreshIntervalMs = options.ownerRefreshIntervalMs || 3000;
   const ownerTtlMs = options.ownerTtlMs || 10000;
+  const ownerRefreshIntervalMs = options.ownerRefreshIntervalMs || 3000;
   const onLost = options.onLost || null;
 
   let stopped = false;
@@ -289,39 +175,23 @@ function startOwnerHeartbeat({ ctx, fromId, redis, ownerValue, options = {} }) {
 
   const tick = async () => {
     if (stopped) return;
-
     try {
-      const refreshed = await refreshOwner(redis, fromId, ownerValue, {
-        ownerTtlMs,
-      });
-
+      const refreshed = await refreshOwner(redis, fromId, ownerValue, { ownerTtlMs });
       if (!refreshed) {
-        logger.warn(
-          '[RedisQueue] owner heartbeat lost: fromId=%s owner=%s',
-          fromId,
-          ownerValue
-        );
+        logger.warn('[RedisQueue] owner heartbeat lost: fromId=%s owner=%s', fromId, ownerValue);
         if (onLost) onLost();
       }
     } catch (err) {
-      logger.error(
-        '[RedisQueue] owner heartbeat error: fromId=%s owner=%s err=%s',
-        fromId,
-        ownerValue,
-        err && err.message
-      );
+      logger.error('[RedisQueue] owner heartbeat error: fromId=%s owner=%s err=%s', fromId, ownerValue, err && err.message);
     }
   };
 
-  // 第一次 heartbeat 延後到 ownerTtlMs 一半才觸發
-  // 讓主迴圈先執行 popJobs，避免 setInterval 搶先佔用 event loop
-  const initialDelay = ownerTtlMs; // 延後到整個 TTL，讓主迴圈完全不被干擾
   const initTimer = setTimeout(() => {
     if (stopped) return;
     tick();
     timer = setInterval(tick, ownerRefreshIntervalMs);
     if (typeof timer.unref === 'function') timer.unref();
-  }, initialDelay);
+  }, ownerTtlMs);
 
   if (typeof initTimer.unref === 'function') initTimer.unref();
 
@@ -335,37 +205,21 @@ function startOwnerHeartbeat({ ctx, fromId, redis, ownerValue, options = {} }) {
   };
 }
 
-//
-// worker 會卡在這裡等待，不再掃 active set
+// Block-pop a fromId from the ready queue (BRPOP). Returns null on timeout.
 async function blockPopReadyFromId(redis, timeoutSec) {
-  const readyQueueKey = buildReadyQueueKey();
-  const result = await redis.brpop(readyQueueKey, timeoutSec);
-
-  if (!result || result.length < 2) {
-    return null;
-  }
+  const result = await redis.brpop(buildReadyQueueKey(), timeoutSec);
+  if (!result || result.length < 2) return null;
 
   const fromId = Number(result[1]);
-
-  if (!Number.isInteger(fromId) || fromId <= 0) {
-    return null;
-  }
-
-  return fromId;
+  return (Number.isInteger(fromId) && fromId > 0) ? fromId : null;
 }
 
-// drain queue
+// Drain all jobs from a fromId queue while holding the owner lock.
 //
-// 流程：
-// - 先啟動 owner heartbeat
-// - 每輪先 refresh owner，確認自己還持有鎖
-// - 批次 pop jobs
-// - 逐筆呼叫 handler(job)
-// - queue 空了就結束
-//
-// 注意：
-// - 這一版不再維護 active set
-// - 也不再在 queue empty 時 removeActiveFromId
+// - Runs a heartbeat to keep the lock alive during long drains.
+// - Processes jobs in batches; calls handler(job) for each.
+// - On finish (or owner loss), releases the lock and re-enqueues fromId
+//   if jobs arrived mid-drain.
 async function drainQueue({ ctx, fromId, redis, handler, ownerValue, options = {} }) {
   const { logger } = ctx;
   const ownerTtlMs = options.ownerTtlMs || 10000;
@@ -375,102 +229,60 @@ async function drainQueue({ ctx, fromId, redis, handler, ownerValue, options = {
   let ownerLost = false;
 
   const heartbeat = startOwnerHeartbeat({
-    ctx,
-    fromId,
-    redis,
-    ownerValue,
-    options: {
-      ownerTtlMs,
-      ownerRefreshIntervalMs,
-      onLost: () => { ownerLost = true; },
-    },
+    ctx, fromId, redis, ownerValue,
+    options: { ownerTtlMs, ownerRefreshIntervalMs, onLost: () => { ownerLost = true; } },
   });
 
   try {
     while (!ownerLost) {
       const jobs = await popJobs(redis, fromId, batchSize);
-
-      if (jobs.length === 0) {
-        break;
-      }
+      if (jobs.length === 0) break;
 
       for (const job of jobs) {
         if (ownerLost) break;
         try {
           await handler(job);
         } catch (err) {
-          logger.error(
-            '[RedisQueue] job handler error: fromId=%s jobId=%s err=%s',
-            fromId,
-            job.jobId,
-            err && err.message
-          );
+          logger.error('[RedisQueue] job handler error: fromId=%s jobId=%s err=%s', fromId, job.jobId, err && err.message);
         }
       }
     }
 
     if (ownerLost) {
-      logger.warn(
-        '[RedisQueue] owner lost during drain: fromId=%s owner=%s',
-        fromId,
-        ownerValue
-      );
+      logger.warn('[RedisQueue] owner lost during drain: fromId=%s owner=%s', fromId, ownerValue);
     }
   } finally {
     heartbeat.stop();
     await releaseOwner(redis, fromId, ownerValue);
 
-    // drain 結束後，若 queue 還有剩餘 job（可能是 drain 進行中新進來的）
-    // 重新把 fromId 推回 ready queue，讓 worker 繼續處理
-    // 避免 job 永遠卡在 queue 裡沒人消費
+    // If jobs arrived while we were draining, re-signal the ready queue.
     try {
-      const queueKey = buildQueueKey(fromId);
-      const remaining = await redis.llen(queueKey);
+      const remaining = await redis.llen(buildQueueKey(fromId));
       if (remaining > 0) {
-        const readyQueueKey = buildReadyQueueKey();
-        await redis.lpush(readyQueueKey, String(fromId));
+        await redis.lpush(buildReadyQueueKey(), String(fromId));
       }
     } catch (err) {
-      logger.error(
-        '[RedisQueue] failed to re-enqueue fromId after drain: fromId=%s err=%s',
-        fromId,
-        err && err.message
-      );
+      logger.error('[RedisQueue] failed to re-enqueue fromId after drain: fromId=%s err=%s', fromId, err && err.message);
     }
   }
 }
 
-
-// 嘗試啟動 drain
-//
-// 流程：
-// - worker 從 ready queue 取到 fromId
-// - 嘗試取得 owner lock
-// - 如果成功，就 drain 該 fromId queue
-// - 如果失敗，表示已有其他 worker 在做，直接跳過
+// Try to acquire the owner lock and drain the queue for a given fromId.
+// If another worker already holds the lock, returns false immediately.
 async function tryStartDrain({ ctx, fromId, redis, handler }) {
   const { app } = ctx;
   const ownerValue = buildOwnerValue();
-  const transferQueueConfig = getTransferQueueConfig(app);
+  const config = getTransferQueueConfig(app);
 
-  const acquired = await tryAcquireOwner(redis, fromId, ownerValue, {
-    ownerTtlMs: transferQueueConfig.ownerTtlMs,
-  });
-
-  if (!acquired) {
-    return false;
-  }
+  const acquired = await tryAcquireOwner(redis, fromId, ownerValue, { ownerTtlMs: config.ownerTtlMs });
+  if (!acquired) return false;
 
   await drainQueue({
-    ctx,
-    fromId,
-    redis,
-    handler,
-    ownerValue,
+    ctx, fromId, redis, handler, ownerValue,
     options: {
-      ownerTtlMs: transferQueueConfig.ownerTtlMs,
-      ownerRefreshIntervalMs: transferQueueConfig.ownerRefreshIntervalMs,
-      batchSize: transferQueueConfig.batchSize,
+      ownerTtlMs: config.ownerTtlMs,
+      ownerRefreshIntervalMs: config.ownerRefreshIntervalMs,
+      batchSize: config.batchSize,
     },
   });
 

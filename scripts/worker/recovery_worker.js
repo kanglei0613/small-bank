@@ -124,9 +124,27 @@ async function recoverOne(log, shardPgMap) {
 }
 
 // step = RESERVED：Step 1 commit 了，Step 2 不確定
-// 查 transfers.status 確認實際狀態，再決定補償或推進
+// 先查 toShard 的 saga_credits 確認 toAccount 是否已入帳
+//   有記錄 → Step 2 已完成，走 compensateCredited（反轉兩邊）
+//   無記錄 → 查 transfers.status 確認狀態，再決定補償或同步終態
 async function recoverFromReserved(log, shardPgMap) {
   const fromShardPg = shardPgMap[log.fromShardId];
+  const toShardPg   = shardPgMap[log.toShardId];
+
+  // 先查 toShard 的 saga_credits，確認 toAccount 是否已入帳
+  const creditsResult = await toShardPg.query(
+    'SELECT id FROM saga_credits WHERE transfer_id = $1 LIMIT 1',
+    [ log.transferId ]
+  );
+
+  if (creditsResult.rowCount > 0) {
+    logger.info(
+      'RESERVED but saga_credits exists, toAccount was credited, compensating both: transferId=%s',
+      log.transferId
+    );
+    await compensateCredited(log, shardPgMap);
+    return;
+  }
 
   const transferResult = await fromShardPg.query(
     'SELECT status FROM transfers WHERE id = $1',
@@ -153,7 +171,7 @@ async function recoverFromReserved(log, shardPgMap) {
     return;
   }
 
-  // status = RESERVED：Step 2 確認沒做，直接補償 fromAccount
+  // status = RESERVED 且 saga_credits 無記錄：Step 2 確認沒做，直接補償 fromAccount
   logger.info(
     'RESERVED with no credit, compensating fromAccount: transferId=%s',
     log.transferId

@@ -33,6 +33,7 @@ class TransferService extends Service {
     this.repo = new TransfersRepo(ctx);
   }
 
+  // Decide between synchronous same-shard transfer and async cross-shard queue.
   async submitTransfer({ fromId, toId, amount }) {
     validateTransferInput({ fromId, toId, amount });
 
@@ -51,15 +52,13 @@ class TransferService extends Service {
       return { mode: 'sync', ...result };
     }
 
-    const queued = await this.enqueueTransfer({ fromId, toId, amount });
+    const queued = await this._enqueueTransfer({ fromId, toId, amount });
     return { mode: 'async', ...queued };
   }
 
-  async enqueueTransfer({ fromId, toId, amount }) {
+  // Enqueue a cross-shard transfer job and return the jobId immediately.
+  async _enqueueTransfer({ fromId, toId, amount }) {
     const { app } = this.ctx;
-
-    validateTransferInput({ fromId, toId, amount });
-
     const queueConfig = app.config.transferQueue || {
       rejectThresholdPerFromId: 240,
       maxQueueLengthPerFromId: 300,
@@ -91,27 +90,19 @@ class TransferService extends Service {
     return { jobId, status: 'queued' };
   }
 
-  async executeTransfer({ fromId, toId, amount }) {
-    return await this.repo.transfer(fromId, toId, amount);
-  }
-
   async processJob(job, redis) {
     const { logger } = this.ctx;
     const { jobId, fromId, toId, amount } = job;
-
     const start = Date.now();
-
     const queueWaitMs = start - (job.createdAt || start);
+
     logger.info('[TransferJob] queue wait: jobId=%s fromId=%s queueWaitMs=%d', jobId, fromId, queueWaitMs);
 
     try {
       const result = await this.repo.transfer(fromId, toId, amount);
-
       const duration = Date.now() - start;
-      logger.info(
-        '[TransferJob] success: jobId=%s fromId=%s toId=%s duration=%dms',
-        jobId, fromId, toId, duration
-      );
+
+      logger.info('[TransferJob] success: jobId=%s fromId=%s toId=%s duration=%dms', jobId, fromId, toId, duration);
 
       await transferJobStore.markSuccess(redis, job, result);
       await redis.incr('bench:transfer:success');
@@ -119,10 +110,8 @@ class TransferService extends Service {
       return result;
     } catch (err) {
       const duration = Date.now() - start;
-      logger.error(
-        '[TransferJob] failed: jobId=%s fromId=%s toId=%s duration=%dms err=%s',
-        jobId, fromId, toId, duration, err && err.message
-      );
+
+      logger.error('[TransferJob] failed: jobId=%s fromId=%s toId=%s duration=%dms err=%s', jobId, fromId, toId, duration, err && err.message);
 
       await transferJobStore.markFailed(redis, job, err);
       await redis.incr('bench:transfer:failed');
@@ -148,7 +137,6 @@ class TransferService extends Service {
     const blockTimeoutSec = workerConfig.readyQueueBlockTimeoutSec ?? 1;
     const errorSleepMs = Number(workerConfig.workerErrorSleepMs || 1000);
 
-    // 建立獨立的 ioredis 直連，繞過 egg cluster-client IPC 延遲
     const redisConfig = app.config.redis && app.config.redis.client
       ? app.config.redis.client
       : { host: '127.0.0.1', port: 6379, db: 0 };
@@ -169,27 +157,15 @@ class TransferService extends Service {
     // eslint-disable-next-line no-constant-condition
     while (true) {
       try {
-        const fromId = await redisTransferQueue.blockPopReadyFromId(
-          redis,
-          blockTimeoutSec
-        );
-
+        const fromId = await redisTransferQueue.blockPopReadyFromId(redis, blockTimeoutSec);
         if (!fromId) continue;
 
-        // 不 await drain，讓 loop 立刻取下一個 fromId
+        // Fire-and-forget: let the loop immediately pick up the next fromId
         this.tryDrainOneFromIdQueue(fromId, redis).catch(err => {
-          logger.error(
-            '[QueueWorker] drain error: fromId=%s err=%s',
-            fromId,
-            err && (err.stack || err.message)
-          );
+          logger.error('[QueueWorker] drain error: fromId=%s err=%s', fromId, err && (err.stack || err.message));
         });
       } catch (err) {
-        logger.error(
-          '[QueueWorker] loop error: %s',
-          err && (err.stack || err.message)
-        );
-
+        logger.error('[QueueWorker] loop error: %s', err && (err.stack || err.message));
         await new Promise(resolve => setTimeout(resolve, errorSleepMs));
       }
     }
@@ -202,17 +178,14 @@ class TransferService extends Service {
     if (!Number.isInteger(aid) || aid <= 0) {
       throw new BadRequestError('accountId must be a positive integer');
     }
-
     if (!Number.isInteger(lim) || lim <= 0) {
       throw new BadRequestError('limit must be a positive integer');
     }
-
     if (lim > 200) {
       throw new BadRequestError('limit must be <= 200');
     }
 
     const items = await this.repo.listByAccountId(aid, lim);
-
     return { items };
   }
 }
