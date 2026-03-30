@@ -171,7 +171,7 @@ async function recoverFromReserved(log, shardPgMap) {
     return;
   }
 
-  // status = RESERVED 且 saga_credits 無記錄：Step 2 確認沒做，直接補償 fromAccount
+  // status = RESERVED 且 saga_credits 無記錄：Step 2 確認沒做，補償 fromAccount
   logger.info(
     'RESERVED with no credit, compensating fromAccount: transferId=%s',
     log.transferId
@@ -182,7 +182,9 @@ async function recoverFromReserved(log, shardPgMap) {
     await client.query('BEGIN');
     await client.query("SET LOCAL lock_timeout = '500ms'");
 
-    await client.query(
+    // ✅ guard: AND reserved_balance >= $1
+    // 防止 recovery 重跑時 reserved_balance 已歸零，UPDATE 讓它變負數
+    const compensateResult = await client.query(
       `
         UPDATE accounts
         SET
@@ -190,9 +192,36 @@ async function recoverFromReserved(log, shardPgMap) {
           reserved_balance  = reserved_balance - $1,
           updated_at        = NOW()
         WHERE id = $2
+          AND reserved_balance >= $1
+        RETURNING id
       `,
       [ log.amount, log.fromAccountId ]
     );
+
+    // rowCount = 0：reserved_balance 不足，資料已不一致，標記 NEEDS_REVIEW
+    if (compensateResult.rowCount === 0) {
+      await client.query(
+        'UPDATE transfers SET status = $1, updated_at = NOW() WHERE id = $2',
+        [ 'FAILED', log.transferId ]
+      );
+      await client.query(
+        'UPDATE saga_log SET step = $1, updated_at = NOW() WHERE transfer_id = $2',
+        [ 'NEEDS_REVIEW', log.transferId ]
+      );
+      await client.query('COMMIT');
+      logger.error('========================================');
+      logger.error('CRITICAL: saga recovery requires manual intervention (RESERVED compensate)');
+      logger.error('  transferId    = %s', log.transferId);
+      logger.error('  fromAccountId = %s (shard %d)', log.fromAccountId, log.fromShardId);
+      logger.error('  amount        = %s', log.amount);
+      logger.error('  reserved_balance is insufficient — may have been double-compensated');
+      logger.error('ACTION REQUIRED:');
+      logger.error('  1. verify fromAccount id=%s reserved_balance on shard %d', log.fromAccountId, log.fromShardId);
+      logger.error('  2. manually fix: UPDATE accounts SET available_balance = available_balance + %s, reserved_balance = reserved_balance - %s WHERE id = %s;', log.amount, log.amount, log.fromAccountId);
+      logger.error('  3. UPDATE saga_log SET step = \'FAILED\' WHERE transfer_id = %s;', log.transferId);
+      logger.error('========================================');
+      return;
+    }
 
     await client.query(
       'UPDATE transfers SET status = $1, updated_at = NOW() WHERE id = $2',
@@ -227,6 +256,7 @@ async function recoverFromCredited(log, shardPgMap) {
     await client.query('BEGIN');
     await client.query("SET LOCAL lock_timeout = '500ms'");
 
+    // ✅ guard 已存在：AND reserved_balance >= $1
     const finalizeResult = await client.query(
       `
         UPDATE accounts
@@ -273,8 +303,10 @@ async function recoverFromCredited(log, shardPgMap) {
 }
 
 // Step 3 無法完成時的補償路徑：
-// 1. 先扣回 toAccount
-// 2. 再還原 fromAccount reserved → available
+// 1. 先把 saga_log 推進到 COMPENSATING（crash 重啟後從 COMPENSATING 繼續，不重複扣 toAccount）
+// 2. 查 saga_compensations 確認 toAccount 是否已補償（冪等 guard）
+// 3. 若未補償，扣回 toAccount（✅ 加 available_balance >= $1 guard）
+// 4. 再還原 fromAccount reserved → available（✅ 改用 UPDATE WHERE 取代 SELECT + UPDATE，消除 TOCTOU）
 async function compensateCredited(log, shardPgMap) {
   const fromShardPg = shardPgMap[log.fromShardId];
   const toShardPg   = shardPgMap[log.toShardId];
@@ -286,62 +318,111 @@ async function compensateCredited(log, shardPgMap) {
     [ 'COMPENSATING', log.transferId ]
   );
 
-  const toClient = await toShardPg.connect();
-  try {
-    await toClient.query('BEGIN');
-    await toClient.query("SET LOCAL lock_timeout = '500ms'");
+  // 查 saga_compensations，確認 toAccount 是否已補償（冪等 guard）
+  const alreadyCompensated = await toShardPg.query(
+    'SELECT id FROM saga_compensations WHERE transfer_id = $1 LIMIT 1',
+    [ log.transferId ]
+  );
 
-    await toClient.query(
-      `
-        UPDATE accounts
-        SET
-          balance           = balance - $1,
-          available_balance = available_balance - $1,
-          updated_at        = NOW()
-        WHERE id = $2
-      `,
-      [ log.amount, log.toAccountId ]
-    );
+  if (alreadyCompensated.rowCount === 0) {
+    const toClient = await toShardPg.connect();
+    try {
+      await toClient.query('BEGIN');
+      await toClient.query("SET LOCAL lock_timeout = '500ms'");
 
-    // saga_compensations 和 UPDATE accounts 在同一個 tx
-    // 用來記錄「這筆 transfer 的 toAccount 補償已執行」
-    // recovery worker 重跑時查這張表，有記錄就跳過，避免重複扣款
-    await toClient.query(
-      `
-        INSERT INTO saga_compensations (transfer_id)
-        VALUES ($1)
-        ON CONFLICT (transfer_id) DO NOTHING
-      `,
-      [ log.transferId ]
-    );
+      // ✅ 新增 guard: AND available_balance >= $1
+      // toAccount 的 available_balance 理論上應該足夠（Step 2 加進去了），
+      // 但若帳戶在 Step 2 ~ 補償之間被提款到不夠，沒有 guard 會讓 available 變負數
+      const compensateToResult = await toClient.query(
+        `
+          UPDATE accounts
+          SET
+            balance           = balance - $1,
+            available_balance = available_balance - $1,
+            updated_at        = NOW()
+          WHERE id = $2
+            AND available_balance >= $1
+        `,
+        [ log.amount, log.toAccountId ]
+      );
 
-    await toClient.query('COMMIT');
-  } catch (err) {
-    try { await toClient.query('ROLLBACK'); } catch (e) { void e; }
-    logger.error(
-      'CRITICAL: compensate toAccount failed: transferId=%s err=%s',
-      log.transferId, err && err.message
+      // rowCount = 0：toAccount 餘額不足，資料已不一致
+      // 寫 NEEDS_REVIEW 讓人工介入，不繼續補 fromAccount（否則 fromAccount 的 reserved 永遠卡住）
+      if (compensateToResult.rowCount === 0) {
+        await toClient.query('ROLLBACK');
+        // fromAccount 的 reserved_balance 還是卡住，統一在下方的 fromAccount 段標記 NEEDS_REVIEW
+        logger.error('========================================');
+        logger.error('CRITICAL: compensate toAccount failed (available_balance insufficient)');
+        logger.error('  transferId  = %s', log.transferId);
+        logger.error('  toAccountId = %s (shard %d)', log.toAccountId, log.toShardId);
+        logger.error('  amount      = %s', log.amount);
+        logger.error('  toAccount available_balance is insufficient — needs manual check');
+        logger.error('========================================');
+        // 標記 NEEDS_REVIEW 並離開，不繼續補 fromAccount
+        await fromShardPg.query(
+          'UPDATE transfers SET status = $1, updated_at = NOW() WHERE id = $2',
+          [ 'FAILED', log.transferId ]
+        ).catch(() => {});
+        await fromShardPg.query(
+          'UPDATE saga_log SET step = $1, updated_at = NOW() WHERE transfer_id = $2',
+          [ 'NEEDS_REVIEW', log.transferId ]
+        ).catch(() => {});
+        return;
+      }
+
+      // saga_compensations 和 UPDATE accounts 在同一個 tx
+      await toClient.query(
+        `
+          INSERT INTO saga_compensations (transfer_id)
+          VALUES ($1)
+          ON CONFLICT (transfer_id) DO NOTHING
+        `,
+        [ log.transferId ]
+      );
+
+      await toClient.query('COMMIT');
+    } catch (err) {
+      try { await toClient.query('ROLLBACK'); } catch (e) { void e; }
+      logger.error(
+        'CRITICAL: compensate toAccount failed: transferId=%s err=%s',
+        log.transferId, err && err.message
+      );
+      throw err;
+    } finally {
+      toClient.release();
+    }
+  } else {
+    logger.info(
+      'toAccount already compensated (saga_compensations exists), skipping: transferId=%s',
+      log.transferId
     );
-    throw err;
-  } finally {
-    toClient.release();
   }
 
+  // 補償 fromAccount：還原 reserved → available
+  // ✅ 改用 UPDATE WHERE reserved_balance >= $1，消除原本 SELECT + UPDATE 的 TOCTOU 問題
+  // 原本是先 SELECT reserved_balance，判斷後再 UPDATE，兩步之間若有並發修改會讀到舊值
+  // 改成單一 UPDATE 加 WHERE 條件，由 PG 在鎖定後原子判斷，rowCount=0 才標記 NEEDS_REVIEW
   const fromClient = await fromShardPg.connect();
   try {
     await fromClient.query('BEGIN');
     await fromClient.query("SET LOCAL lock_timeout = '500ms'");
 
-    // 先查實際的 reserved_balance
-    // 若不足，代表資料已不一致，不能強行扣，改標記 NEEDS_REVIEW 讓人工介入
-    const reservedResult = await fromClient.query(
-      'SELECT reserved_balance AS "reservedBalance" FROM accounts WHERE id = $1',
-      [ log.fromAccountId ]
+    const compensateFromResult = await fromClient.query(
+      `
+        UPDATE accounts
+        SET
+          available_balance = available_balance + $1,
+          reserved_balance  = reserved_balance - $1,
+          updated_at        = NOW()
+        WHERE id = $2
+          AND reserved_balance >= $1
+        RETURNING id
+      `,
+      [ log.amount, log.fromAccountId ]
     );
 
-    const reservedBalance = reservedResult.rows[0] ? Number(reservedResult.rows[0].reservedBalance) : 0;
-
-    if (reservedBalance < log.amount) {
+    if (compensateFromResult.rowCount === 0) {
+      // reserved_balance 不足：資料已不一致，標記 NEEDS_REVIEW
       await fromClient.query(
         'UPDATE transfers SET status = $1, updated_at = NOW() WHERE id = $2',
         [ 'FAILED', log.transferId ]
@@ -357,9 +438,8 @@ async function compensateCredited(log, shardPgMap) {
       logger.error('  fromAccountId   = %s (shard %d)', log.fromAccountId, log.fromShardId);
       logger.error('  toAccountId     = %s (shard %d)', log.toAccountId, log.toShardId);
       logger.error('  amount          = %s', log.amount);
-      logger.error('  reserved        = %d  (insufficient, need %s)', reservedBalance, log.amount);
       logger.error('  toAccount       = already compensated (money returned)');
-      logger.error('  fromAccount     = reserved_balance stuck at %d, needs manual clear', reservedBalance);
+      logger.error('  fromAccount     = reserved_balance insufficient, needs manual clear');
       logger.error('  saga_log        = marked NEEDS_REVIEW, recovery will not retry');
       logger.error('ACTION REQUIRED:');
       logger.error('  1. verify toAccount id=%s balance is correct on shard %d', log.toAccountId, log.toShardId);
@@ -369,18 +449,6 @@ async function compensateCredited(log, shardPgMap) {
       logger.error('========================================');
       return;
     }
-
-    await fromClient.query(
-      `
-        UPDATE accounts
-        SET
-          available_balance = available_balance + $1,
-          reserved_balance  = reserved_balance - $1,
-          updated_at        = NOW()
-        WHERE id = $2
-      `,
-      [ log.amount, log.fromAccountId ]
-    );
 
     await fromClient.query(
       'UPDATE transfers SET status = $1, updated_at = NOW() WHERE id = $2',
@@ -433,7 +501,9 @@ async function recoverFromCompensating(log, shardPgMap) {
       await toClient.query('BEGIN');
       await toClient.query("SET LOCAL lock_timeout = '500ms'");
 
-      await toClient.query(
+      // ✅ 新增 guard: AND available_balance >= $1
+      // 同 compensateCredited 的 toAccount 段，防止 available 變負數
+      const compensateToResult = await toClient.query(
         `
           UPDATE accounts
           SET
@@ -441,9 +511,31 @@ async function recoverFromCompensating(log, shardPgMap) {
             available_balance = available_balance - $1,
             updated_at        = NOW()
           WHERE id = $2
+            AND available_balance >= $1
         `,
         [ log.amount, log.toAccountId ]
       );
+
+      if (compensateToResult.rowCount === 0) {
+        await toClient.query('ROLLBACK');
+        logger.error('========================================');
+        logger.error('CRITICAL: compensate toAccount failed in COMPENSATING recovery (available_balance insufficient)');
+        logger.error('  transferId  = %s', log.transferId);
+        logger.error('  toAccountId = %s (shard %d)', log.toAccountId, log.toShardId);
+        logger.error('  amount      = %s', log.amount);
+        logger.error('ACTION REQUIRED: manually verify toAccount balance and fromAccount reserved_balance');
+        logger.error('========================================');
+        // 標記 NEEDS_REVIEW，不繼續補 fromAccount
+        await fromShardPg.query(
+          'UPDATE transfers SET status = $1, updated_at = NOW() WHERE id = $2',
+          [ 'FAILED', log.transferId ]
+        ).catch(() => {});
+        await fromShardPg.query(
+          'UPDATE saga_log SET step = $1, updated_at = NOW() WHERE transfer_id = $2',
+          [ 'NEEDS_REVIEW', log.transferId ]
+        ).catch(() => {});
+        return;
+      }
 
       // 寫入 saga_compensations，和 UPDATE accounts 同一個 tx
       await toClient.query(
@@ -471,20 +563,28 @@ async function recoverFromCompensating(log, shardPgMap) {
     logger.info('toAccount already compensated (saga_compensations exists), skipping: transferId=%s', log.transferId);
   }
 
-  // 補償 fromAccount（和原本 compensateCredited 後半段相同）
+  // 補償 fromAccount（和 compensateCredited 後半段相同）
+  // ✅ 改用 UPDATE WHERE reserved_balance >= $1，消除 TOCTOU
   const fromClient = await fromShardPg.connect();
   try {
     await fromClient.query('BEGIN');
     await fromClient.query("SET LOCAL lock_timeout = '500ms'");
 
-    const reservedResult = await fromClient.query(
-      'SELECT reserved_balance AS "reservedBalance" FROM accounts WHERE id = $1',
-      [ log.fromAccountId ]
+    const compensateFromResult = await fromClient.query(
+      `
+        UPDATE accounts
+        SET
+          available_balance = available_balance + $1,
+          reserved_balance  = reserved_balance - $1,
+          updated_at        = NOW()
+        WHERE id = $2
+          AND reserved_balance >= $1
+        RETURNING id
+      `,
+      [ log.amount, log.fromAccountId ]
     );
 
-    const reservedBalance = reservedResult.rows[0] ? Number(reservedResult.rows[0].reservedBalance) : 0;
-
-    if (reservedBalance < log.amount) {
+    if (compensateFromResult.rowCount === 0) {
       await fromClient.query(
         'UPDATE transfers SET status = $1, updated_at = NOW() WHERE id = $2',
         [ 'FAILED', log.transferId ]
@@ -500,7 +600,7 @@ async function recoverFromCompensating(log, shardPgMap) {
       logger.error('  fromAccountId   = %s (shard %d)', log.fromAccountId, log.fromShardId);
       logger.error('  toAccountId     = %s (shard %d)', log.toAccountId, log.toShardId);
       logger.error('  amount          = %s', log.amount);
-      logger.error('  reserved        = %d  (insufficient, need %s)', reservedBalance, log.amount);
+      logger.error('  fromAccount     = reserved_balance insufficient, needs manual clear');
       logger.error('  saga_log        = marked NEEDS_REVIEW, recovery will not retry');
       logger.error('ACTION REQUIRED:');
       logger.error('  1. verify toAccount id=%s balance is correct on shard %d', log.toAccountId, log.toShardId);
@@ -509,18 +609,6 @@ async function recoverFromCompensating(log, shardPgMap) {
       logger.error('========================================');
       return;
     }
-
-    await fromClient.query(
-      `
-        UPDATE accounts
-        SET
-          available_balance = available_balance + $1,
-          reserved_balance  = reserved_balance - $1,
-          updated_at        = NOW()
-        WHERE id = $2
-      `,
-      [ log.amount, log.fromAccountId ]
-    );
 
     await fromClient.query(
       'UPDATE transfers SET status = $1, updated_at = NOW() WHERE id = $2',

@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict ReUo53uOTClzGYo2Ri6S8oxoGx7lnRO39QMLKAc8W7itZBadQbfz65cYFUIbaZD
+\restrict byEVsfUOzM9OcKHbEbZPjXEk0TE4FWpGYUaoADilSG1ZNmdPUtvdnb6fRBT5neD
 
 -- Dumped from database version 16.13 (Homebrew)
 -- Dumped by pg_dump version 16.13 (Homebrew)
@@ -108,20 +108,6 @@ CREATE INDEX accounts_user_id_idx ON public.accounts USING btree (user_id);
 
 
 --
--- Name: idx_transfers_from_account_id; Type: INDEX; Schema: public; Owner: kanglei0613
---
-
-CREATE INDEX idx_transfers_from_account_id ON public.transfers USING btree (from_account_id);
-
-
---
--- Name: idx_transfers_to_account_id; Type: INDEX; Schema: public; Owner: kanglei0613
---
-
-CREATE INDEX idx_transfers_to_account_id ON public.transfers USING btree (to_account_id);
-
-
---
 -- Name: transfers_from_idx; Type: INDEX; Schema: public; Owner: kanglei0613
 --
 
@@ -139,5 +125,5 @@ CREATE INDEX transfers_to_idx ON public.transfers USING btree (to_account_id);
 -- PostgreSQL database dump complete
 --
 
-\unrestrict ReUo53uOTClzGYo2Ri6S8oxoGx7lnRO39QMLKAc8W7itZBadQbfz65cYFUIbaZD
+\unrestrict byEVsfUOzM9OcKHbEbZPjXEk0TE4FWpGYUaoADilSG1ZNmdPUtvdnb6fRBT5neD
 

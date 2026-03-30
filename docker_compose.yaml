@@ -1,0 +1,239 @@
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+
+  postgres-meta:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: kanglei0613
+      POSTGRES_PASSWORD: 7522alex
+      POSTGRES_DB: small_bank_meta
+    volumes:
+      - pg-meta:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kanglei0613 -d small_bank_meta"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  postgres-s0:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: kanglei0613
+      POSTGRES_PASSWORD: 7522alex
+      POSTGRES_DB: small_bank_s0
+    volumes:
+      - pg-s0:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kanglei0613 -d small_bank_s0"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  postgres-s1:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: kanglei0613
+      POSTGRES_PASSWORD: 7522alex
+      POSTGRES_DB: small_bank_s1
+    volumes:
+      - pg-s1:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kanglei0613 -d small_bank_s1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  postgres-s2:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: kanglei0613
+      POSTGRES_PASSWORD: 7522alex
+      POSTGRES_DB: small_bank_s2
+    volumes:
+      - pg-s2:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kanglei0613 -d small_bank_s2"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  postgres-s3:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: kanglei0613
+      POSTGRES_PASSWORD: 7522alex
+      POSTGRES_DB: small_bank_s3
+    volumes:
+      - pg-s3:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kanglei0613 -d small_bank_s3"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── Redis ───────────────────────────────────────────────────────────────────
+
+  redis:
+    image: redis:7
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── General API (port 7001) ─────────────────────────────────────────────────
+
+  app-general:
+    image: node:22
+    working_dir: /app
+    volumes:
+      - .:/app
+      - /app/typings
+    command: npm run dev
+    ports:
+      - "7001:7001"
+    environment:
+      APP_API_ROLE: general
+      APP_PORT: "7001"
+      APP_WORKERS: "${GENERAL_WORKERS:-3}"
+      PG_META_HOST: postgres-meta
+      PG_SHARD_0_HOST: postgres-s0
+      PG_SHARD_1_HOST: postgres-s1
+      PG_SHARD_2_HOST: postgres-s2
+      PG_SHARD_3_HOST: postgres-s3
+      PG_USER: kanglei0613
+      PG_PASSWORD: 7522alex
+      PG_META_POOL_MAX: "${PG_META_POOL_MAX:-10}"
+      PG_SHARD_POOL_MAX: "${PG_SHARD_POOL_MAX:-10}"
+      REDIS_HOST: redis
+    depends_on:
+      postgres-meta:
+        condition: service_healthy
+      postgres-s0:
+        condition: service_healthy
+      postgres-s1:
+        condition: service_healthy
+      postgres-s2:
+        condition: service_healthy
+      postgres-s3:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ── Transfer API (port 7010) ────────────────────────────────────────────────
+
+  app-transfer:
+    image: node:22
+    working_dir: /app
+    volumes:
+      - .:/app
+      - /app/typings
+    command: npm run dev
+    ports:
+      - "7010:7010"
+    environment:
+      APP_API_ROLE: transfer
+      APP_PORT: "7010"
+      APP_WORKERS: "${TRANSFER_WORKERS:-1}"
+      PG_META_HOST: postgres-meta
+      PG_SHARD_0_HOST: postgres-s0
+      PG_SHARD_1_HOST: postgres-s1
+      PG_SHARD_2_HOST: postgres-s2
+      PG_SHARD_3_HOST: postgres-s3
+      PG_USER: kanglei0613
+      PG_PASSWORD: 7522alex
+      PG_META_POOL_MAX: "${PG_META_POOL_MAX:-5}"
+      PG_SHARD_POOL_MAX: "${PG_SHARD_POOL_MAX:-10}"
+      REDIS_HOST: redis
+      TRANSFER_QUEUE_REJECT_THRESHOLD: "${REJECT_THRESHOLD:-500}"
+      TRANSFER_QUEUE_MAX_LENGTH: "${MAX_QUEUE_LENGTH:-600}"
+    depends_on:
+      postgres-meta:
+        condition: service_healthy
+      postgres-s0:
+        condition: service_healthy
+      postgres-s1:
+        condition: service_healthy
+      postgres-s2:
+        condition: service_healthy
+      postgres-s3:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ── Queue Worker ────────────────────────────────────────────────────────────
+
+  queue-worker:
+    image: node:22
+    working_dir: /app
+    volumes:
+      - .:/app
+      - /app/typings
+    command: node scripts/worker/queue_worker.js
+    environment:
+      PG_HOST: postgres-meta
+      PG_SHARD_0_HOST: postgres-s0
+      PG_SHARD_1_HOST: postgres-s1
+      PG_SHARD_2_HOST: postgres-s2
+      PG_SHARD_3_HOST: postgres-s3
+      PG_USER: kanglei0613
+      PG_PASSWORD: 7522alex
+      PG_META_POOL_MAX: "2"
+      PG_SHARD_POOL_MAX: "${PG_SHARD_POOL_MAX:-10}"
+      REDIS_HOST: redis
+      QUEUE_CONCURRENCY: "${QUEUE_CONCURRENCY:-8}"
+      TRANSFER_QUEUE_BATCH_SIZE: "${BATCH_SIZE:-100}"
+      WORKER_INDEX: "1"
+    depends_on:
+      postgres-s0:
+        condition: service_healthy
+      postgres-s1:
+        condition: service_healthy
+      postgres-s2:
+        condition: service_healthy
+      postgres-s3:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ── Recovery Worker ─────────────────────────────────────────────────────────
+
+  recovery-worker:
+    image: node:22
+    working_dir: /app
+    volumes:
+      - .:/app
+      - /app/typings
+    command: node scripts/worker/recovery_worker.js
+    environment:
+      PG_HOST: postgres-s0
+      PG_SHARD_0_HOST: postgres-s0
+      PG_SHARD_1_HOST: postgres-s1
+      PG_SHARD_2_HOST: postgres-s2
+      PG_SHARD_3_HOST: postgres-s3
+      PG_USER: kanglei0613
+      PG_PASSWORD: 7522alex
+      PG_SHARD_POOL_MAX: "${PG_SHARD_POOL_MAX:-5}"
+      SAGA_RECOVERY_INTERVAL_MS: "${SAGA_RECOVERY_INTERVAL_MS:-10000}"
+      SAGA_STALE_THRESHOLD_SEC: "${SAGA_STALE_THRESHOLD_SEC:-30}"
+      SAGA_SCAN_BATCH_SIZE: "${SAGA_SCAN_BATCH_SIZE:-50}"
+    depends_on:
+      postgres-s0:
+        condition: service_healthy
+      postgres-s1:
+        condition: service_healthy
+      postgres-s2:
+        condition: service_healthy
+      postgres-s3:
+        condition: service_healthy
+
+volumes:
+  pg-meta:
+  pg-s0:
+  pg-s1:
+  pg-s2:
+  pg-s3:
+  redis-data:

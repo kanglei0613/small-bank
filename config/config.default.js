@@ -56,122 +56,102 @@ module.exports = appInfo => {
   };
 
   // =========================
-  // API Role 設定
+  // API Role
   // =========================
-  //
-  // 用來決定這個 API process 要掛哪些 router
-  //
-  // all:
-  //   - 預設值
-  //   - 所有 API 都開
-  //
-  // general:
-  //   - 一般 API
-  //   - users / accounts / transfer jobs / transfer history / queue / bench
-  //
-  // transfer:
-  //   - 只開 POST /transfers
-  //
   config.apiRole = process.env.APP_API_ROLE || 'all';
 
   // =========================
-  // PostgreSQL sharding 設定
+  // PostgreSQL sharding
   // =========================
 
-  const pgMetaPoolMax = parseInt(process.env.PG_META_POOL_MAX || '2');
+  const pgMetaPoolMax  = parseInt(process.env.PG_META_POOL_MAX  || '2');
   const pgShardPoolMax = parseInt(process.env.PG_SHARD_POOL_MAX || '5');
+  const pgUser         = process.env.PG_USER     || 'kanglei0613';
+  const pgPassword     = process.env.PG_PASSWORD || '7522alex';
+  const pgPort         = parseInt(process.env.PG_PORT || '5432');
 
-  // meta DB:
-  // - 存 account_shards 等 routing 資訊
-  //
   config.pgMeta = {
-    host: '127.0.0.1',
-    port: 5432,
-    user: 'kanglei0613',
-    password: '',
-    database: 'small_bank_meta',
-    max: pgMetaPoolMax,
-    idleTimeoutMillis: 30000,
+    host:                    process.env.PG_META_HOST || '127.0.0.1',
+    port:                    pgPort,
+    user:                    pgUser,
+    password:                pgPassword,
+    database:                'small_bank_meta',
+    max:                     pgMetaPoolMax,
+    idleTimeoutMillis:       30000,
     connectionTimeoutMillis: 5000,
-    statement_timeout: 5000,
+    statement_timeout:       5000,
   };
 
-  // =========================
-  // shard DB 設定
-  // =========================
-  //
-  // 每個 shard 都是一個獨立 PostgreSQL database
-  //
   const shardBase = {
-    host: '127.0.0.1',
-    port: 5432,
-    user: 'kanglei0613',
-    password: '',
-    max: pgShardPoolMax,
-    idleTimeoutMillis: 30000,
+    port:                    pgPort,
+    user:                    pgUser,
+    password:                pgPassword,
+    max:                     pgShardPoolMax,
+    idleTimeoutMillis:       30000,
     connectionTimeoutMillis: 5000,
-    statement_timeout: 5000,
+    statement_timeout:       5000,
   };
 
   config.pgShards = {
-    0: Object.assign({}, shardBase, { database: 'small_bank_s0' }),
-    1: Object.assign({}, shardBase, { database: 'small_bank_s1' }),
-    2: Object.assign({}, shardBase, { database: 'small_bank_s2' }),
-    3: Object.assign({}, shardBase, { database: 'small_bank_s3' }),
+    0: Object.assign({}, shardBase, {
+      host:     process.env.PG_SHARD_0_HOST || '127.0.0.1',
+      database: 'small_bank_s0',
+    }),
+    1: Object.assign({}, shardBase, {
+      host:     process.env.PG_SHARD_1_HOST || '127.0.0.1',
+      database: 'small_bank_s1',
+    }),
+    2: Object.assign({}, shardBase, {
+      host:     process.env.PG_SHARD_2_HOST || '127.0.0.1',
+      database: 'small_bank_s2',
+    }),
+    3: Object.assign({}, shardBase, {
+      host:     process.env.PG_SHARD_3_HOST || '127.0.0.1',
+      database: 'small_bank_s3',
+    }),
   };
 
   // =========================
-  // shard 總數
+  // shard count
   // =========================
   config.sharding = {
     shardCount: 4,
   };
 
   // =========================
-  // Egg cluster 設定
+  // Egg cluster
   // =========================
-  //
-  // 可透過環境變數覆蓋：
-  // - APP_PORT
-  // - APP_WORKERS
-  //
   exports.cluster = {
     listen: {
-      port: Number(process.env.APP_PORT || 7001),
-      hostname: '127.0.0.1',
+      port:     Number(process.env.APP_PORT || 7001),
+      hostname: '0.0.0.0',
     },
     workers: Number(process.env.APP_WORKERS || 1),
   };
 
   // =========================
-  // Redis 設定
+  // Redis
   // =========================
   exports.redis = {
     client: {
-      host: '127.0.0.1',
-      port: 6379,
-      password: '',
-      db: 0,
-      keepAlive: 10000,
+      host:           process.env.REDIS_HOST     || '127.0.0.1',
+      port:           parseInt(process.env.REDIS_PORT || '6379'),
+      password:       process.env.REDIS_PASSWORD || '',
+      db:             0,
+      keepAlive:      10000,
       connectTimeout: 5000,
     },
   };
 
   // =========================
-  // Redis transfer queue 設定
+  // Redis transfer queue
   // =========================
-  //
-  // 目前 queue 架構：
-  // - per-fromId queue
-  // - ready queue
-  // - owner lock
-  //
   config.transferQueue = {
-    rejectThresholdPerFromId: parseInt(process.env.TRANSFER_QUEUE_REJECT_THRESHOLD || '240'),
-    maxQueueLengthPerFromId: parseInt(process.env.TRANSFER_QUEUE_MAX_LENGTH || '300'),
-    ownerTtlMs: parseInt(process.env.TRANSFER_QUEUE_OWNER_TTL_MS || '10000'),
-    ownerRefreshIntervalMs: parseInt(process.env.TRANSFER_QUEUE_OWNER_REFRESH_MS || '3000'),
-    batchSize: parseInt(process.env.TRANSFER_QUEUE_BATCH_SIZE || '50'),
+    rejectThresholdPerFromId:  parseInt(process.env.TRANSFER_QUEUE_REJECT_THRESHOLD  || '240'),
+    maxQueueLengthPerFromId:   parseInt(process.env.TRANSFER_QUEUE_MAX_LENGTH        || '300'),
+    ownerTtlMs:                parseInt(process.env.TRANSFER_QUEUE_OWNER_TTL_MS      || '10000'),
+    ownerRefreshIntervalMs:    parseInt(process.env.TRANSFER_QUEUE_OWNER_REFRESH_MS  || '3000'),
+    batchSize:                 parseInt(process.env.TRANSFER_QUEUE_BATCH_SIZE         || '50'),
     readyQueueBlockTimeoutSec: parseInt(process.env.TRANSFER_QUEUE_BLOCK_TIMEOUT_SEC || '1'),
   };
 

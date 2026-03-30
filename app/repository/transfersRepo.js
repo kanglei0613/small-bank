@@ -253,6 +253,18 @@ class TransfersRepo extends baseShardRepo {
           balance: finalizeResult.rows[0],
         };
       } catch (err) {
+        // Step 3 失敗時，把 transfers.status 推到 PENDING_FINALIZE
+        // saga_log 維持 CREDITED 不動，讓 recovery_worker 接手 finalize
+        await fromClient.query(
+          `UPDATE transfers SET status = 'PENDING_FINALIZE', updated_at = NOW() WHERE id = $1`,
+          [ transferId ]
+        ).catch(updateErr => {
+          this.ctx.logger.error(
+            '[CrossShard] Step3 failed and PENDING_FINALIZE update also failed: transferId=%s err=%s',
+            transferId, updateErr && updateErr.message
+          );
+        });
+
         this.ctx.logger.error(
           '[CrossShard] Step3 failed, leaving CREDITED for recovery: transferId=%s err=%s',
           transferId, err && err.message
@@ -276,7 +288,8 @@ class TransfersRepo extends baseShardRepo {
     }
   }
 
-  // CREDITED補償邏輯
+  // CREDITED補償邏輯：把已入帳的 toAccount 扣回來
+  // ✅ 加 AND available_balance >= $1 guard，防止餘額變負數
   async _compensateCredited({ toClient, toAccountId, transferAmount, transferId }) {
     try {
       await toClient.query('BEGIN'); // BEGIN
@@ -287,13 +300,20 @@ class TransfersRepo extends baseShardRepo {
          SET balance = balance - $1,
              available_balance = available_balance - $1,
              updated_at = NOW()
-         WHERE id = $2
+         WHERE id = $2 AND available_balance >= $1
          RETURNING id`,
         [ transferAmount, toAccountId ]
       );
 
+      // rowCount = 0 有兩種情況：
+      // 1. account not found（帳號消失，極端異常）
+      // 2. available_balance < amount（帳號餘額已被其他操作扣到不夠）
+      // 兩種都不能繼續，rollback 後 throw，讓 saga_log 停在 COMPENSATING 等 recovery
       if (result.rowCount === 0) {
-        throw new InternalError('compensate toAccount failed: account not found');
+        await toClient.query('ROLLBACK');
+        throw new InternalError(
+          `compensate toAccount failed: account not found or available_balance insufficient: toAccountId=${toAccountId} amount=${transferAmount}`
+        );
       }
 
       await toClient.query(
@@ -303,6 +323,10 @@ class TransfersRepo extends baseShardRepo {
 
       await toClient.query('COMMIT'); // COMMIT
     } catch (e) {
+      // 若不是上面主動 throw 的（即 DB 層錯誤），補一次 ROLLBACK
+      if (!e.message.startsWith('compensate toAccount failed')) {
+        await toClient.query('ROLLBACK').catch(() => {});
+      }
       this.ctx.logger.error(
         '[CrossShard] CRITICAL: compensate toAccount failed, toAccount still credited, manual intervention needed: transferId=%s toAccountId=%s err=%s',
         transferId, toAccountId, e?.stack || e?.message
@@ -311,7 +335,8 @@ class TransfersRepo extends baseShardRepo {
     }
   }
 
-  // RESERVED補償邏輯
+  // RESERVED補償邏輯：把凍結的 fromAccount reserved 還回 available
+  // ✅ 加 AND reserved_balance >= $1 guard，防止重複補償讓 reserved 變負數
   async _compensateReserved({ fromClient, fromAccountId, transferAmount, transferId }) {
     try {
       await fromClient.query('BEGIN'); // BEGIN
@@ -322,13 +347,18 @@ class TransfersRepo extends baseShardRepo {
          SET available_balance = available_balance + $1,
              reserved_balance = reserved_balance - $1,
              updated_at = NOW()
-         WHERE id = $2
+         WHERE id = $2 AND reserved_balance >= $1
          RETURNING id`,
         [ transferAmount, fromAccountId ]
       );
 
+      // rowCount = 0：帳號消失 或 reserved_balance 已不足（可能被重複補償）
+      // 不能繼續，rollback 後 throw，讓上層記 CRITICAL log
       if (result.rowCount === 0) {
-        throw new InternalError('compensate fromAccount failed: account not found');
+        await fromClient.query('ROLLBACK');
+        throw new InternalError(
+          `compensate fromAccount failed: account not found or reserved_balance insufficient: fromAccountId=${fromAccountId} amount=${transferAmount}`
+        );
       }
 
       await fromClient.query(
@@ -343,6 +373,9 @@ class TransfersRepo extends baseShardRepo {
 
       await fromClient.query('COMMIT'); // COMMIT
     } catch (e) {
+      if (!e.message.startsWith('compensate fromAccount failed')) {
+        await fromClient.query('ROLLBACK').catch(() => {});
+      }
       this.ctx.logger.error(
         '[CrossShard] CRITICAL: compensate fromAccount failed, leaving RESERVED for recovery: transferId=%s fromAccountId=%s err=%s',
         transferId, fromAccountId, e && e.message

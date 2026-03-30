@@ -302,7 +302,7 @@ function redisCommand(command) {
 async function getQueueLength() {
   try {
     // KEYS transfer:queue:* 取得所有 queue key 數量
-    const resp = await redisCommand('*2\r\n$4\r\nKEYS\r\n$16\r\ntransfer:queue:*\r\n');
+    const resp = await redisCommand('*2\r\n$4\r\nKEYS\r\n$17\r\ntransfer:queue:*\r\n');
     // 解析 RESP array 長度（*N）
     const match = resp.match(/^\*(\d+)/);
     return match ? parseInt(match[1]) : 0;
@@ -326,6 +326,15 @@ async function waitForQueueDrain() {
 
   while (true) {
     await new Promise(r => setTimeout(r, 2000));
+
+    if (QUEUE_DRAIN_TIMEOUT > 0) {
+      const elapsed = Math.floor((Date.now() - start) / 1000);
+      if (elapsed >= QUEUE_DRAIN_TIMEOUT) {
+        console.log(` 逾時（${elapsed}s），強制繼續`);
+        return;
+      }
+    }
+
     const len = await getQueueLength();
 
     if (len <= 0) {
