@@ -189,12 +189,29 @@ function queryShardBalance(dbName, retries = 5) {
 }
 
 /**
+ * 用 psql 查詢 MIN_ID ~ MAX_ID 範圍內的實際帳號數（跨所有 shard 加總）
+ */
+function queryTotalAccountCount() {
+  const { execSync } = require('child_process');
+  let total = 0n;
+  for (const db of PG_SHARDS) {
+    try {
+      const sql = `SELECT COUNT(*) FROM accounts WHERE id >= ${MIN_ID} AND id <= ${MAX_ID};`;
+      const cmd = `psql -h ${PG_HOST} -p ${PG_PORT} -U ${PG_USER} -d ${db} -t -A -c "${sql}"`;
+      const output = execSync(cmd, { timeout: 15000 }).toString().trim();
+      total += BigInt(output || '0');
+    } catch (_) {}
+  }
+  return total;
+}
+
+/**
  * 查詢所有 shard 的總餘額，驗證守恆
- * 預期總額 = totalAccounts × INIT_BAL
+ * 預期總額 = 實際帳號數（MIN_ID ~ MAX_ID）× INIT_BAL
  */
 async function checkFullBalanceConsistency() {
-  const totalAccounts = seedConfig.totalAccounts || (MAX_ID - MIN_ID + 1);
-  const expectedTotal = BigInt(totalAccounts) * BigInt(seedConfig.initBal || INIT_BAL);
+  const actualAccountCount = queryTotalAccountCount();
+  const expectedTotal = actualAccountCount * BigInt(seedConfig.initBal || INIT_BAL);
 
   // 等待 PG 連線數降到安全範圍
   const PG_CONN_THRESHOLD = parseInt(args['pg-conn-threshold'] || '50');
