@@ -238,14 +238,14 @@ async function drainQueue({ ctx, fromId, redis, handler, ownerValue, options = {
       const jobs = await popJobs(redis, fromId, batchSize);
       if (jobs.length === 0) break;
 
-      for (const job of jobs) {
-        if (ownerLost) break;
+      await Promise.all(jobs.map(async (job) => {
+        if (ownerLost) return;
         try {
           await handler(job);
         } catch (err) {
           logger.error('[RedisQueue] job handler error: fromId=%s jobId=%s err=%s', fromId, job.jobId, err && err.message);
         }
-      }
+      }));
     }
 
     if (ownerLost) {
