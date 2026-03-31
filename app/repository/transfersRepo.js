@@ -57,60 +57,80 @@ class TransfersRepo extends baseShardRepo {
   }
 
   // Single-database transaction: debit → credit → record.
+  // 用 CTE 把 debit + credit + INSERT 合成一次 round trip（原本 5 次 → 3 次）
   async transferSameShard({ fromAccountId, toAccountId, transferAmount, shardId }) {
     const client = await this.getShardPg(shardId).connect();
 
     try {
-      await client.query('BEGIN'); // BEGIN
-      await client.query("SET LOCAL lock_timeout = '200ms'");
+      // round trip 1: BEGIN + SET LOCAL
+      await client.query("BEGIN; SET LOCAL lock_timeout = '200ms'");
 
-      const debitResult = await client.query(
-        `UPDATE accounts
-         SET balance = balance - $1,
-             available_balance = available_balance - $1,
-             updated_at = NOW()
-         WHERE id = $2 AND available_balance >= $1
-         RETURNING id, balance, available_balance, reserved_balance, updated_at`,
-        [ transferAmount, fromAccountId ]
+      // round trip 2: debit + credit + INSERT，全部在同一個 CTE 裡原子執行
+      const result = await client.query(
+        `WITH debit AS (
+           UPDATE accounts
+           SET balance           = balance           - $1,
+               available_balance = available_balance - $1,
+               updated_at        = NOW()
+           WHERE id = $2 AND available_balance >= $1
+           RETURNING id, balance, available_balance, reserved_balance, updated_at
+         ),
+         credit AS (
+           UPDATE accounts
+           SET balance           = balance           + $1,
+               available_balance = available_balance + $1,
+               updated_at        = NOW()
+           WHERE id = $3
+           RETURNING id
+         ),
+         ins AS (
+           INSERT INTO transfers (from_account_id, to_account_id, amount, status, created_at, updated_at)
+           SELECT $2, $3, $1, 'COMPLETED', NOW(), NOW()
+           WHERE EXISTS (SELECT 1 FROM debit) AND EXISTS (SELECT 1 FROM credit)
+           RETURNING id
+         )
+         SELECT
+           (SELECT COUNT(*) FROM debit)             AS debit_count,
+           (SELECT COUNT(*) FROM credit)            AS credit_count,
+           (SELECT id           FROM ins)           AS transfer_id,
+           (SELECT balance           FROM debit)    AS balance,
+           (SELECT available_balance FROM debit)    AS available_balance,
+           (SELECT reserved_balance  FROM debit)    AS reserved_balance,
+           (SELECT updated_at        FROM debit)    AS updated_at`,
+        [ transferAmount, fromAccountId, toAccountId ]
       );
 
-      if (debitResult.rowCount === 0) {
+      const row = result.rows[0];
+
+      if (row.debit_count === '0') {
         throw new ConflictError('insufficient funds');
       }
-
-      const creditResult = await client.query(
-        `UPDATE accounts
-         SET balance = balance + $1,
-             available_balance = available_balance + $1,
-             updated_at = NOW()
-         WHERE id = $2
-         RETURNING id`,
-        [ transferAmount, toAccountId ]
-      );
-
-      if (creditResult.rowCount === 0) {
+      if (row.credit_count === '0') {
         throw new NotFoundError('destination account not found');
       }
 
-      const insertResult = await client.query(
-        `INSERT INTO transfers (from_account_id, to_account_id, amount, status, created_at, updated_at)
-         VALUES ($1, $2, $3, 'COMPLETED', NOW(), NOW())
-         RETURNING id`,
-        [ fromAccountId, toAccountId, transferAmount ]
-      );
-
-      await client.query('COMMIT'); // COMMIT
+      // round trip 3: COMMIT
+      await client.query('COMMIT');
 
       return {
-        transferId: insertResult.rows[0].id,
+        transferId: row.transfer_id,
         fromId: fromAccountId,
         toId: toAccountId,
         amount: transferAmount,
         status: 'COMPLETED',
         shardId,
         type: 'same-shard',
-        balance: debitResult.rows[0],
+        balance: {
+          id:                fromAccountId,
+          balance:           row.balance,
+          available_balance: row.available_balance,
+          reserved_balance:  row.reserved_balance,
+          updated_at:        row.updated_at,
+        },
       };
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
     } finally {
       client.release();
     }
@@ -305,10 +325,6 @@ class TransfersRepo extends baseShardRepo {
         [ transferAmount, toAccountId ]
       );
 
-      // rowCount = 0 有兩種情況：
-      // 1. account not found（帳號消失，極端異常）
-      // 2. available_balance < amount（帳號餘額已被其他操作扣到不夠）
-      // 兩種都不能繼續，rollback 後 throw，讓 saga_log 停在 COMPENSATING 等 recovery
       if (result.rowCount === 0) {
         await toClient.query('ROLLBACK');
         throw new InternalError(
@@ -323,7 +339,6 @@ class TransfersRepo extends baseShardRepo {
 
       await toClient.query('COMMIT'); // COMMIT
     } catch (e) {
-      // 若不是上面主動 throw 的（即 DB 層錯誤），補一次 ROLLBACK
       if (!e.message.startsWith('compensate toAccount failed')) {
         await toClient.query('ROLLBACK').catch(() => {});
       }
@@ -352,8 +367,6 @@ class TransfersRepo extends baseShardRepo {
         [ transferAmount, fromAccountId ]
       );
 
-      // rowCount = 0：帳號消失 或 reserved_balance 已不足（可能被重複補償）
-      // 不能繼續，rollback 後 throw，讓上層記 CRITICAL log
       if (result.rowCount === 0) {
         await fromClient.query('ROLLBACK');
         throw new InternalError(
