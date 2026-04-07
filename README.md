@@ -1,6 +1,51 @@
 # small-bank
 
-一個以學習為目的、從零設計的**分散式銀行轉帳系統**，重點在於在高並發壓力下同時保證**資金一致性**與**效能**。
+# High-Concurrency Transaction System
+
+本專案是一個以「系統正確性（correctness）」與「流程控制（control flow）」為核心設計的高併發交易系統。
+
+不同於一般以 CRUD 為主的後端專案，本系統著重於在高併發情境下，確保資料一致性、執行順序的可預測性，以及在異常情況下的安全處理能力。
+
+---
+
+## 設計目標
+
+- 在高併發請求下，確保資料一致性（避免資料錯誤或不一致）
+- 建立可預測的執行流程（deterministic execution）
+- 提供完整的錯誤處理機制（retry / rollback / rejection）
+- 控制系統負載（queue + back-pressure）
+
+---
+
+## 核心特性
+
+- 使用 queue 機制序列化寫入操作，避免 race condition
+- 透過 transaction 確保操作的原子性與安全性
+- 設計 retry 與 timeout 機制，提高系統穩定性
+- 支援高併發壓測，並驗證資料正確性（consistency check）
+
+---
+
+## 系統設計觀點（System Design Perspective）
+
+本系統可視為一種「控制流程系統」的抽象模型：
+
+- Transfer（轉帳） ≈ 控制指令（Control Command）
+- Balance（餘額） ≈ 系統狀態（System State）
+- Transaction ≈ 安全保證機制（Safety Guarantee）
+- Queue ≈ 指令排程（Command Scheduling）
+
+透過上述設計，使系統在高併發與不確定性環境中，仍能維持穩定且正確的行為。
+
+---
+
+## 適用場景
+
+- 高併發後端系統
+- 即時資料處理系統
+- 需強一致性的應用場景
+- 控制系統 / 工業自動化流程（Conceptual Mapping）
+
 
 ---
 
