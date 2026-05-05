@@ -9,6 +9,7 @@
     "key-spacing": "off",
     "no-multi-spaces": "off",
     "arrow-parens": "off",
-    "no-loop-func": "off"
+    "no-loop-func": "off",
+    "eol-last": "off"
   }
 }
