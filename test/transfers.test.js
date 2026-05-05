@@ -85,11 +85,12 @@ before(async () => {
     accounts.push(acc);
   }
 
-  sameShardFrom  = accounts[0].id;
-  sameShardTo    = accounts[4].id;  // same shard as accounts[0] (diff = 4)
-  crossShardFrom = accounts[0].id;
-  crossShardTo   = accounts[1].id;  // different shard (diff = 1)
-  poorAccountId  = accounts[8].id;  // same shard as accounts[0,4] (diff = 8)
+  // API 回傳的 id 可能是 string，統一轉成 number 避免 strictEqual 型別不符
+  sameShardFrom  = Number(accounts[0].id);
+  sameShardTo    = Number(accounts[4].id);  // same shard as accounts[0] (diff = 4)
+  crossShardFrom = Number(accounts[0].id);
+  crossShardTo   = Number(accounts[1].id);  // different shard (diff = 1)
+  poorAccountId  = Number(accounts[8].id);  // same shard as accounts[0,4] (diff = 8)
 
   testAccountIds = accounts.map(a => a.id);
 });
