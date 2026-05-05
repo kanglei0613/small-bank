@@ -1,4 +1,9 @@
 {
   "extends": "eslint-config-egg",
-  "root": true
+  "root": true,
+  "rules": {
+    "linebreak-style": "off",
+    "valid-jsdoc": "off",
+    "require-jsdoc": "off"
+  }
 }
