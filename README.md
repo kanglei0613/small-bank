@@ -386,25 +386,25 @@ node scripts/benchmark/mixed_rps_autocannon.js \
 - **開發環境選擇：曾嘗試以 Docker 容器化部署，但因 WSL2 的 volume mount 與 network namespace 問題導致效能異常，最終改為 PostgreSQL / Redis 原生安裝於 WSL，以確保壓測數據的準確性。
 ---
 
-## Transaction Consistency
+## 交易一致性設計
 
-This section covers the engineering decisions behind correctness guarantees in the small-bank system.
+本章說明 small-bank 在高併發下保證資料正確性的工程決策。
 
-### Sharding Strategy
+### 分片策略
 
-Accounts are distributed across four PostgreSQL shards using a deterministic hash: `shardId = accountId % 4`. There is no routing table lookup — the shard for any account is computable from the account ID alone in O(1). The meta DB (`small_bank_meta`) holds user and account registration data only; all financial state lives exclusively in the shard databases.
+帳號依照 `shardId = accountId % 4` 分散至四個 PostgreSQL shard，不需要查路由表，任何帳號的 shard 都能在 O(1) 內從帳號 ID 直接算出。Meta DB（`small_bank_meta`）只存用戶與帳號的註冊資料；所有金融狀態都在 shard 資料庫。
 
-This design trades query flexibility for predictable latency and horizontal scalability. A single shard can be scaled independently without affecting the others.
+這個設計犧牲了跨 shard 查詢的彈性，換來可預測的延遲與水平擴展能力。每個 shard 可以獨立擴容，不影響其他 shard。
 
-### Row-Level Locking and Lock Timeout
+### 行級鎖與 Lock Timeout
 
-All balance mutations acquire row-level locks via `UPDATE ... WHERE id = $1`. Every transaction sets `SET LOCAL lock_timeout = '200ms'` immediately after `BEGIN`. This ensures that a lock contention caused by a slow or stuck transaction fails fast rather than piling up waiting connections. Lock timeout errors bubble up as a 503 (via the DB error code handler in `errorHandler.js`) rather than queuing indefinitely.
+所有餘額異動都透過 `UPDATE ... WHERE id = $1` 取得行級鎖。每筆交易在 `BEGIN` 後立即設定 `SET LOCAL lock_timeout = '200ms'`，確保鎖等待超時時快速失敗，不讓連線堆積。Lock timeout 錯誤會透過 `errorHandler.js` 的 DB 錯誤碼處理器轉成 503 回傳。
 
-This is a deliberate trade-off: under extreme contention, some requests are rejected quickly rather than the entire system becoming unresponsive.
+這是刻意的取捨：在極端競爭下，寧可快速拒絕少數請求，也不讓整個系統因等待堆積而無回應。
 
-### Same-Shard Transfer: Single Round-Trip CTE
+### 同 Shard 轉帳：單一 CTE 原子操作
 
-When `fromId % 4 === toId % 4`, the transfer executes inside a single PostgreSQL transaction using a chained CTE:
+當 `fromId % 4 === toId % 4`，轉帳在單一 PostgreSQL 交易內用串接 CTE 完成：
 
 ```sql
 WITH debit AS (
@@ -424,46 +424,46 @@ ins AS (
 SELECT ...
 ```
 
-The entire debit + credit + transfer-record write is atomic and completes in **two round trips** (BEGIN + CTE, COMMIT). If `available_balance < amount`, the `debit` CTE returns zero rows, the `ins` CTE skips the insert, and the code throws `ConflictError('insufficient funds')` — no partial state is committed.
+扣款、入帳、寫入轉帳紀錄三個動作原子完成，只需兩次 round trip（BEGIN + CTE、COMMIT）。若 `available_balance < amount`，`debit` CTE 回傳零行，`ins` CTE 跳過 INSERT，程式拋出 `ConflictError('insufficient funds')`，不會有任何部分狀態被提交。
 
-### Cross-Shard Transfer: Saga Pattern
+### 跨 Shard 轉帳：Saga Pattern
 
-Distributed transactions across two PostgreSQL instances cannot use a single ACID transaction. The system implements a three-step Saga with compensating transactions:
+跨兩個 PostgreSQL 實例的分散式交易無法使用單一 ACID 交易，系統改用三步驟 Saga 搭配補償交易：
 
-**Step 1 — RESERVE (fromShard):** Atomically deducts `available_balance` and increments `reserved_balance` by the transfer amount. A `transfers` record with `status = 'RESERVED'` and a `saga_log` entry with `step = 'RESERVED'` are written in the same transaction. If this step fails, no money has moved and the operation is a clean no-op.
+**第一步 — RESERVE（fromShard）：** 在同一交易內原子扣除 `available_balance`、增加 `reserved_balance`，並寫入 `status = 'RESERVED'` 的 `transfers` 紀錄與 `saga_log`。若此步驟失敗，資金毫無異動，是乾淨的 no-op。
 
-**Step 2 — CREDIT (toShard):** Credits `balance` and `available_balance` on the destination account. A `saga_credits` record (with a unique index on `transfer_id`) is written in the same transaction, providing idempotency — if Step 2 is retried, the `ON CONFLICT DO NOTHING` prevents a double credit.
+**第二步 — CREDIT（toShard）：** 在目標帳號增加 `balance` 與 `available_balance`，同時寫入 `saga_credits` 紀錄（`transfer_id` 有 unique index）。若第二步重試，`ON CONFLICT DO NOTHING` 確保不會重複入帳。
 
-**Step 3 — FINALIZE (fromShard):** Deducts `reserved_balance` and `balance` to complete the bookkeeping. Updates `transfers.status = 'COMPLETED'` and `saga_log.step = 'COMPLETED'`.
+**第三步 — FINALIZE（fromShard）：** 扣除 `reserved_balance` 與 `balance` 完成帳務結算，將 `transfers.status` 更新為 `'COMPLETED'`、`saga_log.step` 更新為 `'COMPLETED'`。
 
-### Double-Spend Prevention
+### 防止重複扣款
 
-The `accounts` table enforces a DB-level `CHECK` constraint:
+`accounts` 資料表有資料庫層級的 `CHECK` 約束：
 
 ```sql
 CONSTRAINT chk_balance_invariant CHECK (balance = available_balance + reserved_balance)
 ```
 
-This constraint is enforced by PostgreSQL on every write, making it physically impossible for the three balance columns to diverge — even if application-level logic has a bug. Any UPDATE that violates this invariant is rejected with a constraint violation error.
+PostgreSQL 在每次寫入時強制檢查此約束，讓三個餘額欄位在物理層面不可能出現分歧，即使應用程式邏輯有 bug 也一樣。任何違反此約束的 UPDATE 都會被資料庫直接拒絕。
 
-For same-shard transfers, the `WHERE available_balance >= $1` predicate in the CTE ensures the debit only proceeds if funds are present. For cross-shard transfers, the same predicate is applied during the RESERVE step — once reserved, the funds are frozen and cannot be spent by a concurrent transfer.
+同 shard 轉帳中，CTE 的 `WHERE available_balance >= $1` 確保只有餘額足夠時才執行扣款；跨 shard 轉帳中，相同的條件在 RESERVE 步驟套用，一旦資金被預留，就無法被其他並發轉帳再次動用。
 
-### Redis Queue: Serialising Per-Account Writes
+### Redis 佇列：序列化同帳號的寫入
 
-Cross-shard transfers are enqueued to a **per-fromId Redis list** (`transfer:queue:{fromId}`) before being processed by a queue worker. This design serialises all outbound transfers from a single account, eliminating the possibility of two concurrent cross-shard transfers from the same account racing against each other's RESERVE step.
+跨 shard 轉帳在執行前先進入 **per-fromId Redis list**（`transfer:queue:{fromId}`），再由 queue worker 依序處理。此設計將同一帳號的所有跨 shard 轉帳序列化，消除兩筆並發轉帳在 RESERVE 步驟互相競爭的可能性。
 
-Each `fromId` queue has a configurable `rejectThreshold` (default 240) and `maxQueueLength` (default 300). Requests beyond the threshold receive a `429 TooManyRequests` immediately, providing back-pressure and protecting downstream DB capacity.
+每個 `fromId` 佇列有可設定的 `rejectThreshold`（預設 240）與 `maxQueueLength`（預設 300）。超出閾值的請求立即回傳 `429 TooManyRequests`，提供背壓保護下游 DB 容量。
 
-A `transfer:ready` list acts as a dispatch queue — when a per-fromId queue becomes non-empty, the fromId is pushed there for the blocking worker loop (`BLPOP`) to pick up, enabling event-driven processing without polling.
+`transfer:ready` list 作為調度佇列——當某個 per-fromId 佇列從空變為非空時，該 fromId 會被 push 進去，供 worker 的阻塞式 `BRPOP` 取走，實現事件驅動處理而非輪詢。
 
-### Failure Recovery
+### 失敗復原
 
-If Step 2 fails (e.g. destination account not found), the system calls `_compensateReserved`: it restores `available_balance` and decrements `reserved_balance` in a new transaction, then marks the transfer `FAILED`. A guard `AND reserved_balance >= $1` prevents a compensation from driving `reserved_balance` negative.
+若第二步失敗（例如目標帳號不存在），系統呼叫 `_compensateReserved`：在新的交易內還原 `available_balance`、減少 `reserved_balance`，並將轉帳標記為 `FAILED`。條件 `AND reserved_balance >= $1` 防止補償操作把 `reserved_balance` 扣成負數。
 
-If Step 3 fails (e.g. a transient DB error after the credit has already committed), the transfer is marked `PENDING_FINALIZE` and the saga_log remains at `step = 'CREDITED'`. A background Recovery Worker periodically scans `saga_log` for non-terminal states and re-drives them to completion, ensuring eventual consistency even across process restarts.
+若第三步失敗（例如 Credit 已提交但 Finalize 遭遇暫時性 DB 錯誤），轉帳會被標記為 `PENDING_FINALIZE`，`saga_log` 停留在 `step = 'CREDITED'`。背景 Recovery Worker 會定期掃描 `saga_log` 中未到達終態的紀錄，重新驅動至完成，確保即使跨 process 重啟也能達到最終一致性。
 
-The `saga_compensations` table records completed compensation operations with a unique index on `transfer_id`, making compensation itself idempotent against retries.
+`saga_compensations` 資料表記錄已完成的補償操作，`transfer_id` 有 unique index，讓補償動作本身也具備冪等性。
 
-### Balance Conservation Verification
+### 餘額守恆驗證
 
-The benchmark suite verifies global balance conservation by summing all `balance` columns across all four shards before and after the test run. The target is `diff = 0` — no money created or destroyed. The best recorded result: **9,377 RPS, 0% failure rate, balance conservation diff = +0**.
+壓測套件透過加總四個 shard 所有帳號的 `balance` 欄位來驗證全域餘額守恆，目標是 `diff = 0`，確保沒有任何金額被憑空創造或消失。Docker 環境最佳紀錄：**10,886 RPS、Transfer API 0% 失敗率、餘額守恆 diff = +0**。
