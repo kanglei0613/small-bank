@@ -70,6 +70,20 @@ ALTER SEQUENCE public.users_id_seq OWNED BY public.users.id;
 
 
 --
+-- Name: global_account_id_seq; Type: SEQUENCE; Schema: public
+-- Global cross-shard account ID sequence. All account IDs are generated
+-- from this single sequence to guarantee uniqueness across all shards.
+--
+
+CREATE SEQUENCE public.global_account_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
 -- Name: users id; Type: DEFAULT; Schema: public; Owner: kanglei0613
 --
 

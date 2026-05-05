@@ -39,6 +39,9 @@ const logger = {
 // ─── PostgreSQL pools ─────────────────────────────────────────────────────────
 
 const pgBase = {
+  // PG_HOST is used for single-host setups (e.g. local dev where all shards
+  // are on the same PostgreSQL instance). In Docker / multi-host setups,
+  // PG_SHARD_N_HOST overrides this per shard.
   host:                    process.env.PG_HOST     || '127.0.0.1',
   port:                    parseInt(process.env.PG_PORT || '5432'),
   user:                    process.env.PG_USER     || 'kanglei0613',
@@ -55,10 +58,16 @@ function createShardPgMap() {
     2: process.env.PG_SHARD_2_DB || 'small_bank_s2',
     3: process.env.PG_SHARD_3_DB || 'small_bank_s3',
   };
+  const shardHosts = {
+    0: process.env.PG_SHARD_0_HOST || pgBase.host,
+    1: process.env.PG_SHARD_1_HOST || pgBase.host,
+    2: process.env.PG_SHARD_2_HOST || pgBase.host,
+    3: process.env.PG_SHARD_3_HOST || pgBase.host,
+  };
 
   const map = {};
   for (const [ id, database ] of Object.entries(shardDbs)) {
-    map[id] = new Pool({ ...pgBase, database, max: PG_SHARD_POOL_MAX });
+    map[id] = new Pool({ ...pgBase, host: shardHosts[id], database, max: PG_SHARD_POOL_MAX });
   }
   return map;
 }
