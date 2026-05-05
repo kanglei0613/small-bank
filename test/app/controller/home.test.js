@@ -15,9 +15,9 @@ describe('test/app/controller/home.test.js', () => {
   });
 
   it('should GET /', async () => {
-    return app.httpRequest()
+    const res = await app.httpRequest()
       .get('/')
-      .expect('hi, egg')
       .expect(200);
+    assert(res.body.message === 'redis test success', 'home route should return redis test result');
   });
 });

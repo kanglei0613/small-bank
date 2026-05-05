@@ -4,71 +4,50 @@
  * test/transfers.test.js
  *
  * Integration tests for POST /transfers and GET /transfers.
- * Uses supertest to make real HTTP requests against the running Egg app.
+ * Uses egg-mock to start the Egg app and make real HTTP requests.
  *
- * Prerequisites:
- *   - PostgreSQL (meta + 4 shards) must be reachable
- *   - Redis must be reachable
- *   - env vars must point to the test databases (or use defaults)
+ * Shard assignment strategy:
+ *   Account IDs come from a global auto-increment sequence.
+ *   Since shardId = accountId % 4, consecutive IDs cycle through shards 0,1,2,3.
+ *   Therefore accounts[i] and accounts[i+4] are ALWAYS on the same shard,
+ *   and accounts[i] and accounts[i+1] are ALWAYS on different shards —
+ *   regardless of what the starting sequence value is.
  *
- * Run:
- *   npm install --save-dev jest supertest
- *   npx jest test/transfers.test.js
- *
- * Or via egg-bin (existing test runner):
- *   npm run test:local
- *
- * CI note: GitHub Actions sets up service containers with the env vars below.
- * See .github/workflows/ci.yml for the full matrix.
+ *   We create 9 accounts sequentially and assign:
+ *     sameShardFrom  = accounts[0]  (same shard as accounts[4] and accounts[8])
+ *     sameShardTo    = accounts[4]  (same shard as accounts[0])
+ *     crossShardFrom = accounts[0]
+ *     crossShardTo   = accounts[1]  (different shard from accounts[0])
+ *     poorAccount    = accounts[8]  (balance=10, same shard as accounts[4])
  */
 
 const { app } = require('egg-mock/bootstrap');
 // before / after 是 Mocha 全域函式，不需要從 egg-mock/bootstrap 解構
 const assert = require('assert');
 
-// ---------------------------------------------------------------------------
-// Test fixtures
-// We pick account IDs that are on the SAME shard (synchronous path) and
-// also IDs on DIFFERENT shards (asynchronous path).
-//
-// Shard routing: accountId % 4
-//   shard 0 → IDs 4, 8, 1000004, …
-//   shard 1 → IDs 1, 5, 1000001, …
-//   shard 2 → IDs 2, 6, 1000002, …
-//   shard 3 → IDs 3, 7, 1000003, …
-//
-// We use large IDs to avoid collisions with seeded production data.
-// ---------------------------------------------------------------------------
+// ── Test account IDs (populated in before()) ──────────────────────────────
+let sameShardFrom;
+let sameShardTo;
+let crossShardFrom;
+let crossShardTo;
+let poorAccountId;
+let testAccountIds = [];
 
-// Same-shard pair: both on shard 1 (id % 4 === 1)
-const SAME_SHARD_FROM = 9000001; // shard 1
-const SAME_SHARD_TO   = 9000005; // shard 1
-
-// Cross-shard pair: shard 0 → shard 1
-const CROSS_SHARD_FROM = 9000100; // shard 0 (100 % 4 === 0)
-const CROSS_SHARD_TO   = 9000101; // shard 1 (101 % 4 === 1)
-
-const INITIAL_BALANCE = 100000; // ample funds for all test cases
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+// ── Helpers ────────────────────────────────────────────────────────────────
 
 /**
- * Create a user and an account with the given ID and initial balance.
- * Returns the account object.
+ * Create a user and an account with the given label and initial balance.
+ * Returns the account data object (with real auto-generated id).
  */
-async function createTestAccount(accountId, initialBalance = INITIAL_BALANCE) {
-  // 1. Create user
+async function createTestAccount(label, initialBalance = 100000) {
   const userRes = await app.httpRequest()
     .post('/users')
-    .send({ name: `test-user-${accountId}` })
+    .send({ name: `test-${label}-${Date.now()}` })
     .expect(201);
 
   assert(userRes.body.ok, 'user create should succeed');
   const userId = userRes.body.data.id;
 
-  // 2. Open account — the accounts service uses the provided initialBalance
   const accRes = await app.httpRequest()
     .post('/accounts')
     .send({ userId, initialBalance })
@@ -89,34 +68,33 @@ async function getBalance(accountId) {
   return res.body.data;
 }
 
-// ---------------------------------------------------------------------------
-// Lifecycle: create test accounts once, clean up after all tests
-// ---------------------------------------------------------------------------
-
-let testAccountIds = [];
+// ── Lifecycle ──────────────────────────────────────────────────────────────
+//
+// Create 9 accounts sequentially.
+// accounts[i].id and accounts[i+4].id differ by exactly 4,
+// so (accounts[i].id % 4) === (accounts[i+4].id % 4) — always same shard.
+// accounts[i].id and accounts[i+1].id differ by 1,
+// so their shards differ — always cross shard.
 
 before(async () => {
-  // Create all four test accounts
-  await Promise.all([
-    createTestAccount(SAME_SHARD_FROM),
-    createTestAccount(SAME_SHARD_TO),
-    createTestAccount(CROSS_SHARD_FROM),
-    createTestAccount(CROSS_SHARD_TO),
-  ]);
+  const accounts = [];
+  for (let i = 0; i < 9; i++) {
+    // last account is "poor" with only 10 units
+    const balance = i === 8 ? 10 : 100000;
+    const acc = await createTestAccount(`t${i}`, balance);
+    accounts.push(acc);
+  }
 
-  testAccountIds = [
-    SAME_SHARD_FROM,
-    SAME_SHARD_TO,
-    CROSS_SHARD_FROM,
-    CROSS_SHARD_TO,
-  ];
+  sameShardFrom  = accounts[0].id;
+  sameShardTo    = accounts[4].id;  // same shard as accounts[0] (diff = 4)
+  crossShardFrom = accounts[0].id;
+  crossShardTo   = accounts[1].id;  // different shard (diff = 1)
+  poorAccountId  = accounts[8].id;  // same shard as accounts[0,4] (diff = 8)
+
+  testAccountIds = accounts.map(a => a.id);
 });
 
 after(async () => {
-  // Remove test data so repeated runs stay idempotent.
-  // We rely on the DB cascading or just deleting the accounts directly.
-  // If no DELETE route exists, the test DB is wiped by CI between runs anyway.
-  // For local runs, this attempts a best-effort cleanup via raw service calls.
   try {
     console.log('[teardown] test accounts left in DB:', testAccountIds);
   } catch (err) {
@@ -125,13 +103,9 @@ after(async () => {
   }
 });
 
-// ---------------------------------------------------------------------------
-// Test suites
-// ---------------------------------------------------------------------------
+// ── POST /transfers ────────────────────────────────────────────────────────
 
 describe('POST /transfers', () => {
-
-  // ─── Same-shard synchronous transfer ────────────────────────────────────
 
   describe('same-shard (sync) transfer', () => {
     const TRANSFER_AMOUNT = 500;
@@ -140,8 +114,8 @@ describe('POST /transfers', () => {
       const res = await app.httpRequest()
         .post('/transfers')
         .send({
-          fromId: SAME_SHARD_FROM,
-          toId: SAME_SHARD_TO,
+          fromId: sameShardFrom,
+          toId: sameShardTo,
           amount: TRANSFER_AMOUNT,
         })
         .expect(202);
@@ -152,24 +126,24 @@ describe('POST /transfers', () => {
       assert.strictEqual(data.status, 'COMPLETED');
       assert.ok(data.transferId, 'transferId should be present');
       assert.strictEqual(data.type, 'same-shard');
-      assert.strictEqual(data.fromId, SAME_SHARD_FROM);
-      assert.strictEqual(data.toId, SAME_SHARD_TO);
+      assert.strictEqual(data.fromId, sameShardFrom);
+      assert.strictEqual(data.toId, sameShardTo);
       assert.strictEqual(data.amount, TRANSFER_AMOUNT);
     });
 
     it('should debit fromAccount and credit toAccount correctly', async () => {
       const AMOUNT = 1000;
 
-      const beforeFrom = await getBalance(SAME_SHARD_FROM);
-      const beforeTo   = await getBalance(SAME_SHARD_TO);
+      const beforeFrom = await getBalance(sameShardFrom);
+      const beforeTo   = await getBalance(sameShardTo);
 
       await app.httpRequest()
         .post('/transfers')
-        .send({ fromId: SAME_SHARD_FROM, toId: SAME_SHARD_TO, amount: AMOUNT })
+        .send({ fromId: sameShardFrom, toId: sameShardTo, amount: AMOUNT })
         .expect(202);
 
-      const afterFrom = await getBalance(SAME_SHARD_FROM);
-      const afterTo   = await getBalance(SAME_SHARD_TO);
+      const afterFrom = await getBalance(sameShardFrom);
+      const afterTo   = await getBalance(sameShardTo);
 
       assert.strictEqual(
         Number(afterFrom.available_balance),
@@ -181,7 +155,7 @@ describe('POST /transfers', () => {
         Number(beforeTo.available_balance) + AMOUNT,
         'toAccount available_balance should increase by amount'
       );
-      // Total balance in system is conserved
+      // Total balance is conserved
       const beforeTotal = Number(beforeFrom.balance) + Number(beforeTo.balance);
       const afterTotal  = Number(afterFrom.balance)  + Number(afterTo.balance);
       assert.strictEqual(afterTotal, beforeTotal, 'balance conservation: sum must not change');
@@ -190,7 +164,7 @@ describe('POST /transfers', () => {
     it('should include balance snapshot in response', async () => {
       const res = await app.httpRequest()
         .post('/transfers')
-        .send({ fromId: SAME_SHARD_FROM, toId: SAME_SHARD_TO, amount: 100 })
+        .send({ fromId: sameShardFrom, toId: sameShardTo, amount: 100 })
         .expect(202);
 
       const { balance } = res.body.data;
@@ -205,15 +179,13 @@ describe('POST /transfers', () => {
     });
   });
 
-  // ─── Cross-shard asynchronous transfer ──────────────────────────────────
-
   describe('cross-shard (async) transfer', () => {
     it('should return 202 with mode=async and status=queued', async () => {
       const res = await app.httpRequest()
         .post('/transfers')
         .send({
-          fromId: CROSS_SHARD_FROM,
-          toId: CROSS_SHARD_TO,
+          fromId: crossShardFrom,
+          toId: crossShardTo,
           amount: 200,
         })
         .expect(202);
@@ -229,7 +201,7 @@ describe('POST /transfers', () => {
     it('should allow polling GET /transfer-jobs/:jobId', async () => {
       const submitRes = await app.httpRequest()
         .post('/transfers')
-        .send({ fromId: CROSS_SHARD_FROM, toId: CROSS_SHARD_TO, amount: 100 })
+        .send({ fromId: crossShardFrom, toId: crossShardTo, amount: 100 })
         .expect(202);
 
       const { jobId } = submitRes.body.data;
@@ -245,43 +217,43 @@ describe('POST /transfers', () => {
     });
   });
 
-  // ─── Input validation (400 errors) ───────────────────────────────────────
-
   describe('input validation', () => {
+    // Use any valid account ID for validation tests; value doesn't matter
+    // since these requests never reach DB
     const cases = [
       {
         label: 'missing fromId',
-        body: { toId: SAME_SHARD_TO, amount: 100 },
+        body: { toId: 2, amount: 100 },
         message: 'fromId must be a positive integer',
       },
       {
         label: 'fromId = 0',
-        body: { fromId: 0, toId: SAME_SHARD_TO, amount: 100 },
+        body: { fromId: 0, toId: 2, amount: 100 },
         message: 'fromId must be a positive integer',
       },
       {
         label: 'negative fromId',
-        body: { fromId: -1, toId: SAME_SHARD_TO, amount: 100 },
+        body: { fromId: -1, toId: 2, amount: 100 },
         message: 'fromId must be a positive integer',
       },
       {
         label: 'missing toId',
-        body: { fromId: SAME_SHARD_FROM, amount: 100 },
+        body: { fromId: 1, amount: 100 },
         message: 'toId must be a positive integer',
       },
       {
         label: 'amount = 0',
-        body: { fromId: SAME_SHARD_FROM, toId: SAME_SHARD_TO, amount: 0 },
+        body: { fromId: 1, toId: 2, amount: 0 },
         message: 'amount must be a positive integer',
       },
       {
         label: 'amount is float',
-        body: { fromId: SAME_SHARD_FROM, toId: SAME_SHARD_TO, amount: 1.5 },
+        body: { fromId: 1, toId: 2, amount: 1.5 },
         message: 'amount must be a positive integer',
       },
       {
         label: 'fromId === toId',
-        body: { fromId: SAME_SHARD_FROM, toId: SAME_SHARD_FROM, amount: 100 },
+        body: { fromId: 1, toId: 1, amount: 100 },
         message: 'fromId and toId cannot be the same',
       },
     ];
@@ -299,31 +271,14 @@ describe('POST /transfers', () => {
     }
   });
 
-  // ─── Insufficient balance (409 Conflict) ─────────────────────────────────
-
   describe('insufficient balance', () => {
     it('should return 409 when fromAccount has insufficient funds', async () => {
-      // Create a fresh account with only 10 units
-      const poorRes = await app.httpRequest()
-        .post('/accounts')
-        .send({ userId: 1, initialBalance: 10 })
-        .expect(201);
-
-      const poorAccountId = poorRes.body.data.id;
-
-      // Find a valid destination on same shard
-      // Pick a destination that is on the same shard (accountId % 4 == poorAccountId % 4)
-      const destId = poorAccountId + 4; // same shard offset
-
-      // Ensure destination exists by creating it too
-      await app.httpRequest()
-        .post('/accounts')
-        .send({ userId: 1, initialBalance: 0 })
-        .expect(201);
-
+      // poorAccountId was created with balance=10, on same shard as sameShardTo
+      // (accounts[8] and accounts[4] have the same shard since diff=4 divides evenly)
+      // Attempt to transfer 9999 (> 10) → same-shard sync path → 409
       const res = await app.httpRequest()
         .post('/transfers')
-        .send({ fromId: poorAccountId, toId: destId, amount: 9999 })
+        .send({ fromId: poorAccountId, toId: sameShardTo, amount: 9999 })
         .expect(409);
 
       assert.strictEqual(res.body.ok, false);
@@ -332,20 +287,18 @@ describe('POST /transfers', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// GET /transfers
-// ---------------------------------------------------------------------------
+// ── GET /transfers ─────────────────────────────────────────────────────────
 
 describe('GET /transfers', () => {
   it('should return transfer history for an account', async () => {
     // Perform a transfer first so there is at least one record
     await app.httpRequest()
       .post('/transfers')
-      .send({ fromId: SAME_SHARD_FROM, toId: SAME_SHARD_TO, amount: 1 })
+      .send({ fromId: sameShardFrom, toId: sameShardTo, amount: 1 })
       .expect(202);
 
     const res = await app.httpRequest()
-      .get(`/transfers?accountId=${SAME_SHARD_FROM}`)
+      .get(`/transfers?accountId=${sameShardFrom}`)
       .expect(200);
 
     const { ok, data } = res.body;
@@ -371,7 +324,7 @@ describe('GET /transfers', () => {
 
   it('should return 400 when limit exceeds 200', async () => {
     const res = await app.httpRequest()
-      .get(`/transfers?accountId=${SAME_SHARD_FROM}&limit=201`)
+      .get(`/transfers?accountId=${sameShardFrom}&limit=201`)
       .expect(400);
 
     assert.strictEqual(res.body.ok, false);
