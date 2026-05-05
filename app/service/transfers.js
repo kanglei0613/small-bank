@@ -6,6 +6,7 @@ const TransfersRepo = require('../repository/transfersRepo');
 const redisTransferQueue = require('../lib/queue/redis_transfer_queue');
 const transferJobStore = require('../lib/queue/transfer_job_store');
 const { BadRequestError } = require('../lib/errors');
+const { logger } = require('../lib/logger');
 
 function buildJobId() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
@@ -38,22 +39,44 @@ class TransferService extends Service {
     validateTransferInput({ fromId, toId, amount });
 
     const { app } = this.ctx;
+    const requestId = this.ctx.requestId;
     const shardCount = Number(app.config.sharding.shardCount);
     const fromShardId = fromId % shardCount;
     const toShardId = toId % shardCount;
+    const mode = fromShardId === toShardId ? 'sync' : 'async';
 
-    if (fromShardId === toShardId) {
-      const result = await this.repo.transferSameShard({
-        fromAccountId: fromId,
-        toAccountId: toId,
-        transferAmount: amount,
-        shardId: fromShardId,
+    const start = Date.now();
+
+    try {
+      if (fromShardId === toShardId) {
+        const result = await this.repo.transferSameShard({
+          fromAccountId: fromId,
+          toAccountId: toId,
+          transferAmount: amount,
+          shardId: fromShardId,
+        });
+        return { mode: 'sync', ...result };
+      }
+
+      const queued = await this._enqueueTransfer({ fromId, toId, amount });
+      return { mode: 'async', ...queued };
+    } catch (err) {
+      const duration = Date.now() - start;
+      logger.error('[submitTransfer] error', {
+        requestId,
+        fromId,
+        toId,
+        amount,
+        mode,
+        fromShardId,
+        toShardId,
+        durationMs: duration,
+        errCode: err.status || err.code,
+        errMessage: err.message,
+        stack: err.stack,
       });
-      return { mode: 'sync', ...result };
+      throw err;
     }
-
-    const queued = await this._enqueueTransfer({ fromId, toId, amount });
-    return { mode: 'async', ...queued };
   }
 
   // Enqueue a cross-shard transfer job and return the jobId immediately.
