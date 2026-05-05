@@ -1,8 +1,8 @@
 # small-bank
 
 ![CI](https://github.com/kanglei0613/small-bank/actions/workflows/ci.yml/badge.svg)
-![Node](https://img.shields.io/badge/Node.js-18%2B-339933?logo=node.js)
-![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-4169E1?logo=postgresql)
+![Node](https://img.shields.io/badge/Node.js-20_LTS-339933?logo=node.js)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-17-4169E1?logo=postgresql)
 ![Redis](https://img.shields.io/badge/Redis-7-DC382D?logo=redis)
 
 # High-Concurrency Transaction System
@@ -364,26 +364,25 @@ node scripts/benchmark/mixed_rps_autocannon.js \
   --queue-drain-timeout=120
 ```
 
-### 目前最佳成績
+### 目前最佳成績（Docker 環境）
 
 | 指標 | 數值 |
 |------|------|
-| 總 RPS | **9,377** |
-| General API | 4,298 RPS |
-| Transfer API | 5,079 RPS |
-| p95 latency | 158ms |
-| p99 latency | 181ms |
-| 失敗率 | 0% |
+| 總 RPS | **10,886** |
+| General API | 7,826 RPS |
+| Transfer API | 3,060 RPS |
+| p95 latency | 32ms |
+| p99 latency | 43ms |
+| Transfer 失敗率 | **0%**（91,805 筆全部成功）|
 | 餘額守恆 | ✅ diff = +0 |
 
 ---
 
 ## 已知限制
 
-- **單機部署**：目前開發與壓測皆在單機 WSL 環境，尚未驗證多機水平擴展。
+- **單機部署**：目前開發與壓測皆在單機環境，尚未驗證多機水平擴展。
 - **Transfer queue 非 FIFO**：per-fromId queue 確保同一發款帳號的轉帳不會並發衝突，但不同 fromId 之間的處理順序取決於 queue worker 的排程。
 - **每筆借貸平衡驗證**：目前只驗證全量餘額守恆（sum 不變），尚未驗證每筆轉帳的借貸個別平衡。
-- **開發環境選擇：曾嘗試以 Docker 容器化部署，但因 WSL2 的 volume mount 與 network namespace 問題導致效能異常，最終改為 PostgreSQL / Redis 原生安裝於 WSL，以確保壓測數據的準確性。
 ---
 
 ## 交易一致性設計
