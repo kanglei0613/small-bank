@@ -1,0 +1,300 @@
+# docker-compose.yml
+#
+# Full small-bank stack:
+#   postgres-meta  — small_bank_meta (users, account_shards)
+#   postgres-s0~s3 — small_bank_s0~s3 (accounts, transfers, saga_log, …)
+#   redis          — per-fromId transfer queue
+#   app-general    — General API  (port 7001, APP_API_ROLE=general)
+#   app-transfer   — Transfer API (port 7010, APP_API_ROLE=transfer)
+#   queue-worker   — drains Redis per-fromId queues
+#   recovery-worker— re-drives PENDING_FINALIZE / stuck saga rows
+#
+# Usage:
+#   docker-compose up --build          # first run (init SQL applied automatically)
+#   docker-compose up -d               # background
+#   docker-compose down -v             # teardown + wipe volumes
+#
+# Tunable env overrides (pass via .env or shell):
+#   GENERAL_WORKERS   (default 3)
+#   TRANSFER_WORKERS  (default 1)
+#   QUEUE_CONCURRENCY (default 8)
+#   BATCH_SIZE        (default 100)
+#   PG_SHARD_POOL_MAX (default 10)
+#   REJECT_THRESHOLD  (default 500)
+#   MAX_QUEUE_LENGTH  (default 600)
+
+x-pg-common: &pg-common
+  image: postgres:17
+  restart: unless-stopped
+
+x-pg-env: &pg-env
+  POSTGRES_USER: kanglei0613
+  POSTGRES_PASSWORD: 7522alex
+
+x-app-common: &app-common
+  # Node 20 LTS — more stable with egg-scripts than Node 22
+  image: node:20-bookworm-slim
+  working_dir: /app
+  restart: unless-stopped
+  # Mount source; exclude host node_modules so container gets a clean install
+  volumes:
+    - .:/app
+    - node_modules:/app/node_modules
+  # Install deps then start in production mode
+  # egg-scripts is used for production; it starts the cluster master.
+  command: >
+    sh -c "npm install --omit=dev --silent && node_modules/.bin/egg-scripts start --no-daemon --title=small-bank"
+  environment: &app-env-common
+    NODE_ENV: production
+    PG_USER: kanglei0613
+    PG_PASSWORD: 7522alex
+    PG_PORT: "5432"
+    PG_META_HOST: postgres-meta
+    PG_SHARD_0_HOST: postgres-s0
+    PG_SHARD_1_HOST: postgres-s1
+    PG_SHARD_2_HOST: postgres-s2
+    PG_SHARD_3_HOST: postgres-s3
+    PG_META_POOL_MAX: "10"
+    PG_SHARD_POOL_MAX: "${PG_SHARD_POOL_MAX:-10}"
+    REDIS_HOST: redis
+    REDIS_PORT: "6379"
+  depends_on: &app-depends
+    postgres-meta:
+      condition: service_healthy
+    postgres-s0:
+      condition: service_healthy
+    postgres-s1:
+      condition: service_healthy
+    postgres-s2:
+      condition: service_healthy
+    postgres-s3:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+
+  # ── PostgreSQL meta ─────────────────────────────────────────────────────────
+  postgres-meta:
+    <<: *pg-common
+    environment:
+      <<: *pg-env
+      POSTGRES_DB: small_bank_meta
+    volumes:
+      - pg-meta:/var/lib/postgresql/data
+      # Init script runs once on first boot when data volume is empty
+      - ./docker/initdb-meta:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kanglei0613 -d small_bank_meta"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # ── PostgreSQL shards ───────────────────────────────────────────────────────
+  postgres-s0:
+    <<: *pg-common
+    environment:
+      <<: *pg-env
+      POSTGRES_DB: small_bank_s0
+    volumes:
+      - pg-s0:/var/lib/postgresql/data
+      - ./docker/initdb-shard:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kanglei0613 -d small_bank_s0"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  postgres-s1:
+    <<: *pg-common
+    environment:
+      <<: *pg-env
+      POSTGRES_DB: small_bank_s1
+    volumes:
+      - pg-s1:/var/lib/postgresql/data
+      - ./docker/initdb-shard:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kanglei0613 -d small_bank_s1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  postgres-s2:
+    <<: *pg-common
+    environment:
+      <<: *pg-env
+      POSTGRES_DB: small_bank_s2
+    volumes:
+      - pg-s2:/var/lib/postgresql/data
+      - ./docker/initdb-shard:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kanglei0613 -d small_bank_s2"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  postgres-s3:
+    <<: *pg-common
+    environment:
+      <<: *pg-env
+      POSTGRES_DB: small_bank_s3
+    volumes:
+      - pg-s3:/var/lib/postgresql/data
+      - ./docker/initdb-shard:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kanglei0613 -d small_bank_s3"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # ── Redis ───────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+    # Persist to disk so in-flight queued jobs survive container restarts
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+  # ── General API (port 7001) ─────────────────────────────────────────────────
+  app-general:
+    <<: *app-common
+    ports:
+      - "7001:7001"
+    environment:
+      <<: *app-env-common
+      APP_API_ROLE: general
+      APP_PORT: "7001"
+      APP_WORKERS: "${GENERAL_WORKERS:-3}"
+    depends_on:
+      <<: *app-depends
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:7001/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+  # ── Transfer API (port 7010) ────────────────────────────────────────────────
+  app-transfer:
+    <<: *app-common
+    ports:
+      - "7010:7010"
+    environment:
+      <<: *app-env-common
+      APP_API_ROLE: transfer
+      APP_PORT: "7010"
+      APP_WORKERS: "${TRANSFER_WORKERS:-1}"
+      TRANSFER_QUEUE_REJECT_THRESHOLD: "${REJECT_THRESHOLD:-500}"
+      TRANSFER_QUEUE_MAX_LENGTH: "${MAX_QUEUE_LENGTH:-600}"
+      TRANSFER_QUEUE_BATCH_SIZE: "${BATCH_SIZE:-100}"
+    depends_on:
+      <<: *app-depends
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:7010/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+  # ── Queue Worker ────────────────────────────────────────────────────────────
+  # Reads fromId jobs from Redis, executes cross-shard Saga transfers.
+  queue-worker:
+    image: node:20-bookworm-slim
+    working_dir: /app
+    restart: unless-stopped
+    volumes:
+      - .:/app
+      - node_modules:/app/node_modules
+    command: >
+      sh -c "npm install --omit=dev --silent && node scripts/worker/queue_worker.js"
+    environment:
+      NODE_ENV: production
+      PG_USER: kanglei0613
+      PG_PASSWORD: 7522alex
+      PG_PORT: "5432"
+      PG_META_HOST: postgres-meta
+      PG_SHARD_0_HOST: postgres-s0
+      PG_SHARD_1_HOST: postgres-s1
+      PG_SHARD_2_HOST: postgres-s2
+      PG_SHARD_3_HOST: postgres-s3
+      PG_META_POOL_MAX: "2"
+      PG_SHARD_POOL_MAX: "${PG_SHARD_POOL_MAX:-10}"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      QUEUE_CONCURRENCY: "${QUEUE_CONCURRENCY:-8}"
+      TRANSFER_QUEUE_BATCH_SIZE: "${BATCH_SIZE:-100}"
+      TRANSFER_QUEUE_BLOCK_TIMEOUT_SEC: "1"
+    depends_on:
+      postgres-s0:
+        condition: service_healthy
+      postgres-s1:
+        condition: service_healthy
+      postgres-s2:
+        condition: service_healthy
+      postgres-s3:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      # Wait for app-general to finish npm install first (avoids race condition)
+      app-general:
+        condition: service_healthy
+
+  # ── Recovery Worker ─────────────────────────────────────────────────────────
+  # Periodically scans saga_log for RESERVED / CREDITED / COMPENSATING rows
+  # and drives them to a terminal state (COMPLETED or FAILED).
+  recovery-worker:
+    image: node:20-bookworm-slim
+    working_dir: /app
+    restart: unless-stopped
+    volumes:
+      - .:/app
+      - node_modules:/app/node_modules
+    command: >
+      sh -c "npm install --omit=dev --silent && node scripts/worker/recovery_worker.js"
+    environment:
+      NODE_ENV: production
+      PG_USER: kanglei0613
+      PG_PASSWORD: 7522alex
+      PG_PORT: "5432"
+      PG_SHARD_0_HOST: postgres-s0
+      PG_SHARD_1_HOST: postgres-s1
+      PG_SHARD_2_HOST: postgres-s2
+      PG_SHARD_3_HOST: postgres-s3
+      PG_SHARD_POOL_MAX: "${PG_SHARD_POOL_MAX:-5}"
+      SAGA_RECOVERY_INTERVAL_MS: "${SAGA_RECOVERY_INTERVAL_MS:-10000}"
+      SAGA_STALE_THRESHOLD_SEC: "${SAGA_STALE_THRESHOLD_SEC:-30}"
+      SAGA_SCAN_BATCH_SIZE: "${SAGA_SCAN_BATCH_SIZE:-50}"
+    depends_on:
+      postgres-s0:
+        condition: service_healthy
+      postgres-s1:
+        condition: service_healthy
+      postgres-s2:
+        condition: service_healthy
+      postgres-s3:
+        condition: service_healthy
+      # Wait for app-general to finish npm install first (avoids race condition)
+      app-general:
+        condition: service_healthy
+
+volumes:
+  pg-meta:
+  pg-s0:
+  pg-s1:
+  pg-s2:
+  pg-s3:
+  redis-data:
+  # Shared node_modules volume avoids repeated installs across services
+  node_modules:
