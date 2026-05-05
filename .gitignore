@@ -2,7 +2,7 @@ logs/
 npm-debug.log
 yarn-error.log
 node_modules/
-*-lock.json
+# keep package-lock.json for reproducible installs
 *-lock.yaml
 yarn.lock
 coverage/
@@ -15,6 +15,7 @@ typings/
 .nyc_output/
 .env
 .env.*
+!.env.example
 
 # benchmark runtime 產生的檔案
 scripts/benchmark/.seed-config.json

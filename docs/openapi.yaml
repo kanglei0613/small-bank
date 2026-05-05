@@ -1,0 +1,465 @@
+openapi: 3.0.3
+info:
+  title: Small Bank API
+  version: 1.0.0
+  description: |
+    High-concurrency banking transfer system built on Node.js (Egg.js) + PostgreSQL sharding + Redis queue.
+
+    ## Architecture
+    - **General API** (port 7001): accounts, users, transfer history, job status
+    - **Transfer API** (port 7010): POST /transfers only
+    - **Sharding**: accountId % 4 → shard 0–3
+    - **Same-shard**: synchronous CTE in single round trip, returns HTTP 202 with `mode: "sync"`
+    - **Cross-shard**: async via Redis per-fromId queue → Saga pattern, returns HTTP 202 with `mode: "async"`
+
+servers:
+  - url: http://localhost:7001
+    description: General API
+  - url: http://localhost:7010
+    description: Transfer API
+
+tags:
+  - name: Transfers
+    description: Transfer submission and history
+  - name: TransferJobs
+    description: Async job status polling
+
+paths:
+  /transfers:
+    post:
+      tags: [Transfers]
+      summary: Submit a transfer
+      description: |
+        Creates a transfer between two accounts.
+
+        - **Same shard** (fromId % 4 === toId % 4): executes synchronously via CTE; `mode = "sync"`, `status = "COMPLETED"`
+        - **Cross shard**: enqueues to Redis per-fromId queue; `mode = "async"`, `status = "queued"`.
+          Poll `GET /transfer-jobs/{jobId}` for final result.
+
+        Always returns **HTTP 202 Accepted**.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransferRequest'
+            examples:
+              same_shard:
+                summary: Same-shard transfer (fromId=1, toId=5 → both shard 1)
+                value: { fromId: 1, toId: 5, amount: 100 }
+              cross_shard:
+                summary: Cross-shard transfer (fromId=1 → shard 1, toId=2 → shard 2)
+                value: { fromId: 1, toId: 2, amount: 500 }
+      responses:
+        '202':
+          description: Transfer accepted (sync completed or async queued)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransferSubmitResponse'
+              examples:
+                sync_response:
+                  summary: Same-shard synchronous result
+                  value:
+                    ok: true
+                    data:
+                      mode: sync
+                      transferId: 4821
+                      fromId: 1
+                      toId: 5
+                      amount: 100
+                      status: COMPLETED
+                      shardId: 1
+                      type: same-shard
+                      balance:
+                        id: 1
+                        balance: 9900
+                        available_balance: 9900
+                        reserved_balance: 0
+                        updated_at: "2025-01-01T00:00:00.000Z"
+                async_response:
+                  summary: Cross-shard async job queued
+                  value:
+                    ok: true
+                    data:
+                      mode: async
+                      jobId: "1735680000000-a3f8bc12"
+                      status: queued
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+    get:
+      tags: [Transfers]
+      summary: List transfer history for an account
+      description: |
+        Returns transfers where the account is either sender or receiver, ordered by id DESC.
+        Maximum 200 records per query (default 50).
+      parameters:
+        - name: accountId
+          in: query
+          required: true
+          description: Account ID to query transfers for
+          schema:
+            type: integer
+            minimum: 1
+            example: 42
+        - name: limit
+          in: query
+          required: false
+          description: Number of records to return (1–200, default 50)
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+            example: 20
+      responses:
+        '200':
+          description: Transfer list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransferListResponse'
+              example:
+                ok: true
+                data:
+                  items:
+                    - id: 4821
+                      from_account_id: 1
+                      to_account_id: 5
+                      amount: 100
+                      status: COMPLETED
+                      created_at: "2025-01-01T00:00:00.000Z"
+                      updated_at: "2025-01-01T00:00:00.000Z"
+                    - id: 4820
+                      from_account_id: 2
+                      to_account_id: 1
+                      amount: 200
+                      status: COMPLETED
+                      created_at: "2025-01-01T00:00:00.000Z"
+                      updated_at: "2025-01-01T00:00:00.000Z"
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /transfer-jobs/{jobId}:
+    get:
+      tags: [TransferJobs]
+      summary: Get async transfer job status
+      description: |
+        Poll this endpoint after receiving a `mode: "async"` response from `POST /transfers`.
+
+        Job status lifecycle:
+        - `queued` → job is in Redis queue, not yet processed
+        - `success` → transfer completed successfully
+        - `failed` → transfer failed (e.g. insufficient funds on cross-shard)
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          description: Job ID returned by POST /transfers (async mode)
+          schema:
+            type: string
+            example: "1735680000000-a3f8bc12"
+      responses:
+        '200':
+          description: Job status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransferJobResponse'
+              examples:
+                queued:
+                  summary: Still in queue
+                  value:
+                    ok: true
+                    data:
+                      jobId: "1735680000000-a3f8bc12"
+                      status: queued
+                      fromId: 1
+                      toId: 2
+                      amount: 500
+                      createdAt: 1735680000000
+                      updatedAt: 1735680000000
+                success:
+                  summary: Completed successfully
+                  value:
+                    ok: true
+                    data:
+                      jobId: "1735680000000-a3f8bc12"
+                      status: success
+                      fromId: 1
+                      toId: 2
+                      amount: 500
+                      result:
+                        transferId: 9012
+                        status: COMPLETED
+                        type: cross-shard
+                      createdAt: 1735680000000
+                      updatedAt: 1735680001234
+                failed:
+                  summary: Transfer failed
+                  value:
+                    ok: true
+                    data:
+                      jobId: "1735680000000-a3f8bc12"
+                      status: failed
+                      fromId: 1
+                      toId: 2
+                      amount: 500
+                      error: "insufficient funds"
+                      createdAt: 1735680000000
+                      updatedAt: 1735680001234
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+components:
+  schemas:
+    TransferRequest:
+      type: object
+      required: [fromId, toId, amount]
+      properties:
+        fromId:
+          type: integer
+          minimum: 1
+          description: Source account ID (positive integer)
+          example: 1
+        toId:
+          type: integer
+          minimum: 1
+          description: Destination account ID (positive integer, must differ from fromId)
+          example: 2
+        amount:
+          type: integer
+          minimum: 1
+          description: Transfer amount in smallest currency unit (positive integer, no decimals)
+          example: 100
+
+    TransferSubmitResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          example: true
+        data:
+          oneOf:
+            - $ref: '#/components/schemas/SyncTransferResult'
+            - $ref: '#/components/schemas/AsyncTransferResult'
+
+    SyncTransferResult:
+      type: object
+      description: Result for same-shard synchronous transfers
+      properties:
+        mode:
+          type: string
+          enum: [sync]
+        transferId:
+          type: integer
+          description: ID of the created transfer record
+        fromId:
+          type: integer
+        toId:
+          type: integer
+        amount:
+          type: integer
+        status:
+          type: string
+          enum: [COMPLETED]
+        shardId:
+          type: integer
+          description: Shard both accounts reside on
+        type:
+          type: string
+          enum: [same-shard]
+        balance:
+          $ref: '#/components/schemas/AccountBalance'
+
+    AsyncTransferResult:
+      type: object
+      description: Result for cross-shard asynchronous transfers
+      properties:
+        mode:
+          type: string
+          enum: [async]
+        jobId:
+          type: string
+          description: Unique job identifier for polling /transfer-jobs/:jobId
+          example: "1735680000000-a3f8bc12"
+        status:
+          type: string
+          enum: [queued]
+
+    AccountBalance:
+      type: object
+      properties:
+        id:
+          type: integer
+        balance:
+          type: integer
+          description: Total balance (available_balance + reserved_balance)
+        available_balance:
+          type: integer
+          description: Spendable balance
+        reserved_balance:
+          type: integer
+          description: Frozen balance (in-flight cross-shard transfers)
+        updated_at:
+          type: string
+          format: date-time
+
+    TransferRecord:
+      type: object
+      properties:
+        id:
+          type: integer
+        from_account_id:
+          type: integer
+        to_account_id:
+          type: integer
+        amount:
+          type: integer
+        status:
+          type: string
+          enum: [COMPLETED, RESERVED, PENDING_FINALIZE, FAILED]
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    TransferListResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          example: true
+        data:
+          type: object
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/TransferRecord'
+
+    TransferJobResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          example: true
+        data:
+          type: object
+          properties:
+            jobId:
+              type: string
+            status:
+              type: string
+              enum: [queued, success, failed]
+            fromId:
+              type: integer
+            toId:
+              type: integer
+            amount:
+              type: integer
+            result:
+              type: object
+              nullable: true
+              description: Present when status = "success"
+            error:
+              type: string
+              nullable: true
+              description: Error message when status = "failed"
+            createdAt:
+              type: integer
+              description: Unix timestamp (ms)
+            updatedAt:
+              type: integer
+              description: Unix timestamp (ms)
+
+    ErrorResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          example: false
+        message:
+          type: string
+          example: "insufficient funds"
+
+  responses:
+    BadRequest:
+      description: Invalid input parameters
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            invalid_from_id:
+              value: { ok: false, message: "fromId must be a positive integer" }
+            same_account:
+              value: { ok: false, message: "fromId and toId cannot be the same" }
+            invalid_amount:
+              value: { ok: false, message: "amount must be a positive integer" }
+    NotFound:
+      description: Account not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            ok: false
+            message: "destination account not found"
+    Conflict:
+      description: Insufficient funds
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            ok: false
+            message: "insufficient funds"
+    TooManyRequests:
+      description: Per-fromId Redis queue is full (cross-shard transfers only)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            ok: false
+            message: "too many pending transfers for this account"
+    InternalError:
+      description: Unexpected server error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            ok: false
+            message: "internal server error"
+    ServiceUnavailable:
+      description: Database connection error (ECONNREFUSED, pg error codes 57P01, 53300, etc.)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            ok: false
+            message: "service temporarily unavailable"

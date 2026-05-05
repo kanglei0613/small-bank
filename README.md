@@ -1,5 +1,10 @@
 # small-bank
 
+![CI](https://github.com/kanglei0613/small-bank/actions/workflows/ci.yml/badge.svg)
+![Node](https://img.shields.io/badge/Node.js-18%2B-339933?logo=node.js)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-4169E1?logo=postgresql)
+![Redis](https://img.shields.io/badge/Redis-7-DC382D?logo=redis)
+
 # High-Concurrency Transaction System
 
 本專案是一個以「系統正確性（correctness）」與「流程控制（control flow）」為核心設計的高併發交易系統。
@@ -106,6 +111,40 @@
    │   Queue Worker   │   │ Recovery Worker  │
    │  (轉帳執行)      │   │  (Saga 補償)     │
    └──────────────────┘   └──────────────────┘
+```
+
+```mermaid
+flowchart TD
+    Client["Client"]
+
+    subgraph API["API Layer"]
+        G["General API\nport 7001\n帳號 / 查詢"]
+        T["Transfer API\nport 7010\n轉帳請求"]
+    end
+
+    subgraph Queue["Async Transfer Pipeline"]
+        RQ["Redis Queue\nper-fromId list"]
+        QW["Queue Worker\n轉帳執行"]
+        RW["Recovery Worker\nSaga 補償"]
+    end
+
+    subgraph DB["Database Layer"]
+        Meta["PostgreSQL\nsmall_bank_meta\nusers / account_shards"]
+        S0["Shard 0\nsmall_bank_s0"]
+        S1["Shard 1\nsmall_bank_s1"]
+        S2["Shard 2\nsmall_bank_s2"]
+        S3["Shard 3\nsmall_bank_s3"]
+    end
+
+    Client --> G
+    Client --> T
+    G --> Meta
+    G --> S0 & S1 & S2 & S3
+    T -->|"同 shard → 同步 CTE"| S0 & S1 & S2 & S3
+    T -->|"跨 shard → 入 queue"| RQ
+    RQ --> QW
+    QW -->|"Saga: RESERVE → CREDIT → FINALIZE"| S0 & S1 & S2 & S3
+    RW -->|"掃 saga_log\n修復 PENDING_FINALIZE"| S0 & S1 & S2 & S3
 ```
 
 ### 資料庫分佈
@@ -219,7 +258,30 @@ Queue Worker 取出 job
 
 ## 快速啟動
 
-### 環境需求
+### Docker（推薦 — 三行跑起來）
+
+```bash
+git clone https://github.com/kanglei0613/small-bank.git
+cd small-bank
+cp .env.example .env
+docker-compose up
+```
+
+API 起來後：
+- General API：`http://localhost:7001`
+- Transfer API：`http://localhost:7010`
+- Swagger UI：`http://localhost:7001/api-docs`
+
+建立測試資料：
+```bash
+node scripts/benchmark/seed.js --concurrency=3
+```
+
+---
+
+### 本機開發（WSL2 原生安裝）
+
+#### 環境需求
 
 - Node.js 18+
 - PostgreSQL 16+（原生安裝，非 Docker）
@@ -322,3 +384,86 @@ node scripts/benchmark/mixed_rps_autocannon.js \
 - **Transfer queue 非 FIFO**：per-fromId queue 確保同一發款帳號的轉帳不會並發衝突，但不同 fromId 之間的處理順序取決於 queue worker 的排程。
 - **每筆借貸平衡驗證**：目前只驗證全量餘額守恆（sum 不變），尚未驗證每筆轉帳的借貸個別平衡。
 - **開發環境選擇：曾嘗試以 Docker 容器化部署，但因 WSL2 的 volume mount 與 network namespace 問題導致效能異常，最終改為 PostgreSQL / Redis 原生安裝於 WSL，以確保壓測數據的準確性。
+---
+
+## Transaction Consistency
+
+This section covers the engineering decisions behind correctness guarantees in the small-bank system.
+
+### Sharding Strategy
+
+Accounts are distributed across four PostgreSQL shards using a deterministic hash: `shardId = accountId % 4`. There is no routing table lookup — the shard for any account is computable from the account ID alone in O(1). The meta DB (`small_bank_meta`) holds user and account registration data only; all financial state lives exclusively in the shard databases.
+
+This design trades query flexibility for predictable latency and horizontal scalability. A single shard can be scaled independently without affecting the others.
+
+### Row-Level Locking and Lock Timeout
+
+All balance mutations acquire row-level locks via `UPDATE ... WHERE id = $1`. Every transaction sets `SET LOCAL lock_timeout = '200ms'` immediately after `BEGIN`. This ensures that a lock contention caused by a slow or stuck transaction fails fast rather than piling up waiting connections. Lock timeout errors bubble up as a 503 (via the DB error code handler in `errorHandler.js`) rather than queuing indefinitely.
+
+This is a deliberate trade-off: under extreme contention, some requests are rejected quickly rather than the entire system becoming unresponsive.
+
+### Same-Shard Transfer: Single Round-Trip CTE
+
+When `fromId % 4 === toId % 4`, the transfer executes inside a single PostgreSQL transaction using a chained CTE:
+
+```sql
+WITH debit AS (
+  UPDATE accounts SET balance = balance - $1, available_balance = available_balance - $1
+  WHERE id = $2 AND available_balance >= $1
+  RETURNING ...
+),
+credit AS (
+  UPDATE accounts SET balance = balance + $1, available_balance = available_balance + $1
+  WHERE id = $3
+  RETURNING id
+),
+ins AS (
+  INSERT INTO transfers (...) SELECT ... WHERE EXISTS (SELECT 1 FROM debit) AND EXISTS (SELECT 1 FROM credit)
+  RETURNING id
+)
+SELECT ...
+```
+
+The entire debit + credit + transfer-record write is atomic and completes in **two round trips** (BEGIN + CTE, COMMIT). If `available_balance < amount`, the `debit` CTE returns zero rows, the `ins` CTE skips the insert, and the code throws `ConflictError('insufficient funds')` — no partial state is committed.
+
+### Cross-Shard Transfer: Saga Pattern
+
+Distributed transactions across two PostgreSQL instances cannot use a single ACID transaction. The system implements a three-step Saga with compensating transactions:
+
+**Step 1 — RESERVE (fromShard):** Atomically deducts `available_balance` and increments `reserved_balance` by the transfer amount. A `transfers` record with `status = 'RESERVED'` and a `saga_log` entry with `step = 'RESERVED'` are written in the same transaction. If this step fails, no money has moved and the operation is a clean no-op.
+
+**Step 2 — CREDIT (toShard):** Credits `balance` and `available_balance` on the destination account. A `saga_credits` record (with a unique index on `transfer_id`) is written in the same transaction, providing idempotency — if Step 2 is retried, the `ON CONFLICT DO NOTHING` prevents a double credit.
+
+**Step 3 — FINALIZE (fromShard):** Deducts `reserved_balance` and `balance` to complete the bookkeeping. Updates `transfers.status = 'COMPLETED'` and `saga_log.step = 'COMPLETED'`.
+
+### Double-Spend Prevention
+
+The `accounts` table enforces a DB-level `CHECK` constraint:
+
+```sql
+CONSTRAINT chk_balance_invariant CHECK (balance = available_balance + reserved_balance)
+```
+
+This constraint is enforced by PostgreSQL on every write, making it physically impossible for the three balance columns to diverge — even if application-level logic has a bug. Any UPDATE that violates this invariant is rejected with a constraint violation error.
+
+For same-shard transfers, the `WHERE available_balance >= $1` predicate in the CTE ensures the debit only proceeds if funds are present. For cross-shard transfers, the same predicate is applied during the RESERVE step — once reserved, the funds are frozen and cannot be spent by a concurrent transfer.
+
+### Redis Queue: Serialising Per-Account Writes
+
+Cross-shard transfers are enqueued to a **per-fromId Redis list** (`transfer:queue:{fromId}`) before being processed by a queue worker. This design serialises all outbound transfers from a single account, eliminating the possibility of two concurrent cross-shard transfers from the same account racing against each other's RESERVE step.
+
+Each `fromId` queue has a configurable `rejectThreshold` (default 240) and `maxQueueLength` (default 300). Requests beyond the threshold receive a `429 TooManyRequests` immediately, providing back-pressure and protecting downstream DB capacity.
+
+A `transfer:ready` list acts as a dispatch queue — when a per-fromId queue becomes non-empty, the fromId is pushed there for the blocking worker loop (`BLPOP`) to pick up, enabling event-driven processing without polling.
+
+### Failure Recovery
+
+If Step 2 fails (e.g. destination account not found), the system calls `_compensateReserved`: it restores `available_balance` and decrements `reserved_balance` in a new transaction, then marks the transfer `FAILED`. A guard `AND reserved_balance >= $1` prevents a compensation from driving `reserved_balance` negative.
+
+If Step 3 fails (e.g. a transient DB error after the credit has already committed), the transfer is marked `PENDING_FINALIZE` and the saga_log remains at `step = 'CREDITED'`. A background Recovery Worker periodically scans `saga_log` for non-terminal states and re-drives them to completion, ensuring eventual consistency even across process restarts.
+
+The `saga_compensations` table records completed compensation operations with a unique index on `transfer_id`, making compensation itself idempotent against retries.
+
+### Balance Conservation Verification
+
+The benchmark suite verifies global balance conservation by summing all `balance` columns across all four shards before and after the test run. The target is `diff = 0` — no money created or destroyed. The best recorded result: **9,377 RPS, 0% failure rate, balance conservation diff = +0**.
