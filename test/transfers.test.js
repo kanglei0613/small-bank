@@ -22,7 +22,8 @@
  * See .github/workflows/ci.yml for the full matrix.
  */
 
-const { app, before, after } = require('egg-mock/bootstrap');
+const { app } = require('egg-mock/bootstrap');
+// before / after 是 Mocha 全域函式，不需要從 egg-mock/bootstrap 解構
 const assert = require('assert');
 
 // ---------------------------------------------------------------------------
