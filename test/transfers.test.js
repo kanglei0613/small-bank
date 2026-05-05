@@ -117,11 +117,11 @@ after(async () => {
   // If no DELETE route exists, the test DB is wiped by CI between runs anyway.
   // For local runs, this attempts a best-effort cleanup via raw service calls.
   try {
-    const { app: eggApp } = require('egg-mock/bootstrap');
-    // If there's a cleanup helper or migration reset, call it here.
-    // Otherwise just log — the accounts are harmless.
     console.log('[teardown] test accounts left in DB:', testAccountIds);
-  } catch (_) {}
+  } catch (err) {
+    // best-effort cleanup; CI wipes the DB between runs anyway
+    console.warn('[teardown] cleanup warning:', err && err.message);
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -311,8 +311,7 @@ describe('POST /transfers', () => {
       const poorAccountId = poorRes.body.data.id;
 
       // Find a valid destination on same shard
-      const destShardId = poorAccountId % 4;
-      // Pick a destination that is on the same shard
+      // Pick a destination that is on the same shard (accountId % 4 == poorAccountId % 4)
       const destId = poorAccountId + 4; // same shard offset
 
       // Ensure destination exists by creating it too

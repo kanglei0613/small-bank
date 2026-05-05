@@ -30,7 +30,8 @@ const path = require('path');
 const fs = require('fs');
 
 function setupSwagger(app) {
-  let swaggerUi, YAML;
+  let swaggerUi;
+  let YAML;
 
   try {
     swaggerUi = require('swagger-ui-express');
