@@ -4,6 +4,11 @@
   "rules": {
     "linebreak-style": "off",
     "valid-jsdoc": "off",
-    "require-jsdoc": "off"
+    "require-jsdoc": "off",
+    "quotes": "off",
+    "key-spacing": "off",
+    "no-multi-spaces": "off",
+    "arrow-parens": "off",
+    "no-loop-func": "off"
   }
 }
