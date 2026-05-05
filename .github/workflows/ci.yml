@@ -12,11 +12,10 @@ jobs:
     runs-on: ubuntu-latest
 
     # ── Service containers ─────────────────────────────────────────────────
-    # Each PostgreSQL service uses the same image and credentials as
-    # config/config.default.js reads from env vars.
-    # Redis uses its default port with no auth (matches config defaults).
+    # 使用單一 PostgreSQL 容器，在啟動後建立全部 5 個 DB。
+    # 這樣所有連線都用 localhost:5432，不需要 per-shard port 設定。
     services:
-      postgres-meta:
+      postgres:
         image: postgres:17
         env:
           POSTGRES_USER: ci_user
@@ -26,62 +25,6 @@ jobs:
           - 5432:5432
         options: >-
           --health-cmd "pg_isready -U ci_user -d small_bank_meta"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-
-      postgres-s0:
-        image: postgres:17
-        env:
-          POSTGRES_USER: ci_user
-          POSTGRES_PASSWORD: ci_pass
-          POSTGRES_DB: small_bank_s0
-        ports:
-          - 5433:5432
-        options: >-
-          --health-cmd "pg_isready -U ci_user -d small_bank_s0"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-
-      postgres-s1:
-        image: postgres:17
-        env:
-          POSTGRES_USER: ci_user
-          POSTGRES_PASSWORD: ci_pass
-          POSTGRES_DB: small_bank_s1
-        ports:
-          - 5434:5432
-        options: >-
-          --health-cmd "pg_isready -U ci_user -d small_bank_s1"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-
-      postgres-s2:
-        image: postgres:17
-        env:
-          POSTGRES_USER: ci_user
-          POSTGRES_PASSWORD: ci_pass
-          POSTGRES_DB: small_bank_s2
-        ports:
-          - 5435:5432
-        options: >-
-          --health-cmd "pg_isready -U ci_user -d small_bank_s2"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-
-      postgres-s3:
-        image: postgres:17
-        env:
-          POSTGRES_USER: ci_user
-          POSTGRES_PASSWORD: ci_pass
-          POSTGRES_DB: small_bank_s3
-        ports:
-          - 5436:5432
-        options: >-
-          --health-cmd "pg_isready -U ci_user -d small_bank_s3"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
@@ -97,40 +40,29 @@ jobs:
           --health-retries 10
 
     # ── Environment variables ──────────────────────────────────────────────
-    # Mirrors what config/config.default.js reads.
-    # Each shard maps to a different host port on the CI runner (localhost).
     env:
       NODE_ENV: test
 
-      # Database credentials
       PG_USER: ci_user
       PG_PASSWORD: ci_pass
-      PG_PORT: 5432
+      PG_PORT: "5432"
 
-      # Meta DB
       PG_META_HOST: localhost
-      # Override port via PG_META_PORT if your config supports it;
-      # otherwise meta DB shares port 5432 (first postgres container).
-
-      # Shards — each maps to a different host port
       PG_SHARD_0_HOST: localhost
       PG_SHARD_1_HOST: localhost
       PG_SHARD_2_HOST: localhost
       PG_SHARD_3_HOST: localhost
 
-      # Pool sizes (keep small in CI)
-      PG_META_POOL_MAX: 2
-      PG_SHARD_POOL_MAX: 3
+      PG_META_POOL_MAX: "2"
+      PG_SHARD_POOL_MAX: "3"
 
-      # Redis
       REDIS_HOST: localhost
-      REDIS_PORT: 6379
+      REDIS_PORT: "6379"
       REDIS_PASSWORD: ""
 
-      # App
       APP_API_ROLE: all
-      APP_PORT: 7001
-      APP_WORKERS: 1
+      APP_PORT: "7001"
+      APP_WORKERS: "1"
 
     steps:
       # ── Checkout ──────────────────────────────────────────────────────────
@@ -148,9 +80,22 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # ── Create shard databases ─────────────────────────────────────────────
+      # POSTGRES_DB 只建立 small_bank_meta，shard DB 要另外建立
+      - name: Create shard databases
+        env:
+          PGPASSWORD: ci_pass
+        run: |
+          psql -h localhost -p 5432 -U ci_user -d postgres \
+            -c "CREATE DATABASE small_bank_s0;"
+          psql -h localhost -p 5432 -U ci_user -d postgres \
+            -c "CREATE DATABASE small_bank_s1;"
+          psql -h localhost -p 5432 -U ci_user -d postgres \
+            -c "CREATE DATABASE small_bank_s2;"
+          psql -h localhost -p 5432 -U ci_user -d postgres \
+            -c "CREATE DATABASE small_bank_s3;"
+
       # ── Apply DB schemas ──────────────────────────────────────────────────
-      # Each container starts empty; we run the init SQL files here
-      # (same files used by docker/initdb-* for the local stack).
       - name: Apply meta schema
         env:
           PGPASSWORD: ci_pass
@@ -162,55 +107,18 @@ jobs:
         env:
           PGPASSWORD: ci_pass
         run: |
-          psql -h localhost -p 5433 -U ci_user -d small_bank_s0 \
+          psql -h localhost -p 5432 -U ci_user -d small_bank_s0 \
             -f docker/initdb-shard/01-schema_shard.sql
-          psql -h localhost -p 5434 -U ci_user -d small_bank_s1 \
+          psql -h localhost -p 5432 -U ci_user -d small_bank_s1 \
             -f docker/initdb-shard/01-schema_shard.sql
-          psql -h localhost -p 5435 -U ci_user -d small_bank_s2 \
+          psql -h localhost -p 5432 -U ci_user -d small_bank_s2 \
             -f docker/initdb-shard/01-schema_shard.sql
-          psql -h localhost -p 5436 -U ci_user -d small_bank_s3 \
+          psql -h localhost -p 5432 -U ci_user -d small_bank_s3 \
             -f docker/initdb-shard/01-schema_shard.sql
-
-      # ── Override shard ports for test runner ──────────────────────────────
-      # config.default.js reads PG_SHARD_{N}_HOST but not individual ports.
-      # Since all shards share localhost but on different ports, we patch
-      # the connection via a config.test.js override file if it exists,
-      # or rely on PG_PORT being shard-specific.
-      #
-      # Recommended: add config/config.test.js with per-shard port overrides.
-      # The CI step below generates it dynamically so the repo stays clean.
-      - name: Generate config/config.test.js for CI shard ports
-        run: |
-          cat > config/config.test.js << 'EOF'
-          'use strict';
-          // Generated by CI — overrides per-shard ports for local port mapping
-          module.exports = () => {
-            const config = {};
-            const base = {
-              user:                    process.env.PG_USER,
-              password:                process.env.PG_PASSWORD,
-              max:                     3,
-              idleTimeoutMillis:       10000,
-              connectionTimeoutMillis: 5000,
-              statement_timeout:       5000,
-            };
-            config.pgMeta = Object.assign({}, base, {
-              host: 'localhost', port: 5432, database: 'small_bank_meta',
-            });
-            config.pgShards = {
-              0: Object.assign({}, base, { host: 'localhost', port: 5433, database: 'small_bank_s0' }),
-              1: Object.assign({}, base, { host: 'localhost', port: 5434, database: 'small_bank_s1' }),
-              2: Object.assign({}, base, { host: 'localhost', port: 5435, database: 'small_bank_s2' }),
-              3: Object.assign({}, base, { host: 'localhost', port: 5436, database: 'small_bank_s3' }),
-            };
-            return config;
-          };
-          EOF
 
       # ── Lint ──────────────────────────────────────────────────────────────
       - name: Lint
         run: npm run lint
-        continue-on-error: false
 
       # ── Test ──────────────────────────────────────────────────────────────
       - name: Test
@@ -220,6 +128,7 @@ jobs:
       # ── Upload test results (optional) ────────────────────────────────────
       - name: Upload test logs on failure
         if: failure()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: test-logs
