@@ -64,12 +64,47 @@ const QUEUE_DRAIN_TIMEOUT = parseInt(args['queue-drain-timeout'] || '120');
 const REDIS_URL          = args['redis-url'] || '127.0.0.1';
 const REDIS_PORT         = parseInt(args['redis-port'] || '6379');
 const SKIP_BALANCE_CHECK = 'skip-balance-check' in args;
+const USE_DOCKER         = !!args['docker'];
 
 // PG shard 設定（用於全量餘額查詢）
 const PG_SHARDS = (args['pg-shards'] || 'small_bank_s0,small_bank_s1,small_bank_s2,small_bank_s3').split(',');
 const PG_HOST   = args['pg-host'] || '127.0.0.1';
 const PG_PORT   = parseInt(args['pg-port'] || '5432');
-const PG_USER   = args['pg-user'] || process.env.USER || 'postgres';
+const PG_USER   = args['pg-user'] || process.env.PG_USER || 'kanglei0613';
+
+// Docker 容器名稱對照（--docker 模式）
+const DOCKER_PG_CONTAINERS = {
+  small_bank_s0:   'small-bank-postgres-s0-1',
+  small_bank_s1:   'small-bank-postgres-s1-1',
+  small_bank_s2:   'small-bank-postgres-s2-1',
+  small_bank_s3:   'small-bank-postgres-s3-1',
+  small_bank_meta: 'small-bank-postgres-meta-1',
+};
+
+// spawnSync 版本，避免 Windows cmd.exe 的 shell 解析問題
+// 自動偵測環境：優先嘗試 docker exec；若 docker 不存在則退回直連 psql
+function runPsqlQuery(dbName, sql, timeout = 15000) {
+  const { spawnSync } = require('child_process');
+  const container = DOCKER_PG_CONTAINERS[dbName] || `small-bank-postgres-${dbName}-1`;
+
+  // 永遠先嘗試 docker exec（不依賴 USE_DOCKER flag 是否正確解析）
+  let result = spawnSync(
+    'docker', [ 'exec', container, 'psql', '-U', PG_USER, '-d', dbName, '-t', '-A', '-c', sql ],
+    { timeout, encoding: 'utf8' }
+  );
+
+  // 只有在 docker 指令本身找不到（ENOENT）時才退回直連 psql
+  if (result.error && result.error.code === 'ENOENT') {
+    result = spawnSync(
+      'psql', [ '-h', PG_HOST, '-p', String(PG_PORT), '-U', PG_USER, '-d', dbName, '-t', '-A', '-c', sql ],
+      { timeout, encoding: 'utf8' }
+    );
+  }
+
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw new Error(result.stderr || `psql exited ${result.status}`);
+  return result.stdout.trim();
+}
 
 // 讀取 seed 設定檔
 let seedConfig = {};
@@ -162,12 +197,10 @@ function printStats(s) {
  * 只計算 seed 範圍內的帳號（MIN_ID ~ MAX_ID），排除壓測期間 postAccount 新建的
  */
 function queryShardBalance(dbName, retries = 5) {
-  const { execSync } = require('child_process');
   for (let i = 0; i < retries; i++) {
     try {
       const sql = `SELECT COALESCE(SUM(balance), 0) AS total, COALESCE(SUM(reserved_balance), 0) AS reserved FROM accounts WHERE id >= ${MIN_ID} AND id <= ${MAX_ID};`;
-      const cmd = `psql -h ${PG_HOST} -p ${PG_PORT} -U ${PG_USER} -d ${dbName} -t -A -c "${sql}"`;
-      const output = execSync(cmd, { timeout: 15000 }).toString().trim();
+      const output = runPsqlQuery(dbName, sql, 15000);
       const parts = output.split('|');
       return {
         balance:  BigInt(parts[0] || '0'),
@@ -175,11 +208,11 @@ function queryShardBalance(dbName, retries = 5) {
       };
     } catch (e) {
       const msg = e.message || '';
+      console.error(`\n  [queryShardBalance:${dbName}] retry ${i + 1}/${retries} error: ${msg}`);
       if (msg.includes('too many clients') && i < retries - 1) {
-        // 等待連線釋放後重試
+        // 等待連線釋放後重試（用 Atomics.wait 跨平台 sleep）
         const waitMs = (i + 1) * 3000;
-        const { execSync: execSyncWait } = require('child_process');
-        try { execSyncWait(`sleep ${waitMs / 1000}`); } catch (_) {}
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, waitMs);
         continue;
       }
       return null;
@@ -192,13 +225,11 @@ function queryShardBalance(dbName, retries = 5) {
  * 用 psql 查詢 MIN_ID ~ MAX_ID 範圍內的實際帳號數（跨所有 shard 加總）
  */
 function queryTotalAccountCount() {
-  const { execSync } = require('child_process');
   let total = 0n;
   for (const db of PG_SHARDS) {
     try {
       const sql = `SELECT COUNT(*) FROM accounts WHERE id >= ${MIN_ID} AND id <= ${MAX_ID};`;
-      const cmd = `psql -h ${PG_HOST} -p ${PG_PORT} -U ${PG_USER} -d ${db} -t -A -c "${sql}"`;
-      const output = execSync(cmd, { timeout: 15000 }).toString().trim();
+      const output = runPsqlQuery(db, sql, 15000);
       total += BigInt(output || '0');
     } catch (_) {}
   }
@@ -210,34 +241,18 @@ function queryTotalAccountCount() {
  * 預期總額 = 實際帳號數（MIN_ID ~ MAX_ID）× INIT_BAL
  */
 async function checkFullBalanceConsistency() {
+  // 固定等待 30 秒讓 app pool 連線自然釋放，不依賴 psql 或本機工具
+  const CONN_WAIT = parseInt(args['conn-wait'] || '30');
+  process.stdout.write(`  等待連線釋放（${CONN_WAIT}s）...`);
+  for (let i = CONN_WAIT; i > 0; i--) {
+    await new Promise(r => setTimeout(r, 1000));
+    if (i % 5 === 0) process.stdout.write(` ${i}s`);
+  }
+  console.log(' 完成');
+
+  // 查詢實際帳號數（等連線釋放後再查，確保不被 max_connections 擋住）
   const actualAccountCount = queryTotalAccountCount();
   const expectedTotal = actualAccountCount * BigInt(seedConfig.initBal || INIT_BAL);
-
-  // 等待 PG 連線數降到安全範圍
-  const PG_CONN_THRESHOLD = parseInt(args['pg-conn-threshold'] || '50');
-  const PG_CONN_TIMEOUT   = parseInt(args['pg-conn-wait-timeout'] || '120');
-  const pgConnStart = Date.now();
-
-  process.stdout.write('  等待 PG 連線釋放...');
-  while (true) {
-    try {
-      const { execSync } = require('child_process');
-      const connCount = execSync(
-        `psql -h ${PG_HOST} -p ${PG_PORT} -U ${PG_USER} -d ${PG_SHARDS[0]} -t -A -c "SELECT count(*) FROM pg_stat_activity WHERE state IS NOT NULL;"`,
-        { timeout: 5000 }
-      ).toString().trim();
-      const count = parseInt(connCount || '999');
-      if (count < PG_CONN_THRESHOLD) {
-        console.log(` 完成（${count} 條）`);
-        break;
-      }
-    } catch (_) {}
-    if (Date.now() - pgConnStart > PG_CONN_TIMEOUT * 1000) {
-      console.log(' 逾時，強制查詢');
-      break;
-    }
-    await new Promise(r => setTimeout(r, 3000));
-  }
 
   let totalBalance  = 0n;
   let totalReserved = 0n;
