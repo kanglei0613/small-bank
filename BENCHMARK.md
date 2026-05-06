@@ -322,3 +322,71 @@ pgBouncer 的 transaction mode 不支援 `SET LOCAL`，而系統中所有轉帳 
 ### ❌ 調整壓測請求比例（降低寫入操作比例）
 
 降低 `POST /users`、`POST /accounts` 的比例可以拉高 RPS 數字，但這屬於「投機取巧」——壓測的目的是模擬真實負載，人為調整比例只會讓數字好看但無法反映真實效能，因此維持原始比例。
+
+---
+
+## Docker 環境壓測（2026-05）
+
+完成 Docker Compose 容器化部署後，以相同壓測腳本在 Docker 環境重新測試。
+
+### Docker 測試環境
+
+| 項目 | 規格 |
+|------|------|
+| 部署方式 | Docker Compose（docker-compose up）|
+| 作業系統 | Windows 11 + Docker Desktop（WSL2 backend）|
+| Node.js | 20 LTS（node:20-bookworm-slim）|
+| PostgreSQL | 17（postgres:17，5 個獨立容器）|
+| Redis | 7 Alpine（redis:7-alpine）|
+| app-general workers | 3（APP_WORKERS=3）|
+| app-transfer workers | 1（APP_WORKERS=1）|
+| queue-worker 並發數 | 8（QUEUE_CONCURRENCY=8）|
+
+### 壓測指令
+
+```bash
+# 確認 stack 全部 healthy 後建立測試資料
+node scripts/benchmark/seed.js --concurrency=3
+
+# 執行壓測（參數與 WSL 版本相同）
+node scripts/benchmark/mixed_rps_autocannon.js \
+  --connections=200 \
+  --duration=30 \
+  --min-id=1 \
+  --max-id=50000 \
+  --init-bal=1000000 \
+  --queue-drain-timeout=120
+```
+
+### 壓測結果
+
+```
+總 RPS (avg)        : 10,886
+p95 latency         : 32ms
+p99 latency         : 43ms
+
+General API
+  RPS               : 7,826
+  avg latency       : 9.18ms
+  成功率            : 100.00%（11 筆 4xx 業務拒絕，非伺服器錯誤）
+
+Transfer API
+  RPS               : 3,060
+  成功率            : 100%（91,805 / 91,805）
+  連線錯誤          : 0
+
+餘額守恆
+  diff              : +0 ✅
+```
+
+### 與 WSL 原生環境對比
+
+| 指標 | WSL 原生 | Docker | 變化 |
+|------|---------|--------|------|
+| 總 RPS | 9,377 | **10,886** | +16% |
+| General RPS | 4,298 | 7,826 | +82% |
+| Transfer RPS | 5,079 | 3,060 | -40% |
+| p99 latency | 181ms | **43ms** | -76% |
+| Transfer 失敗率 | 0% | 0% | — |
+
+> **說明**：General RPS 大幅提升主因是 Docker 版的 app-general 設定了 3 workers，且 Docker 內部 bridge network 容器間通訊延遲極低。Transfer RPS 相對下降是因為整體負載分配調整，Transfer API 本身仍保持 0% 失敗率，系統正確性完全不受影響。p99 從 181ms 降至 43ms，代表尾端延遲大幅改善。
