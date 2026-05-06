@@ -26,6 +26,7 @@
 x-pg-common: &pg-common
   image: postgres:17
   restart: unless-stopped
+  command: postgres -c max_connections=500
 
 x-pg-env: &pg-env
   POSTGRES_USER: kanglei0613
