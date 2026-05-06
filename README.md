@@ -63,6 +63,7 @@
 - [跨 Shard 轉帳：Saga Pattern](#跨-shard-轉帳saga-pattern)
 - [API 說明](#api-說明)
 - [快速啟動](#快速啟動)
+- [即時監控 Dashboard](#即時監控-dashboard)
 - [壓測](#壓測)
 - [已知限制](#已知限制)
 
@@ -345,6 +346,27 @@ bash scripts/run/wsl_stack.sh stop
 # 清空資料庫 + Redis
 bash scripts/run/wsl_stack.sh clean
 ```
+
+---
+
+## 即時監控 Dashboard
+
+`monitor.html` 是一個單頁監控介面，直接在瀏覽器開啟即可使用，不需要額外安裝任何工具。
+
+每秒 poll `GET /queue/global-stats`，即時顯示：
+
+- Queue 中的待處理任務總數，以及每秒積壓 / 消化的方向（▲ / ▼）
+- 活躍帳戶佇列數與 Hot Account 數量
+- Top 15 熱門帳戶排行，含視覺化 queue 深度 bar（綠 → 黃 → 紅）
+
+### 使用方式
+
+```bash
+# Docker 啟動後，直接在 Mac 開啟
+open monitor.html
+```
+
+壓測跑起來的同時開著 dashboard，可以觀察哪些帳戶在高負載下成為 hot account，queue 深度如何隨流量波動，以及 worker 的消化速度。
 
 ---
 
