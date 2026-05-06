@@ -34,7 +34,19 @@ const INIT_BAL          = parseInt(args['init-bal']          || '1000000');
 const CONCURRENCY       = parseInt(args['concurrency']       || '50');
 const GENERAL_URL       = args['general-url']                || 'http://127.0.0.1:7001';
 const SKIP_FLUSH        = !!args['skip-flush'];
+const USE_DOCKER        = !!args['docker'];
 const OUTPUT_FILE       = args['output']                     || 'scripts/benchmark/.seed-config.json';
+
+// Docker 容器名稱（docker-compose project 預設為資料夾名稱 small-bank）
+const DOCKER_REDIS_CONTAINER    = 'small-bank-redis-1';
+const DOCKER_PG_META_CONTAINER  = 'small-bank-postgres-meta-1';
+const DOCKER_PG_SHARD_CONTAINERS = {
+  small_bank_s0: 'small-bank-postgres-s0-1',
+  small_bank_s1: 'small-bank-postgres-s1-1',
+  small_bank_s2: 'small-bank-postgres-s2-1',
+  small_bank_s3: 'small-bank-postgres-s3-1',
+};
+const DOCKER_PG_USER = process.env.PG_USER || 'kanglei0613';
 
 const PG_DBS = [
   'small_bank_s0',
@@ -97,21 +109,35 @@ async function main() {
   console.log(`  concurrency    : ${CONCURRENCY}`);
   console.log(`  general url    : ${GENERAL_URL}`);
   console.log(`  skip flush     : ${SKIP_FLUSH}`);
+  console.log(`  docker mode    : ${USE_DOCKER}`);
   console.log('==========================================');
   console.log('');
 
   // Step 1: flush
   if (!SKIP_FLUSH) {
     console.log('[ 1/4 ] 清空 Redis...');
-    execSync('redis-cli FLUSHALL', { stdio: 'pipe' });
+    if (USE_DOCKER) {
+      execSync(`docker exec ${DOCKER_REDIS_CONTAINER} redis-cli FLUSHALL`, { stdio: 'pipe' });
+    } else {
+      execSync('redis-cli FLUSHALL', { stdio: 'pipe' });
+    }
     console.log('        Redis 清空完成');
 
     console.log('[ 2/4 ] 清空資料庫...');
-    for (const db of PG_DBS) {
-      execSync(`psql -d ${db} -c "TRUNCATE accounts, transfers RESTART IDENTITY CASCADE;" 2>/dev/null || true`, { stdio: 'pipe' });
+    if (USE_DOCKER) {
+      for (const db of PG_DBS) {
+        const container = DOCKER_PG_SHARD_CONTAINERS[db];
+        execSync(`docker exec ${container} psql -U ${DOCKER_PG_USER} -d ${db} -c "TRUNCATE accounts, transfers RESTART IDENTITY CASCADE;"`, { stdio: 'pipe' });
+      }
+      execSync(`docker exec ${DOCKER_PG_META_CONTAINER} psql -U ${DOCKER_PG_USER} -d ${META_DB} -c "TRUNCATE account_shards, users RESTART IDENTITY CASCADE;"`, { stdio: 'pipe' });
+      execSync(`docker exec ${DOCKER_PG_META_CONTAINER} psql -U ${DOCKER_PG_USER} -d ${META_DB} -c "ALTER SEQUENCE global_account_id_seq RESTART WITH 1;"`, { stdio: 'pipe' });
+    } else {
+      for (const db of PG_DBS) {
+        execSync(`psql -d ${db} -c "TRUNCATE accounts, transfers RESTART IDENTITY CASCADE;" 2>/dev/null || true`, { stdio: 'pipe' });
+      }
+      execSync(`psql -d ${META_DB} -c "TRUNCATE account_shards, users RESTART IDENTITY CASCADE;" 2>/dev/null || true`, { stdio: 'pipe' });
+      execSync(`psql -d ${META_DB} -c "ALTER SEQUENCE global_account_id_seq RESTART WITH 1;" 2>/dev/null || true`, { stdio: 'pipe' });
     }
-    execSync(`psql -d ${META_DB} -c "TRUNCATE account_shards, users RESTART IDENTITY CASCADE;" 2>/dev/null || true`, { stdio: 'pipe' });
-    execSync(`psql -d ${META_DB} -c "ALTER SEQUENCE global_account_id_seq RESTART WITH 1;" 2>/dev/null || true`, { stdio: 'pipe' });
     console.log('        資料庫清空完成');
   } else {
     console.log('[ 1/4 ] 跳過清空 Redis');
@@ -172,12 +198,6 @@ async function main() {
   console.log(`  總 accounts : ${accountIds.length}`);
   console.log(`  account ID  : ${minId} ~ ${maxId}`);
   console.log(`  user ID     : ${minUserId} ~ ${maxUserId}`);
-  console.log('');
-  console.log('  壓測指令：');
-  console.log(`  node scripts/benchmark/mixed_rps_autocannon.js \\`);
-  console.log(`    --min-id=${minId} --max-id=${maxId} \\`);
-  console.log(`    --min-user-id=${minUserId} --max-user-id=${maxUserId} \\`);
-  console.log(`    --init-bal=${INIT_BAL}`);
   console.log('==========================================');
 
   // 輸出到檔案
