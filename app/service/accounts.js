@@ -1,5 +1,21 @@
 'use strict';
 
+/**
+ * @file app/service/accounts.js
+ *
+ * 帳號業務邏輯層（AccountsService）
+ *
+ * 職責：
+ * - 開戶：驗證 userId、initialBalance，確認 user 存在後呼叫 Repo 寫入 DB
+ * - 存款 / 提款：驗證參數後呼叫 Repo，完成後刪除 Redis Cache（避免髒讀）
+ * - 餘額查詢：優先讀 Redis Cache；Cache miss 才查 DB 並回填 Cache
+ * - Cache 失效：刪除指定 accountId 的 Redis key，讓下次查詢重新從 DB 載入
+ *
+ * Redis Cache 策略：
+ * - TTL 30 秒，由 cache.accountTTL() 統一控管
+ * - Redis 故障時靜默降級，不中斷 API 回應（只打 log）
+ */
+
 const Service = require('egg').Service;
 const AccountsRepo = require('../repository/accountsRepo');
 const UsersRepo = require('../repository/usersRepo');

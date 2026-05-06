@@ -1,5 +1,21 @@
 'use strict';
 
+/**
+ * @file app/service/transferJobs.js
+ *
+ * Transfer Job 查詢與 SSE 串流層（TransferJobsService）
+ *
+ * 職責：
+ * - getJobById：從 Redis 查詢 transfer job 狀態，直接回傳 JSON
+ * - streamJobById：若 job 已完成直接回傳；否則建立 SSE 連線，透過 Redis Pub/Sub
+ *   等待 queue worker 的完成通知後即時推送給前端並關閉連線
+ *
+ * SSE 設計重點：
+ * - 每個請求建立獨立的 ioredis subscriber，避免共用 app.redisSub 造成 unsubscribe 競態
+ * - 訂閱後需再查一次 job 狀態，防止訂閱前 job 已完成導致漏掉通知
+ * - 30 秒 timeout 防止連線永久佔用；前端斷線時 cleanup 立即釋放資源
+ */
+
 const Redis = require('ioredis'); // 引入 Redis 套件
 const { PassThrough } = require('stream'); // 引用串流套件以實作 SSE
 const Service = require('egg').Service; // 繼承 Egg.js 的 service 資料

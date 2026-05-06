@@ -1,5 +1,22 @@
 'use strict';
 
+/**
+ * @file app/lib/queue/transfer_job_store.js
+ *
+ * Transfer Job 狀態存取層（transfer_job_store）
+ *
+ * 職責：
+ * - createJob：建立新 job（status: queued），直接寫入 Redis
+ * - getJob：依 jobId 從 Redis 讀取 job 詳情
+ * - markSuccess：job 完成時覆蓋寫入最終結果，並透過 Redis Pub/Sub 通知 SSE
+ * - markFailed：job 失敗時覆蓋寫入錯誤資訊，並透過 Redis Pub/Sub 通知 SSE
+ *
+ * 設計原則：
+ * - markSuccess / markFailed 直接覆蓋寫入，避免先 GET 再 SET 的額外 round trip
+ * - 使用 pipeline 將 SET + PUBLISH 合成一次操作，減少網路延遲
+ * - Job TTL 預設 24 小時，到期後自動清除
+ */
+
 // Transfer Job Store
 //
 // 作用：

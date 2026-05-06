@@ -1,5 +1,28 @@
 'use strict';
 
+/**
+ * @file app/lib/queue/redis_transfer_queue.js
+ *
+ * Redis 轉帳佇列核心模組
+ *
+ * 架構說明：
+ * - 每個 fromId 擁有獨立的 List queue（transfer:queue:from:{fromId}）
+ * - 全域 ready queue（transfer:queue:ready:fromIds）記錄哪些 fromId 有待處理工作
+ * - owner lock（transfer:queue:owner:from:{fromId}）確保同一 fromId 同時只有一個 worker 處理
+ *
+ * 流量控制：
+ * - rejectThreshold：超過此長度直接拒絕（429）
+ * - maxQueueLength：超過此長度也拒絕（soft cap）
+ *
+ * 關鍵函數：
+ * - pushJob：Lua 腳本原子化 長度檢查 + RPUSH + ready queue 通知
+ * - popJobs：Lua 腳本原子化批次 LRANGE + LTRIM
+ * - tryAcquireOwner / refreshOwner / releaseOwner：owner lock 生命週期管理
+ * - startOwnerHeartbeat：背景 TTL 刷新，防止 lock 在長 drain 中過期
+ * - drainQueue：主要 drain 邏輯，含 heartbeat、批次處理、drain 後重入信號
+ * - tryStartDrain：嘗試取得 lock 並啟動 drain（已有 owner 則直接 return false）
+ */
+
 const { TooManyRequestsError } = require('../errors');
 
 // Key builders

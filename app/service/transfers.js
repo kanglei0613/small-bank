@@ -1,5 +1,22 @@
 'use strict';
 
+/**
+ * @file app/service/transfers.js
+ *
+ * 轉帳業務邏輯層（TransferService）
+ *
+ * 職責：
+ * - submitTransfer：判斷 fromShard === toShard，決定走同步 CTE 或非同步 queue
+ * - _enqueueTransfer：建立 jobId，寫入 transferJobStore（Redis），再 push 進 per-fromId queue
+ * - processJob：執行單筆 transfer job，成功 / 失敗後更新 Redis job 狀態並 publish 通知 SSE
+ * - tryDrainOneFromIdQueue：嘗試取得 owner lock 並 drain 一個 fromId 的 queue
+ * - startQueueWorker：（Egg scheduler 用）啟動無限 BRPOP 迴圈，持續消費 ready queue
+ *
+ * 路由決策：
+ * - fromId % shardCount === toId % shardCount → 同 shard，直接用 CTE 同步完成
+ * - 否則 → 跨 shard，入 Redis queue，由 queue worker 以 Saga 非同步執行
+ */
+
 const Redis = require('ioredis');
 const Service = require('egg').Service;
 const TransfersRepo = require('../repository/transfersRepo');
@@ -8,10 +25,18 @@ const transferJobStore = require('../lib/queue/transfer_job_store');
 const { BadRequestError } = require('../lib/errors');
 const { logger } = require('../lib/logger');
 
+/**
+ * 產生唯一的 jobId：timestamp + 隨機字串，保證在同一毫秒內不重複
+ * @returns {string}
+ */
 function buildJobId() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+/**
+ * 驗證轉帳輸入參數，不合法時拋出 BadRequestError
+ * @param {{ fromId: number, toId: number, amount: number }} params
+ */
 function validateTransferInput({ fromId, toId, amount }) {
   if (!Number.isInteger(fromId) || fromId <= 0) {
     throw new BadRequestError('fromId must be a positive integer');

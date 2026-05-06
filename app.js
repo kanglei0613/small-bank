@@ -1,5 +1,23 @@
 'use strict';
 
+/**
+ * @file app.js
+ *
+ * Egg.js App 啟動設定（app lifecycle hook）
+ *
+ * 職責：
+ * 1. 建立 meta DB（metaPg）與各 shard DB（shardPgMap）的 PostgreSQL connection pool
+ * 2. 建立 Redis 直連（redisDb）：供 enqueueTransfer、createJob、pushJob 等低延遲操作使用
+ *    （繞過 egg cluster-client IPC 延遲）
+ * 3. 若 APP_ROLE=api，建立 Redis subscriber（redisSub）供 SSE Pub/Sub 使用
+ * 4. beforeStart：驗證 meta DB + 所有 shard DB 連線是否正常
+ * 5. 若 APP_ROLE=queue，啟動多個背景 queue worker（QUEUE_CONCURRENCY 個並行 loop）
+ *
+ * APP_ROLE 說明：
+ * - api（預設）：提供 HTTP API，不啟動 queue worker
+ * - queue：啟動 queue worker，背景持續處理 transfer job，不對外提供 HTTP API
+ */
+
 const { Pool } = require('pg');
 const Redis = require('ioredis');
 

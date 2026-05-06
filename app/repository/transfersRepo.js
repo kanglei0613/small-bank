@@ -1,5 +1,24 @@
 'use strict';
 
+/**
+ * @file app/repository/transfersRepo.js
+ *
+ * 轉帳資料存取層（TransfersRepo）
+ *
+ * 職責：
+ * - listByAccountId：查詢帳號的轉帳紀錄（UNION from + to，依 id DESC）
+ * - transfer：依 shardId 決定走 transferSameShard 或 transferCrossShard
+ * - transferSameShard：用單一 CTE 把 debit + credit + INSERT 合成一次 round trip（3 次 vs 原本 5 次）
+ * - transferCrossShard：三步驟 Saga（RESERVE → CREDIT → FINALIZE），各步驟獨立 transaction
+ * - _compensateReserved：Step 2 失敗時還原 fromAccount 的凍結餘額
+ * - _compensateCredited：Step 3 失敗時扣回已入帳的 toAccount 餘額
+ *
+ * 冪等保護：
+ * - saga_credits：ON CONFLICT DO NOTHING 防止 Step 2 重複入帳
+ * - saga_compensations：ON CONFLICT DO NOTHING 防止補償操作重複執行
+ * - 所有 UPDATE 加 guard 條件（reserved_balance >= amount 等），防止重複補償讓欄位變負數
+ */
+
 const baseShardRepo = require('./baseShardRepo');
 const { ConflictError, NotFoundError, InternalError } = require('../lib/errors');
 

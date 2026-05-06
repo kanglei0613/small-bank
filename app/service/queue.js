@@ -1,5 +1,19 @@
 'use strict';
 
+/**
+ * @file app/service/queue.js
+ *
+ * Queue 狀態查詢層（QueueService）
+ *
+ * 職責：
+ * - getQueueStats：查詢單一 fromId 的 queue 長度、owner lock 狀態、ready queue 長度等
+ * - getGlobalStats：SCAN 所有 per-fromId queue key，彙整整體 queue 總量與 hot account 排行
+ *
+ * 注意：
+ * - getGlobalStats 使用 cursor-based SCAN（非阻塞），但在 key 數量極大時仍有延遲
+ * - 此 Service 為唯讀查詢，不寫入任何 Redis 或 DB 狀態
+ */
+
 const Service = require('egg').Service;
 const redisTransferQueue = require('../lib/queue/redis_transfer_queue');
 

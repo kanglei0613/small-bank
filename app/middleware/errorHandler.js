@@ -1,5 +1,19 @@
 'use strict';
 
+/**
+ * @file app/middleware/errorHandler.js
+ *
+ * 全域錯誤處理 Middleware（errorHandler）
+ *
+ * 職責：
+ * - 攔截所有未捕獲的錯誤，依錯誤類型回傳對應的 HTTP status code 與訊息
+ *
+ * 錯誤分類處理邏輯：
+ * 1. DB 連線錯誤（ECONNREFUSED 等 PG error codes）→ 503 service temporarily unavailable
+ * 2. AppError（含 status 欄位）→ 使用 err.status 與 err.message 直接回傳
+ * 3. 其他未知錯誤 → 500 internal server error，並寫入 error log
+ */
+
 const DB_CONNECTION_ERROR_CODES = new Set([
   'ECONNREFUSED',
   '57P01',

@@ -1,5 +1,19 @@
 'use strict';
 
+/**
+ * @file app/controller/accounts.js
+ *
+ * 帳號 HTTP 控制層（AccountsController）
+ *
+ * 路由對應：
+ * - POST /accounts            → create()   開戶
+ * - POST /accounts/:id/deposit → deposit()  存款
+ * - POST /accounts/:id/withdraw → withdraw() 提款
+ * - GET  /accounts/:id        → show()     查詢帳號餘額
+ *
+ * 職責：解析 HTTP 請求參數，呼叫 service 層，回傳標準 JSON 格式（{ ok, data }）
+ */
+
 const Controller = require('egg').Controller;
 
 class AccountsController extends Controller {
