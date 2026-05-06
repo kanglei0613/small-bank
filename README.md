@@ -352,28 +352,26 @@ bash scripts/run/wsl_stack.sh clean
 
 詳細的壓測方法、環境設定、各階段優化過程與結果，請參考 [BENCHMARK.md](./BENCHMARK.md)。
 
-### 快速壓測
+### 快速壓測（Docker）
 
 ```bash
-node scripts/benchmark/mixed_rps_autocannon.js \
-  --connections=200 \
-  --duration=30 \
-  --min-id=1 \
-  --max-id=50000 \
-  --init-bal=1000000 \
-  --queue-drain-timeout=120
+# 建立測試資料
+node scripts/benchmark/seed.js --docker --users=50000 --accounts-per-user=1 --init-bal=1000000
+
+# 執行壓測
+node scripts/benchmark/mixed_rps_autocannon.js --transfer-url=http://127.0.0.1:7010 --general-url=http://127.0.0.1:7001 --duration=30 --conn-wait=30
 ```
 
 ### 目前最佳成績（Docker 環境）
 
 | 指標 | 數值 |
 |------|------|
-| 總 RPS | **10,886** |
-| General API | 7,826 RPS |
-| Transfer API | 3,060 RPS |
-| p95 latency | 32ms |
-| p99 latency | 43ms |
-| Transfer 失敗率 | **0%**（91,805 筆全部成功）|
+| 總 RPS | **12,363** |
+| General API | 9,021 RPS |
+| Transfer API | 3,342 RPS |
+| p95 latency | 38ms |
+| p99 latency | 53ms |
+| 總失敗率 | **0%**（370,851 筆全部成功）|
 | 餘額守恆 | ✅ diff = +0 |
 
 ---
@@ -465,4 +463,4 @@ PostgreSQL 在每次寫入時強制檢查此約束，讓三個餘額欄位在物
 
 ### 餘額守恆驗證
 
-壓測套件透過加總四個 shard 所有帳號的 `balance` 欄位來驗證全域餘額守恆，目標是 `diff = 0`，確保沒有任何金額被憑空創造或消失。Docker 環境最佳紀錄：**10,886 RPS、Transfer API 0% 失敗率、餘額守恆 diff = +0**。
+壓測套件透過加總四個 shard 所有帳號的 `balance` 欄位來驗證全域餘額守恆，目標是 `diff = 0`，確保沒有任何金額被憑空創造或消失。Docker 環境最佳紀錄：**12,363 RPS、全 API 0% 失敗率、餘額守恆 diff = +0**。

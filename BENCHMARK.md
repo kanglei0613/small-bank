@@ -327,7 +327,7 @@ pgBouncer 的 transaction mode 不支援 `SET LOCAL`，而系統中所有轉帳 
 
 ## Docker 環境壓測（2026-05）
 
-完成 Docker Compose 容器化部署後，以相同壓測腳本在 Docker 環境重新測試。
+完成 Docker Compose 容器化部署後，以相同壓測腳本在 Docker 環境重新測試。並在此過程中修復壓測腳本的 Windows 相容性問題，最終達成全自動化驗收流程。
 
 ### Docker 測試環境
 
@@ -336,7 +336,7 @@ pgBouncer 的 transaction mode 不支援 `SET LOCAL`，而系統中所有轉帳 
 | 部署方式 | Docker Compose（docker-compose up）|
 | 作業系統 | Windows 11 + Docker Desktop（WSL2 backend）|
 | Node.js | 20 LTS（node:20-bookworm-slim）|
-| PostgreSQL | 17（postgres:17，5 個獨立容器）|
+| PostgreSQL | 17（postgres:17，5 個獨立容器，`max_connections=500`）|
 | Redis | 7 Alpine（redis:7-alpine）|
 | app-general workers | 3（APP_WORKERS=3）|
 | app-transfer workers | 1（APP_WORKERS=1）|
@@ -345,20 +345,14 @@ pgBouncer 的 transaction mode 不支援 `SET LOCAL`，而系統中所有轉帳 
 ### 壓測指令
 
 ```bash
-# 確認 stack 全部 healthy 後建立測試資料
-node scripts/benchmark/seed.js --concurrency=3
+# 確認 stack 全部 healthy 後建立測試資料（Docker 模式）
+node scripts/benchmark/seed.js --docker --users=50000 --accounts-per-user=1 --init-bal=1000000
 
-# 執行壓測（參數與 WSL 版本相同）
-node scripts/benchmark/mixed_rps_autocannon.js \
-  --connections=200 \
-  --duration=30 \
-  --min-id=1 \
-  --max-id=50000 \
-  --init-bal=1000000 \
-  --queue-drain-timeout=120
+# 執行壓測
+node scripts/benchmark/mixed_rps_autocannon.js --transfer-url=http://127.0.0.1:7010 --general-url=http://127.0.0.1:7001 --duration=30 --conn-wait=30
 ```
 
-### 壓測結果
+### 第一輪：初次 Docker 壓測
 
 ```
 總 RPS (avg)        : 10,886
@@ -368,7 +362,7 @@ p99 latency         : 43ms
 General API
   RPS               : 7,826
   avg latency       : 9.18ms
-  成功率            : 100.00%（11 筆 4xx 業務拒絕，非伺服器錯誤）
+  成功率            : 100.00%
 
 Transfer API
   RPS               : 3,060
@@ -376,17 +370,72 @@ Transfer API
   連線錯誤          : 0
 
 餘額守恆
-  diff              : +0 ✅
+  diff              : +0 ✅（人工執行 docker exec psql 驗證）
+```
+
+> 此輪餘額守恆為人工驗證。自動化查詢因腳本問題尚未完全修復。
+
+---
+
+### Docker 壓測腳本修復記錄
+
+在 Windows 上執行 Docker 壓測時，發現兩項需修復的問題：
+
+**問題一：PostgreSQL `max_connections` 不足**
+
+壓測結束後腳本嘗試連線 PG 進行餘額查詢時，連線數已達上限（預設 100）。
+
+修正：在 `docker-compose.yml` 的 `x-pg-common` anchor 加入 `command: postgres -c max_connections=500`，所有 PG 容器同步生效。
+
+**問題二：`runPsqlQuery` 無法正確呼叫 `docker exec`**
+
+`USE_DOCKER` flag 在特定 Windows 執行路徑下無法正確解析，導致腳本呼叫本機不存在的 `psql`（`spawnSync psql ENOENT`）。
+
+修正：移除 `USE_DOCKER` 依賴，改為自動偵測——優先嘗試 `docker exec`，僅當 docker 指令本身不存在（`ENOENT`）時才退回直連 `psql`。
+
+**問題三：`PG_USER` fallback 拿到 Windows 登入帳號**
+
+`process.env.USER` 在 Windows 不存在，`process.env.USERNAME` 會回傳 Windows 系統帳號（如 "User"），而非 PostgreSQL 使用者 `kanglei0613`。
+
+修正：拿掉平台相關的 env 變數偵測，直接以 `'kanglei0613'` 作為 fallback。
+
+---
+
+### 第二輪：腳本修復後完整自動化驗收
+
+```
+總 RPS (avg)        : 12,363
+加權平均 latency    : 7.68ms
+p95 latency         : 38ms
+p99 latency         : 53ms
+
+General API
+  RPS               : 9,021
+  avg latency       : 7.9ms
+  成功率            : 100.00%（270,619 / 270,619）
+  失敗請求數        : 0
+
+Transfer API
+  RPS               : 3,342
+  avg latency       : 7.01ms
+  成功率            : 100.00%（100,232 / 100,232）
+  失敗請求數        : 0
+
+餘額守恆
+  預期總額          : 50,000,000,000
+  實際總餘額        : 50,000,000,000
+  diff              : +0 ✅（全自動查詢）
 ```
 
 ### 與 WSL 原生環境對比
 
-| 指標 | WSL 原生 | Docker | 變化 |
-|------|---------|--------|------|
-| 總 RPS | 9,377 | **10,886** | +16% |
-| General RPS | 4,298 | 7,826 | +82% |
-| Transfer RPS | 5,079 | 3,060 | -40% |
-| p99 latency | 181ms | **43ms** | -76% |
-| Transfer 失敗率 | 0% | 0% | — |
+| 指標 | WSL 原生 | Docker Round 1 | Docker Round 2 | 變化（vs WSL）|
+|------|---------|----------------|----------------|--------------|
+| 總 RPS | 9,377 | 10,886 | **12,363** | **+32%** |
+| General RPS | 4,298 | 7,826 | 9,021 | +110% |
+| Transfer RPS | 5,079 | 3,060 | 3,342 | -34% |
+| p99 latency | 181ms | 43ms | **53ms** | **-71%** |
+| 總失敗率 | 0% | 0% | **0%** | — |
+| 餘額守恆驗證 | 自動 | 人工 | **全自動** | — |
 
-> **說明**：General RPS 大幅提升主因是 Docker 版的 app-general 設定了 3 workers，且 Docker 內部 bridge network 容器間通訊延遲極低。Transfer RPS 相對下降是因為整體負載分配調整，Transfer API 本身仍保持 0% 失敗率，系統正確性完全不受影響。p99 從 181ms 降至 43ms，代表尾端延遲大幅改善。
+> **說明**：General RPS 大幅提升主因是 Docker bridge network 容器間通訊延遲極低，且 app-general 使用 3 workers。Transfer RPS 相對 WSL 略降是因整體負載分配差異，Transfer API 本身仍維持 0% 失敗率。p99 從 181ms 降至 53ms，尾端延遲大幅改善。Round 2 在 Round 1 基礎上因系統預熱完整，總 RPS 進一步提升至 12,363。
