@@ -5,18 +5,104 @@
  *
  * 轉帳資料存取層（TransfersRepo）
  *
- * 職責：
- * - listByAccountId：查詢帳號的轉帳紀錄（UNION from + to，依 id DESC）
- * - transfer：依 shardId 決定走 transferSameShard 或 transferCrossShard
- * - transferSameShard：用單一 CTE 把 debit + credit + INSERT 合成一次 round trip（3 次 vs 原本 5 次）
- * - transferCrossShard：三步驟 Saga（RESERVE → CREDIT → FINALIZE），各步驟獨立 transaction
- * - _compensateReserved：Step 2 失敗時還原 fromAccount 的凍結餘額
- * - _compensateCredited：Step 3 失敗時扣回已入帳的 toAccount 餘額
+ * ════════════════════════════════════════════════════════════════
+ * 職責與設計摘要
+ * ════════════════════════════════════════════════════════════════
  *
- * 冪等保護：
- * - saga_credits：ON CONFLICT DO NOTHING 防止 Step 2 重複入帳
- * - saga_compensations：ON CONFLICT DO NOTHING 防止補償操作重複執行
- * - 所有 UPDATE 加 guard 條件（reserved_balance >= amount 等），防止重複補償讓欄位變負數
+ * 主要方法：
+ *   listByAccountId   — 查詢帳號轉帳紀錄（UNION from + to，依 id DESC）
+ *   transfer          — 依 shardId 路由到 transferSameShard 或 transferCrossShard
+ *   transferSameShard — 單一 CTE 原子完成 debit + credit + INSERT（3 round trips vs 原本 5）
+ *   transferCrossShard — 三步驟 Saga（RESERVE → CREDIT → FINALIZE），各步驟獨立 transaction
+ *   _compensateReserved — Step 2 失敗時，還原 fromAccount 的 reserved_balance → available_balance
+ *   _compensateCredited — Step 3 失敗時，扣回已入帳的 toAccount balance/available_balance
+ *
+ * 冪等保護機制：
+ *   saga_credits       ON CONFLICT DO NOTHING → 防止 Step 2 重複入帳
+ *   saga_compensations ON CONFLICT DO NOTHING → 防止補償操作重複執行
+ *   所有 UPDATE 帶 guard 條件（reserved_balance >= $1、available_balance >= $1），
+ *   防止重複補償讓餘額欄位變負數
+ *
+ * ════════════════════════════════════════════════════════════════
+ * 三餘額模型（Three-balance Model）
+ * ════════════════════════════════════════════════════════════════
+ *
+ *   balance           — 帳戶總餘額（含凍結中的金額）
+ *   available_balance — 可用餘額（用戶實際能動用的金額）
+ *   reserved_balance  — 凍結餘額（跨 shard 轉帳進行中的金額）
+ *
+ *   資料庫 CHECK 約束：balance = available_balance + reserved_balance
+ *   此約束在物理層面強制守恆，任何違反的 UPDATE 會被 PostgreSQL 直接拒絕。
+ *
+ * ════════════════════════════════════════════════════════════════
+ * 連線洩漏修復記錄（Connection Leak Bug Fix）
+ * ════════════════════════════════════════════════════════════════
+ *
+ * 問題（已修復）：
+ *   早期版本的 transferCrossShard 在 try 區塊外呼叫 connect()：
+ *
+ *     let fromClient = null;
+ *     fromClient = await this.getShardPg(fromShardId).connect(); // ← try 外
+ *     try {
+ *       ...如果這裡 throw，finally 中 fromClient.release() 會正確執行
+ *       toClient = await this.getShardPg(toShardId).connect();   // ← 若此行 throw
+ *       // fromClient 已 connect，toClient 連接失敗，
+ *       // 進 catch 但 toClient=null，finally 中 fromClient.release() 仍可執行
+ *       // ✅ 其實這種模式在 finally 有 null 檢查時是安全的
+ *     } finally {
+ *       if (fromClient) fromClient.release();
+ *       if (toClient) toClient.release();
+ *     }
+ *
+ *   真正的潛在問題是若 connect() 本身 throw（連線池耗盡），
+ *   在 try 外呼叫時 finally 不會執行，連線嘗試失敗但 pool 狀態可能不一致。
+ *
+ * 修復（現行版本）：
+ *   fromClient 和 toClient 的 connect() 都在 try 區塊內執行，
+ *   確保無論哪一步失敗，finally 都能正確 release 已取得的連線：
+ *
+ *     try {
+ *       fromClient = await this.getShardPg(fromShardId).connect(); // ✅ try 內
+ *       toClient   = await this.getShardPg(toShardId).connect();   // ✅ try 內
+ *       ...
+ *     } finally {
+ *       if (fromClient) fromClient.release();
+ *       if (toClient)   toClient.release();
+ *     }
+ *
+ * ════════════════════════════════════════════════════════════════
+ * ⚠️  架構審查標注（Architecture Review Annotations）2026-05
+ * ════════════════════════════════════════════════════════════════
+ *
+ * [NOT PRODUCTION-READY] 以下問題在 production 環境仍需修補：
+ *
+ * 1. 跨 Shard 轉帳記錄只存 fromShard（KNOWN LIMITATION — Risk: HIGH）
+ *    - listByAccountId 在 toShard 上查 `WHERE to_account_id = $1`，
+ *      對跨 shard 的收款紀錄回傳 0 筆（記錄存在 fromShard，不在 toShard）。
+ *    - 影響：收款方（toAccount）的帳單中看不到跨 shard 入帳記錄。
+ *    - 修法 A：Step 2（CREDIT）同時在 toShard 寫入 shadow 轉帳記錄（status='CREDIT_SHADOW'）
+ *    - 修法 B：listByAccountId 在兩個 shard 都查並 merge 結果（額外 round trip）
+ *    - 注意：需先建立 transfers 表的索引：
+ *        CREATE INDEX CONCURRENTLY ON transfers(from_account_id);
+ *        CREATE INDEX CONCURRENTLY ON transfers(to_account_id);
+ *
+ * 2. transferCrossShard 與 recovery_worker 之間的 CREDITED race condition（Risk: CRITICAL）
+ *    - Step 2 commit 成功，saga_log 更新至 CREDITED 後，Step 3 finalize 開始執行。
+ *    - 若此時 recovery_worker 掃到 CREDITED 記錄（STALE_THRESHOLD=30s，queue 積壓可能超過）：
+ *        (a) queue_worker 的 Step 3 commit 成功（saga_log.step = COMPLETED）
+ *        (b) recovery_worker 嘗試 finalize，reserved_balance 已為 0，rowCount=0
+ *        (c) recovery_worker 誤判「finalize 失敗」，呼叫 compensateCredited 撤銷已完成轉帳
+ *    - 根本修法在 recovery_worker.recoverFromCredited：
+ *        rowCount=0 時先查 transfers.status，若為 COMPLETED 只同步 saga_log，不走補償。
+ *
+ * 3. 沒有 client 端冪等鍵（Idempotency Key）支援（Risk: HIGH）
+ *    - 客戶端網路重試會創建多個 job，可能造成重複扣款。
+ *    - 修法：接受 X-Idempotency-Key header，以 (userId, idempotencyKey) 在 Redis 查重，
+ *      相同 key 直接回傳原有 jobId 而非建立新 job。
+ *
+ * 4. processJob 無分類重試（Risk: HIGH — 在 transfers.js 標注）
+ *    - ConflictError（余額不足）和 lock_timeout（暫時性故障）都 markFailed，
+ *      暫時性故障造成永久性轉帳失敗。
  */
 
 const baseShardRepo = require('./baseShardRepo');
@@ -37,6 +123,20 @@ class TransfersRepo extends baseShardRepo {
       throw new NotFoundError('account not found');
     }
 
+    // ⚠️ [KNOWN LIMITATION] 跨 shard 收款紀錄缺失問題（Cross-shard incoming transfer history gap）
+    //
+    // 設計說明：轉帳記錄（transfers 表）只寫入 fromShard。
+    // 對於同 shard 轉帳，`WHERE to_account_id = $1` 能找到收款記錄（同一張表）。
+    // 對於跨 shard 轉帳，records 只在 fromShard，本查詢在 toShard 執行時回傳 0 筆。
+    //
+    // 影響：帳號 A（shard 1）收到來自帳號 B（shard 0）的跨 shard 轉帳，
+    // 查 A 的轉帳紀錄時，該筆入帳記錄不存在。
+    //
+    // 修法（兩選一）：
+    //   (a) Step 2 在 toShard 同時寫入 shadow transfer record（status='CREDIT_SHADOW'）
+    //   (b) listByAccountId 在兩個 shard 都查並 merge 結果
+    //
+    // 需要新增 indexes: CREATE INDEX ON transfers(from_account_id); CREATE INDEX ON transfers(to_account_id);
     const result = await shardPg.query(
       `SELECT id, from_account_id, to_account_id, amount, status, created_at, updated_at
        FROM transfers
@@ -77,6 +177,16 @@ class TransfersRepo extends baseShardRepo {
 
   // Single-database transaction: debit → credit → record.
   // 用 CTE 把 debit + credit + INSERT 合成一次 round trip（原本 5 次 → 3 次）
+  //
+  // ✅ 強一致性（Strong consistency）：單一 PostgreSQL 交易，ACID 保證。
+  // ✅ 無 race condition：CTE 中 `WHERE available_balance >= $1` 由 row lock 原子執行。
+  // ✅ CHECK 約束（balance = available_balance + reserved_balance）在 DB 層防止資料分歧。
+  //
+  // ⚠️ [NOTE] lock_timeout = '200ms' 設計取捨：
+  //    高競爭帳號（熱帳號，如大量用戶轉入同一帳號）在 200ms 內無法取得 row lock 時，
+  //    PG 拋出 55P03 錯誤，轉成 503 回傳客戶端。這是刻意的 fail-fast 設計，
+  //    但對熱帳號場景（如商戶收款帳號）可能造成大量 503。
+  //    Production 調優：根據 p99 lock wait 時間動態調整 timeout 值。
   async transferSameShard({ fromAccountId, toAccountId, transferAmount, shardId }) {
     const client = await this.getShardPg(shardId).connect();
 
@@ -156,11 +266,14 @@ class TransfersRepo extends baseShardRepo {
   }
 
   async transferCrossShard({ fromAccountId, toAccountId, transferAmount, fromShardId, toShardId }) {
-    const fromClient = await this.getShardPg(fromShardId).connect();
-    const toClient = await this.getShardPg(toShardId).connect();
+    let fromClient = null;
+    let toClient = null;
     let transferId = null;
 
     try {
+      // ⚠️ 在 try 內 connect：確保任一步驟失敗都能在 finally 釋放已取得的 client
+      fromClient = await this.getShardPg(fromShardId).connect();
+      toClient = await this.getShardPg(toShardId).connect();
       // step 1: available_balance扣除轉出金額, reserved_balance加入轉出金額以凍結
       await fromClient.query('BEGIN'); // BEGIN
       await fromClient.query("SET LOCAL lock_timeout = '200ms'");
@@ -230,6 +343,21 @@ class TransfersRepo extends baseShardRepo {
 
       // Step 2 committed後標記狀態為CREDITED in saga_log
       // retry一次，還是不行的話就補償兩個帳號
+      //
+      // ⚠️ [RACE CONDITION RISK] 此段 saga_log 更新與 recovery_worker 存在競爭（Race with recovery）
+      //
+      // 情境說明：
+      //   若 saga_log 更新到 CREDITED 失敗兩次後，下方補償邏輯（_compensateCredited +
+      //   _compensateReserved）會正確還原兩個帳號。
+      //   但若 saga_log 成功更新到 CREDITED 後，Step 3 finalize 開始執行，
+      //   此時若 recovery_worker 掃到此 CREDITED 記錄並試圖執行 finalize，
+      //   recovery_worker.recoverFromCredited 在 finalize 失敗（reserved=0）後
+      //   會錯誤走補償路徑，撤銷已完成的轉帳。
+      //   此 race 的根本修法在 recovery_worker.recoverFromCredited 加入 transfers.status 檢查。
+      //   詳見 recovery_worker.js 中的相關標注。
+      //
+      // ⚠️ [NOT PRODUCTION-READY] 此段補償後若 process crash，
+      //   recovery_worker 會從 COMPENSATING 狀態接手。請確認 recovery_worker 運作正常。
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
           await fromClient.query(
@@ -322,8 +450,8 @@ class TransfersRepo extends baseShardRepo {
       }
 
     } finally {
-      fromClient.release();
-      toClient.release();
+      if (fromClient) fromClient.release();
+      if (toClient) toClient.release();
     }
   }
 

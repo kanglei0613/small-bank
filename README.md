@@ -66,6 +66,7 @@
 - [即時監控 Dashboard](#即時監控-dashboard)
 - [壓測](#壓測)
 - [已知限制](#已知限制)
+- [Architecture Review](#architecture-review)
 
 ---
 
@@ -165,7 +166,7 @@ flowchart TD
 
 | 元件 | 選擇 | 原因 |
 |------|------|------|
-| Runtime | Node.js 18+ | 非同步 I/O 適合高並發場景 |
+| Runtime | Node.js 20 LTS | 非同步 I/O 適合高並發場景 |
 | Framework | Egg.js | 提供 cluster 管理、middleware、生命週期管理 |
 | Database | PostgreSQL × 5 | ACID 事務保證資金安全 |
 | Cache / Queue | Redis | 高速讀寫，作為 transfer queue 的載體 |
@@ -259,24 +260,119 @@ Queue Worker 取出 job
 
 ## 快速啟動
 
-### Docker（推薦 — 三行跑起來）
+### Docker（推薦）
+
+以下為完整的 Docker 環境啟動流程，每個步驟均附說明：
 
 ```bash
+# 1. Clone 專案
 git clone https://github.com/kanglei0613/small-bank.git
 cd small-bank
-cp .env.example .env
-docker-compose up
+
+# 2. 啟動整個 stack（PostgreSQL × 5、Redis、API × 2、Queue Worker、Recovery Worker）
+#    第一次啟動會自動執行 initdb SQL（建表、建索引、建約束），無需手動初始化
+docker compose up -d
+
+# 3. 確認所有服務健康（所有服務應顯示 healthy 或 running）
+docker compose ps
+
+# 4. Seed：建立帳號與初始資料（約 50,000 帳號，每帳號 1,000,000 初始餘額）
+#    --docker 使用容器內的 PG 連線設定（必填）
+#    --users=N 建立帳號數（預設 50000）
+#    --init-bal=N 每帳號初始餘額（預設 1000000）
+node scripts/benchmark/seed.js --docker --users=50000 --init-bal=1000000
+
+# 5. 啟動前端開發伺服器（Vue 3）
+cd frontend && npm install && npm run dev
+# 瀏覽器開啟 http://localhost:5173
+
+# 6. 執行一般混合壓測（General + Transfer API，預設 100 並發，持續 30 秒）
+node scripts/benchmark/mixed_rps_autocannon.js
+
+# 也可指定參數：
+node scripts/benchmark/mixed_rps_autocannon.js --connections=200 --duration=60 --amount=1
+
+# 7. 執行 Sequential vs Concurrent 對比壓測（展示 row-lock contention 問題）
+#    自動切換 queue-worker 模式兩輪，最後輸出對比報告
+node scripts/benchmark/bench_compare.js
+
+# 8. 完整重置（刪除所有 volume，回到乾淨狀態，再重新啟動）
+docker compose down -v && docker compose up -d
 ```
 
 API 起來後：
 - General API：`http://localhost:7001`
 - Transfer API：`http://localhost:7010`
-- Swagger UI：`http://localhost:7001/api-docs`
+- 前端 Dashboard：`http://localhost:5173`（npm run dev 啟動後）
 
-建立測試資料：
+---
+
+### 指令與參數說明
+
+#### `seed.js` — 建立測試資料
+
 ```bash
-node scripts/benchmark/seed.js --concurrency=3
+node scripts/benchmark/seed.js [選項]
 ```
+
+| 參數 | 說明 | 預設值 |
+|------|------|--------|
+| `--docker` | 使用 Docker 容器內部 PG 連線（`docker exec psql`）。Docker 環境必填 | — |
+| `--users=N` | 建立的用戶數 | `50000` |
+| `--init-bal=N` | 每個帳號的初始餘額 | `1000000` |
+| `--concurrency=N` | 建立帳號的並發數（本機模式，不宜過高） | `3` |
+
+> ⚠️ Seed 完成後會在 `scripts/benchmark/.seed-config.json` 寫入帳號 ID 範圍，供後續壓測腳本自動讀取。
+
+#### `mixed_rps_autocannon.js` — 混合 RPS 壓測
+
+```bash
+node scripts/benchmark/mixed_rps_autocannon.js [選項]
+```
+
+| 參數 | 說明 | 預設值 |
+|------|------|--------|
+| `--connections=N` | 總並發連線數（75% 分給 General API，25% 分給 Transfer API）| `100` |
+| `--duration=N` | 壓測持續秒數 | `30` |
+| `--pool-size=N` | 預先產生的請求池大小（避免壓測中途 CPU 被佔用） | `1000` |
+| `--min-id=N / --max-id=N` | 帳號 ID 範圍（若有 seed config 則自動讀取，不需手動指定） | seed config |
+| `--amount=N` | 每筆轉帳金額 | `1` |
+| `--init-bal=N` | 帳號初始餘額（用於守恆計算基準，應與 seed 時相同） | `1000000` |
+| `--queue-drain-timeout=N` | 壓測結束後，等待 async queue 清空的最大秒數；`0` 表示只等 balance-delay | `120` |
+| `--balance-delay=N` | 壓測結束後等待 N 秒再做餘額檢查（排除跨 shard 最終一致性延遲） | `3` |
+| `--skip-balance-check` | 跳過壓測後的餘額守恆查詢（快速跑時使用） | — |
+| `--general-url=URL` | General API 位址 | `http://127.0.0.1:7001` |
+| `--transfer-url=URL` | Transfer API 位址 | `http://127.0.0.1:7010` |
+
+#### `bench_compare.js` — Sequential vs Concurrent 對比壓測
+
+```bash
+node scripts/benchmark/bench_compare.js
+```
+
+無額外命令列參數。腳本內固定 5 個跨 shard pair（各個 shard 方向均覆蓋），每個 pair 送 40 筆 job，自動執行兩輪：
+
+- **Round 1（Concurrent）**：設定 `QUEUE_DRAIN_SEQUENTIAL=false`，重啟 queue-worker，觀察 lock_timeout 造成的大量失敗
+- **Round 2（Sequential）**：設定 `QUEUE_DRAIN_SEQUENTIAL=true`，重啟 queue-worker，觀察 100% 成功率
+
+最後輸出對比表格，結束後自動還原 queue-worker 為 sequential 模式並刪除 override 設定檔。
+
+> ⚠️ 此腳本會寫入 `docker-compose.override.yml` 並執行 `docker compose up -d --no-deps queue-worker`，需要主機上有 Docker CLI。
+
+#### `docker-compose.yml` 可調環境變數
+
+可透過 shell export 或 `.env` 檔案覆寫，不需重建 image：
+
+| 變數 | 說明 | 預設值 |
+|------|------|--------|
+| `QUEUE_DRAIN_SEQUENTIAL` | `true`：sequential drain（推薦，100% 成功率）；`false`：concurrent drain（對比壓測用，~1/batchSize 成功率）| `true` |
+| `BATCH_SIZE` | queue-worker 每次 drain 的 batch 大小 | `100` |
+| `QUEUE_CONCURRENCY` | queue-worker 的並發 BRPOP loop 數量 | `8` |
+| `PG_SHARD_POOL_MAX` | 每個 shard 的 PostgreSQL 連線池上限 | `10` |
+| `GENERAL_WORKERS` | General API 的 cluster worker 數 | `3` |
+| `TRANSFER_WORKERS` | Transfer API 的 cluster worker 數 | `1` |
+| `REJECT_THRESHOLD` | 每個 fromId queue 開始回傳 429 的長度閾值 | `500` |
+| `MAX_QUEUE_LENGTH` | 每個 fromId queue 的記憶體上限 | `600` |
 
 ---
 
@@ -284,25 +380,25 @@ node scripts/benchmark/seed.js --concurrency=3
 
 #### 環境需求
 
-- Node.js 18+
-- PostgreSQL 16+（原生安裝，非 Docker）
+- Node.js 20 LTS
+- PostgreSQL 17+（原生安裝，非 Docker）
 - Redis 7+（原生安裝）
 - WSL2（Ubuntu）
 
-### 安裝依賴
+#### 安裝依賴
 
 ```bash
 npm install
 ```
 
-### 資料庫初始化
+#### 資料庫初始化
 
-執行建表 SQL（`scripts/db/` 目錄下），建立以下資料庫：
+執行建表 SQL（`docker/initdb-meta/` 和 `docker/initdb-shard/` 目錄下），建立以下資料庫：
 
 - `small_bank_meta`
 - `small_bank_s0` ~ `small_bank_s3`
 
-### 啟動 Stack
+#### 啟動 Stack
 
 ```bash
 bash scripts/run/wsl_stack.sh restart -g 3 -t 1 -qc 8 -pgMeta 25 -pgShard 10
@@ -321,15 +417,7 @@ bash scripts/run/wsl_stack.sh restart -g 3 -t 1 -qc 8 -pgMeta 25 -pgShard 10
 | `-rejectThreshold` | 每個 fromId 的拒絕閾值 | `500` |
 | `-maxQueueLength` | 每個 fromId 的最大 queue 長度 | `600` |
 
-### 建立測試資料
-
-```bash
-node scripts/benchmark/seed.js --concurrency=3
-```
-
-> ⚠️ `--concurrency` 不要設太高（建議 3），否則會打爆 meta DB pool。
-
-### 其他指令
+#### 其他指令
 
 ```bash
 # 查看狀態
@@ -388,12 +476,12 @@ node scripts/benchmark/mixed_rps_autocannon.js --transfer-url=http://127.0.0.1:7
 
 | 指標 | 數值 |
 |------|------|
-| 總 RPS | **12,363** |
-| General API | 9,021 RPS |
-| Transfer API | 3,342 RPS |
-| p95 latency | 38ms |
-| p99 latency | 53ms |
-| 總失敗率 | **0%**（370,851 筆全部成功）|
+| 總 RPS | **13,156** |
+| General API | ~9,900 RPS |
+| Transfer API | ~3,256 RPS |
+| p95 latency | 36ms |
+| p99 latency | 49ms |
+| 總失敗率 | **0%**（全部成功）|
 | 餘額守恆 | ✅ diff = +0 |
 
 ---
@@ -403,6 +491,12 @@ node scripts/benchmark/mixed_rps_autocannon.js --transfer-url=http://127.0.0.1:7
 - **單機部署**：目前開發與壓測皆在單機環境，尚未驗證多機水平擴展。
 - **Transfer queue 非 FIFO**：per-fromId queue 確保同一發款帳號的轉帳不會並發衝突，但不同 fromId 之間的處理順序取決於 queue worker 的排程。
 - **每筆借貸平衡驗證**：目前只驗證全量餘額守恆（sum 不變），尚未驗證每筆轉帳的借貸個別平衡。
+- **Redis 單點故障**：Redis 無 HA 設計，Redis 崩潰導致 queue 服務中斷。
+- **跨 shard 收款記錄缺失**：受款方在不同 shard 時，轉帳記錄不出現在受款方的帳單中。
+- **Shard rebalance 未實作**：帳號 shard 路由為靜態計算（accountId % 4），不支援重新分片。
+- **無 idempotency key**：客戶端重試可能導致重複轉帳。
+- **無認證機制**：Transfer API 未加入 JWT/session 驗證，任何人均可發起轉帳。
+
 ---
 
 ## 交易一致性設計
@@ -485,4 +579,229 @@ PostgreSQL 在每次寫入時強制檢查此約束，讓三個餘額欄位在物
 
 ### 餘額守恆驗證
 
-壓測套件透過加總四個 shard 所有帳號的 `balance` 欄位來驗證全域餘額守恆，目標是 `diff = 0`，確保沒有任何金額被憑空創造或消失。Docker 環境最佳紀錄：**12,363 RPS、全 API 0% 失敗率、餘額守恆 diff = +0**。
+壓測套件透過加總四個 shard 所有帳號的 `balance` 欄位來驗證全域餘額守恆，目標是 `diff = 0`，確保沒有任何金額被憑空創造或消失。Docker 環境最佳紀錄：**13,156 RPS、全 API 0% 失敗率、餘額守恆 diff = +0**。
+
+---
+
+## Architecture Review
+
+> 本章節為完整的多角色架構評審（2026-05），涵蓋設計決策、已知問題與修正記錄，可作為面試技術討論的參考依據。
+
+### 系統架構全圖
+
+```
+                        ┌──────────────────────────────────┐
+                        │            Client                │
+                        └────────────┬─────────────────────┘
+                                     │ HTTP
+                   ┌─────────────────┼─────────────────────┐
+                   ▼                 ▼                     │
+       ┌───────────────────┐  ┌──────────────────┐         │
+       │   General API     │  │  Transfer API    │         │
+       │   port 7001       │  │  port 7010       │         │
+       │ (帳號/查詢/SSE)  │  │  (轉帳請求)      │         │
+       └────────┬──────────┘  └────────┬─────────┘         │
+                │                      │                   │
+                │ pool                 │ sync              │ async
+                │                      ▼                   │
+                │          ┌──────────────────────┐        │
+                │          │  transferSameShard   │        │
+                │          │  CTE（3 round trips）│        │
+                │          └──────────────────────┘        │
+                │                                          │
+                │                      ┌───────────────────┘
+                │                      ▼
+                │          ┌──────────────────────┐
+                │          │    Redis Queue       │
+                │          │  per-fromId List     │
+                │          │  + owner lock        │
+                │          │  + heartbeat         │
+                │          └──────────┬───────────┘
+                │                     │ BRPOP
+                │          ┌──────────▼───────────┐
+                │          │    Queue Worker       │
+                │          │  (CONCURRENCY loops) │
+                │          │  sequential drain     │
+                │          └──────────┬───────────┘
+                │                     │ Saga
+                ▼                     ▼
+      ┌─────────────────────────────────────────────────────────┐
+      │                   PostgreSQL Shards                     │
+      │                                                         │
+      │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────┐ │
+      │  │  Shard 0 │  │  Shard 1 │  │  Shard 2 │  │Shard 3 │ │
+      │  │ id%4 = 0 │  │ id%4 = 1 │  │ id%4 = 2 │  │id%4=3  │ │
+      │  └──────────┘  └──────────┘  └──────────┘  └────────┘ │
+      │  每個 shard：accounts / transfers / saga_log /           │
+      │              saga_credits / saga_compensations          │
+      └─────────────────────────────────────────────────────────┘
+                   ▲
+                   │ 每 10 秒掃描
+      ┌────────────┴───────────┐
+      │    Recovery Worker     │
+      │  掃 saga_log，修復     │
+      │  RESERVED / CREDITED / │
+      │  COMPENSATING 狀態     │
+      └────────────────────────┘
+
+  另有 PostgreSQL Meta DB：
+      small_bank_meta → users / account_shards（帳號路由表）
+```
+
+### Saga 狀態機
+
+```
+Transfer 發起
+    │
+    ├── 同 shard ──► CTE ──► COMPLETED（同步，3 round trips）
+    │
+    └── 跨 shard
+            │
+            ▼
+        [Redis Queue]
+            │
+            ▼
+        Step 1 RESERVE
+        （fromShard：扣 available，加 reserved，insert transfer+saga_log）
+            │
+            ├── 失敗 ──► no-op（clean rollback，不需補償）
+            │
+            ▼
+        Step 2 CREDIT
+        （toShard：加 balance+available，insert saga_credits）
+            │
+            ├── 失敗 ──► _compensateReserved：還原 fromAccount reserved→available
+            │                               transfer=FAILED, saga_log=FAILED
+            ▼
+        saga_log → CREDITED
+            │
+            ▼
+        Step 3 FINALIZE
+        （fromShard：扣 reserved+balance，transfer=COMPLETED，saga_log=COMPLETED）
+            │
+            ├── 失敗 ──► transfer=PENDING_FINALIZE，saga_log 停在 CREDITED
+            │            ← Recovery Worker 接手
+            │
+            └── 成功 ──► COMPLETED
+```
+
+### 關鍵設計決策與 Tradeoff
+
+#### 1. per-fromId Queue + Sequential Drain：消除 Row Lock 競爭
+
+**問題**：若同一 fromId 的多個跨 shard 轉帳並行執行 RESERVE 步驟，所有 Saga 競爭同一個 `fromAccount` row lock（`UPDATE accounts WHERE id = {fromId}`）。在 `lock_timeout=200ms` 下：
+- batchSize 個 Saga 並行 → 只有 1 個取得 lock，其餘 N-1 個 timeout → 有效成功率 = **1/batchSize**
+- batchSize=50 → 有效成功率僅 **2%**，其餘 98% 全部 503 失敗
+
+**解法**：per-fromId queue 配合 **sequential drain**（逐一執行）：
+- 同一 fromId 的 Saga 依序執行，無 row lock 競爭
+- 有效成功率 **100%**，每個 Saga 平均等待時間 = 前面 Saga 的處理時間
+- 整體吞吐量由多個不同 fromId 的並行 drain 提供（worker 並發數 × per-fromId 串行速度）
+
+```
+QUEUE_DRAIN_SEQUENTIAL=true  → sequential（推薦，100% 成功率）
+QUEUE_DRAIN_SEQUENTIAL=false → concurrent（對照壓測用，~1/batchSize 成功率）
+```
+
+#### 2. 三餘額模型：凍結帳款機制
+
+| 欄位 | 意義 | 同 shard 操作 | 跨 shard Step 1 | 跨 shard Step 3 |
+|------|------|:---:|:---:|:---:|
+| `balance` | 帳戶總額（含凍結）| ↓ | 不動 | ↓ |
+| `available_balance` | 可用餘額 | ↓ | ↓（凍結）| 不動 |
+| `reserved_balance` | 凍結餘額 | 不動 | ↑（凍結）| ↓（銷帳）|
+
+**DB CHECK 約束**：`balance = available_balance + reserved_balance`，在物理層面強制守恆，任何違反的 UPDATE 被 PostgreSQL 直接拒絕，即使應用層有 bug 也無法打破。
+
+#### 3. CTE 原子操作：同 shard 轉帳的效率優化
+
+同 shard 轉帳使用串接 CTE，將 debit + credit + INSERT 合成 **3 次 round trip**（vs 原本 5 次）：
+- BEGIN（round trip 1）
+- debit CTE + credit CTE + INSERT CTE（round trip 2，全部原子）
+- COMMIT（round trip 3）
+
+`WHERE EXISTS (SELECT 1 FROM debit) AND EXISTS (SELECT 1 FROM credit)` 確保只有兩個 UPDATE 都成功時才 INSERT 轉帳記錄。
+
+#### 4. Owner Lock + Heartbeat：Worker 協調機制
+
+每個 fromId 的 queue 同時只能有一個 worker 處理（`SET NX PX` owner lock）。若 drain 時間超過 lock TTL，heartbeat（每 ownerRefreshIntervalMs 刷新一次 TTL）防止 lock 過期後被另一個 worker 搶走，造成兩個 worker 同時 drain 同一 fromId。
+
+```
+lock TTL = 10s（TRANSFER_QUEUE_OWNER_TTL_MS）
+heartbeat interval = 3s（TRANSFER_QUEUE_OWNER_REFRESH_MS）
+→ 在 lock 過期前至少 3 次刷新機會
+```
+
+### 已知問題與修正記錄
+
+| # | 嚴重度 | 問題描述 | 修正狀態 |
+|---|--------|----------|----------|
+| 1 | 🔴 CRITICAL | `recoverFromCredited` 在 `reserved_balance=0` 時未檢查 `transfers.status`，可能撤銷已完成的轉帳（queue_worker race） | 未修復，需在 `rowCount=0` 後加 status 查詢 |
+| 2 | ✅ 已修復 | `startOwnerHeartbeat` 第一次 tick 延遲 `ownerTtlMs`（10s）而非 `ownerRefreshIntervalMs`（3s），長 drain（>=10s）時 lock 過期，兩個 worker 可能同時 drain 同一 fromId | 已修復：`setTimeout` 改用 `ownerRefreshIntervalMs`（3s），確保 lock 在 TTL 前刷新 |
+| 3 | 🟠 HIGH | `processJob` 不區分 permanent/transient 錯誤，lock_timeout（55P03）造成永久失敗 | 未修復，需加 error 分類重試邏輯 |
+| 4 | 🟠 HIGH | 無客戶端冪等鍵（Idempotency Key），網路重試造成重複扣款 | 未修復，需實作 X-Idempotency-Key |
+| 5 | 🟠 HIGH | 跨 shard 收款方帳單缺失（toAccount 看不到跨 shard 入帳記錄）| 已知 limitation，需 shadow record 或跨 shard 聯合查詢 |
+| 6 | 🟡 MEDIUM | `startQueueWorker`（Egg 版）共用單一 Redis 連線執行 BRPOP + drain，吞吐量受限 | 未修復（standalone `queue_worker.js` 已正確分離連線）|
+| 7 | 🟡 MEDIUM | `saga_log` 缺少 `(step, updated_at)` 複合索引，recovery_worker 全表掃描 | 未修復，需 `CREATE INDEX CONCURRENTLY` |
+| 8 | 🟡 MEDIUM | `recoverStaleQueues` 依賴靜態 `WORKER_INDEX=1`，多機部署時不可靠 | 未修復，需改用 Redis SET NX 分散式 lock |
+| 9 | 🟡 MEDIUM | `STALE_THRESHOLD=30s` 在 queue 積壓時過激進，加劇 CRITICAL 問題 1 | 建議調高至 60-300s |
+| 10 | 🟡 MEDIUM | `recovery_worker.js` 中 SQL INTERVAL 使用模板字串（非參數化查詢） | 輕微不良模式，已有 `parseInt` 保護 |
+| 11 | 🟢 LOW | `transfersRepo` 缺少 `transfers(from_account_id)` 和 `(to_account_id)` 索引 | 未修復，高流量下 listByAccountId 效能劣化 |
+| 12 | 🟢 LOW | Routing logic 重複（submitTransfer 和 repo.transfer() 都計算 shardId） | 維護性問題，功能正確 |
+| 13 | ✅ 已修復 | `drainQueue` 預設 concurrent 模式，batchSize 個 Saga 並行競爭同一 fromAccount row lock → lock_timeout(200ms) → N-1 個失敗，成功率 ≈ 1/batchSize | 已修復：改為 `for...of` sequential loop（`QUEUE_DRAIN_SEQUENTIAL=true`，預設）；`QUEUE_DRAIN_SEQUENTIAL=false` 可還原舊行為供對比展示 |
+| 14 | 🟠 HIGH | `recovery_worker` 與 `queue_worker` 在高負載下產生 race：queue 積壓導致 Saga 步驟超過 `STALE_THRESHOLD=30s`，recovery_worker 誤觸發補償 | 部分緩解：`STALE_THRESHOLD` 建議調至 120s；根本修法見問題 #1 |
+| 15 | ✅ 已修復 | `transferCrossShard` 連線洩漏：fromClient/toClient 已移至 `try` 區塊內 connect | 已修復 |
+| 16 | ✅ 已修復 | `compensateCredited` 補償 fromAccount 改用 `UPDATE WHERE` 取代 `SELECT + UPDATE`，消除 TOCTOU | 已修復 |
+| 17 | ✅ 已修復 | `fetchTransfers`（前端 API）未對 bigint 欄位強制轉型，PostgreSQL driver 回傳字串型 id/amount，導致 `===` 比較失敗、方向判斷（出款/入款）錯誤 | 已修復：`id`、`from_account_id`、`to_account_id`、`amount` 統一以 `Number()` 強制轉型 |
+
+### 壓測結果
+
+> 測試環境：Docker 單機，Node.js 20 LTS，PostgreSQL 17，Redis 7
+
+#### 純轉帳壓測（Transfer API only）
+
+| 指標 | 數值 |
+|------|------|
+| 總 RPS | **11,689** |
+| 持續時間 | 30s |
+| 總請求數 | ~350,670 筆 |
+| 失敗率 | **0%**（100% 成功） |
+| 餘額守恆驗證 | ✅ diff = +0 |
+| 模式 | sequential drain，batchSize=50，concurrency=8 |
+
+#### 混合壓測（Transfer API + General API）
+
+| 指標 | 數值 |
+|------|------|
+| 總 RPS | **13,156** |
+| General API | ~9,900 RPS |
+| Transfer API | ~3,256 RPS |
+| p95 latency | 36ms |
+| p99 latency | 49ms |
+| 失敗率 | **0%**（全部成功）|
+| 餘額守恆 | ✅ diff = +0 |
+
+### 面試亮點（Technical Deep-dive Topics）
+
+以下技術點適合與面試官展開深入討論：
+
+**1. 為什麼需要 per-fromId queue？concurrent batch 有什麼問題？**
+> 核心問題是同一 fromAccount 的 row lock 競爭。在 lock_timeout=200ms 下，batchSize 個並行 Saga 只有 1 個能成功（1/batchSize 成功率）。sequential drain 犧牲少量吞吐量換取 100% 正確性，整體吞吐量由多個不同 fromId 的並行 drain 補回。
+
+**2. Saga 補償的冪等性如何保證？**
+> `saga_credits`（`transfer_id` unique）防止 Step 2 重複入帳；`saga_compensations`（`transfer_id` unique）防止補償重複執行；所有 UPDATE 帶 guard 條件（`reserved_balance >= $1`）防止補償讓欄位變負數。這三層冪等保護確保即使 worker crash + retry 也不會造成資金異常。
+
+**3. recovery_worker 與 queue_worker 之間有 race condition 嗎？如何修復？**
+> 有。當 queue_worker 正在執行 Step 3，但尚未 commit 時，recovery_worker 可能掃到 `saga_log.step=CREDITED`。Step 3 commit 後 `reserved_balance=0`，recovery_worker 嘗試 finalize 失敗，誤以為是異常狀態，執行 `compensateCredited` 撤銷已完成的轉帳。修法：`rowCount=0` 時先查 `transfers.status`，若為 `COMPLETED` 只同步 saga_log，不走補償路徑。
+
+**4. lock_timeout=200ms 的設計取捨是什麼？**
+> 這是刻意的 fail-fast 設計：寧可快速拒絕少數等待中的請求（503），也不讓連線因 lock 等待堆積而使整個系統無回應。對熱帳號（如商戶收款帳號，大量用戶同時轉入）可能造成較多 503，可在 queue layer 序列化轉入操作緩解。
+
+**5. 同 shard 轉帳的 CTE 為什麼比三次獨立 SQL 好？**
+> 單一 CTE 只需 3 次 round trip（BEGIN、CTE 本體、COMMIT），而三次獨立 SQL 需要 5 次（BEGIN、UPDATE debit、UPDATE credit、INSERT transfer、COMMIT）。更重要的是 CTE 在同一個 PostgreSQL transaction 內原子執行，消除三次 UPDATE 之間的時間窗口，不可能出現 debit 成功但 credit 失敗的中間狀態。
+
+**6. Redis job store 的 Pub/Sub 通知機制如何與前端 SSE 整合？**
+> `markSuccess`/`markFailed` 使用 Redis pipeline 同時執行 SET（更新 job state）和 PUBLISH（通知 SSE 連線）。SSE handler subscribe 對應 channel（`transfer:job:done:{jobId}`），收到通知後推送給前端，避免輪詢。若 SSE 斷線，前端 fallback 到每 2 秒輪詢 GET `/transfers/jobs/{jobId}`，最多 30 次（60 秒）。
+
+**7. 如何驗證系統的資料一致性？**
+> 三層驗證：(1) 資料庫 CHECK 約束（`balance = available_balance + reserved_balance`）在物理層強制三欄位守恆；(2) 壓測後執行全量餘額守恆查詢，加總四個 shard 所有帳號的 `balance`，diff 應為 +0；(3) saga_log 提供完整審計追蹤，可事後追溯每筆跨 shard 轉帳的每一個步驟。

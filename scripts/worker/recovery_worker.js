@@ -14,6 +14,40 @@
  *   SAGA_SCAN_BATCH_SIZE        每輪最多處理幾筆（預設 50）
  *   PG_SHARD_POOL_MAX
  *   PG_META_POOL_MAX
+ *
+ * ════════════════════════════════════════════════════════════════
+ * ⚠️  架構審查標注（Architecture Review Annotations）2026-05
+ * ════════════════════════════════════════════════════════════════
+ *
+ * [NOT PRODUCTION-READY] 以下已知問題需在 production 部署前修補：
+ *
+ * 1. 【CRITICAL】recoverFromCredited 可能撤銷已完成的轉帳（Race with queue worker）
+ *    詳見 recoverFromCredited 函數內的標注。
+ *    核心問題：finalize rowCount=0 時未檢查 transfers.status，直接走補償路徑。
+ *    修法：在 rowCount=0 時先查 transfers.status，若為 COMPLETED 則同步 saga_log 並返回。
+ *
+ * 2. STALE_THRESHOLD=30s 可能過激進（Aggressive stale threshold）
+ *    在 queue 積壓情況下，saga 從 CREDITED 到 FINALIZE 可能 > 30s。
+ *    recovery_worker 與 queue_worker 競爭 finalize，若 queue_worker 先完成，
+ *    recovery_worker 反而執行錯誤補償（見問題 1）。
+ *    修法：調高 threshold（60-300s），並在 queue_worker 的 saga_log 更新中加入 heartbeat。
+ *
+ * 3. INTERVAL 字串插值（Template literal in SQL - not parameterized）
+ *    `INTERVAL '${STALE_THRESHOLD} seconds'` 使用模板字串。
+ *    雖然 parseInt 保護 STALE_THRESHOLD 為整數，但這是不良模式。
+ *    修法：改用 `updated_at < NOW() - ($1 * INTERVAL '1 second')` 參數化查詢。
+ *
+ * 4. 單一 process、無主備切換（Single process, no HA）
+ *    只有一個 recovery_worker instance，crash 後 saga 停止恢復。
+ *    修法：可多個 instance 並行（每筆 saga 以 SELECT FOR UPDATE SKIP LOCKED 取得），
+ *    或使用 supervisor（PM2/systemd）確保自動重啟。
+ *
+ * 5. NEEDS_REVIEW 無告警（No alerting for manual intervention required）
+ *    NEEDS_REVIEW 狀態的 saga 只寫 error log，無 Prometheus counter、無 PagerDuty alert。
+ *    修法：新增 Prometheus counter `saga_needs_review_total`，觸發 > 0 時 alert。
+ *
+ * 6. 硬碼預設使用者名稱（Hardcoded default PG username）
+ *    pgBase.user 預設 'kanglei0613'，production 必須透過 PG_USER 覆蓋。
  */
 
 const { Pool } = require('pg');
@@ -75,6 +109,15 @@ function createShardPgMap() {
 // ─── Recovery logic ───────────────────────────────────────────────────────────
 
 // 掃單一 shard 的 saga_log，找出卡住的記錄
+//
+// ⚠️ [NOT PRODUCTION-READY] 需要在 saga_log 上建立 (step, updated_at) 複合索引：
+//   CREATE INDEX CONCURRENTLY ON saga_log (step, updated_at)
+//   WHERE step IN ('RESERVED', 'CREDITED', 'COMPENSATING');
+//   沒有此 index，每輪掃描做 full table scan，高 saga_log 量下效能嚴重劣化。
+//
+// ⚠️ [BAD PRACTICE] INTERVAL 字串插值（Template literal - not parameterized query）
+//   `INTERVAL '${STALE_THRESHOLD} seconds'` — STALE_THRESHOLD 由 parseInt 保護，
+//   但這是不良模式，建議改為：`updated_at < NOW() - ($1 * INTERVAL '1 second')` 並傳入參數。
 async function recoverShard(fromShardId, shardPgMap) {
   const shardPg = shardPgMap[fromShardId];
 
@@ -255,6 +298,50 @@ async function recoverFromReserved(log, shardPgMap) {
 
 // step = CREDITED：Step 2 commit 了，Step 3 沒完成
 // 先嘗試重跑 Step 3（finalize），若失敗改走補償路徑
+//
+// ╔══════════════════════════════════════════════════════════════════════╗
+// ║ 🚨 CRITICAL BUG: Race with queue_worker can reverse COMPLETED transfers ║
+// ╚══════════════════════════════════════════════════════════════════════╝
+//
+// 問題描述（Race condition scenario）：
+//   1. queue_worker 執行 Step 3 finalize：reserved_balance -= amount，
+//      transfers.status = 'COMPLETED'，saga_log.step = 'COMPLETED'，全部在同一 tx commit。
+//   2. 但在 Step 3 commit 之前，recovery_worker 掃到 saga_log.step = 'CREDITED'
+//      （因為 STALE_THRESHOLD=30s，而 queue 積壓導致 CREDITED 停留 > 30s）。
+//   3. queue_worker 的 Step 3 commit 成功（saga_log.step 現在已是 COMPLETED）。
+//   4. recovery_worker 執行 finalizeResult：UPDATE WHERE reserved_balance >= $1
+//      → reserved_balance 已是 0，rowCount = 0。
+//   5. recovery_worker 誤判「finalize 失敗」，呼叫 compensateCredited：
+//      → toAccount 被扣回 amount（已入帳的金額被撤銷）
+//      → fromAccount 的 reserved 被還原
+//      → transfers.status 被改為 'FAILED'
+//   6. 結果：queue_worker 回傳 COMPLETED 給用戶，但 recovery_worker 反轉了轉帳。
+//      用戶看到成功，但錢實際上沒有轉出，toAccount 也沒有收到錢。
+//
+// 根本修法（Required fix）：
+//   在 finalizeResult.rowCount === 0 時，先查 transfers.status。
+//   若為 'COMPLETED'，代表 queue_worker 已完成 finalize，
+//   只需同步 saga_log.step = 'COMPLETED' 後返回，不應走補償路徑。
+//
+//   應加入的程式碼（在 rowCount=0 的 ROLLBACK 後）：
+//   ┌─────────────────────────────────────────────────────────────────────
+//   │ // 查詢 transfer 是否已完成（check if already finalized by queue worker）
+//   │ const transferRow = await fromShardPg.query(
+//   │   'SELECT status FROM transfers WHERE id = $1',
+//   │   [log.transferId]
+//   │ );
+//   │ if (transferRow.rows[0]?.status === 'COMPLETED') {
+//   │   // queue_worker 已完成 finalize，同步 saga_log 狀態後返回
+//   │   await fromShardPg.query(
+//   │     'UPDATE saga_log SET step = $1, updated_at = NOW() WHERE transfer_id = $2',
+//   │     ['COMPLETED', log.transferId]
+//   │   );
+//   │   logger.info('transfer already COMPLETED by queue_worker, synced saga_log: transferId=%s', log.transferId);
+//   │   return; // 正確返回，不走補償路徑
+//   │ }
+//   │ // 只有在確認非 COMPLETED 時才走補償路徑
+//   │ await compensateCredited(log, shardPgMap);
+//   └─────────────────────────────────────────────────────────────────────
 async function recoverFromCredited(log, shardPgMap) {
   const fromShardPg = shardPgMap[log.fromShardId];
 
@@ -286,6 +373,17 @@ async function recoverFromCredited(log, shardPgMap) {
         'finalize failed (reserved mismatch), switching to compensate: transferId=%s',
         log.transferId
       );
+
+      // ⚠️ [CRITICAL BUG] 此處缺少 transfers.status 檢查（Missing status check before compensating）
+      //
+      // reserved_balance = 0 有兩種可能：
+      //   (A) queue_worker 已完成 Step 3 finalize（transfers.status = 'COMPLETED'）→ 不應補償！
+      //   (B) 真的發生 reserved_balance 不足的異常狀態 → 才應走補償路徑
+      //
+      // 目前程式碼直接走 compensateCredited，在情境 (A) 下會撤銷已完成的轉帳。
+      // 修法：見上方函數說明的「應加入的程式碼」區塊。
+      //
+      // TODO: Insert transfers.status check here before calling compensateCredited
       await compensateCredited(log, shardPgMap);
       return;
     }

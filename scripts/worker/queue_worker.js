@@ -23,6 +23,46 @@
  *     → brpop 是阻塞命令，同一條連線同時只能跑一個，多個 loop 共用會互相排隊
  *   - drain（執行 job）共用一個 drainRedis 連線
  *     → drain 是在 brpop 返回後才執行，不會有衝突
+ *
+ * ════════════════════════════════════════════════════════════════
+ * ⚠️  架構審查標注（Architecture Review Annotations）2026-05
+ * ════════════════════════════════════════════════════════════════
+ *
+ * [NOT PRODUCTION-READY] 以下已知問題需在 production 部署前修補：
+ *
+ * 1. drainQueue 使用 Promise.all 批次並行（Batch parallelism breaks per-fromId ordering）
+ *    - redis_transfer_queue.drainQueue 對每批 batchSize 個 job 用 Promise.all 並行執行，
+ *      破壞 per-fromId 序列化保證。
+ *    - 影響：同一 fromId 的多筆跨 shard 轉帳在同一批次中並行執行 RESERVE，
+ *      競爭同一個 row lock，200ms lock_timeout 下大量 lock timeout 503。
+ *    - 修法：在 redis_transfer_queue.drainQueue 中改為 `for...await` 依序執行，
+ *      或在 batchSize 中只取 1（犧牲吞吐量換正確性）。
+ *    - Risk level: CRITICAL — 序列化保證完全失效。
+ *
+ * 2. Owner heartbeat 第一次 tick 延遲過久（First heartbeat too late）
+ *    - startOwnerHeartbeat 的第一次 tick 在 ownerTtlMs（預設 10s）後才執行，
+ *      而非 ownerRefreshIntervalMs（預設 3s）後。
+ *    - 如果一批 job 的 drain 時間 >= ownerTtlMs，lock 會在第一次 heartbeat 前過期。
+ *    - 修法：將 `setTimeout(initTimer, ownerTtlMs)` 改為 `setTimeout(initTimer, ownerRefreshIntervalMs)`。
+ *    - Risk level: CRITICAL — drain 超過 10s 時 owner lock 失效，兩個 worker 同時 drain 同一 fromId。
+ *
+ * 3. recoverStaleQueues 依賴 WORKER_INDEX=1（Single-worker recovery assumption）
+ *    - 若 WORKER_INDEX 環境變數未設為 '1'，重啟後殘留 queue 不會被恢復。
+ *    - stack_control.sh 應確保至少一個 worker 以 WORKER_INDEX=1 啟動。
+ *    - 修法：改用分散式 lock（Redis SET NX）決定哪個 worker 執行 recovery，
+ *      而非依賴靜態環境變數。
+ *    - Risk level: MEDIUM — 重啟後殘留 jobs 永久卡住，直到手動干預。
+ *
+ * 4. 無 graceful shutdown（No SIGTERM handler）
+ *    - Worker 被 SIGTERM 終止時，可能正在執行 Saga Step 2 或 Step 3。
+ *    - 雖然 recovery_worker 會處理未完成的 saga，但有 STALE_THRESHOLD 延遲。
+ *    - 修法：監聽 SIGTERM，設定 isShuttingDown flag，等待 in-flight jobs 完成後退出。
+ *    - Risk level: MEDIUM — graceful shutdown 缺失，降低 recovery 效率。
+ *
+ * 5. 硬碼預設使用者名稱（Hardcoded default PG username）
+ *    - pgBase.user 預設為 'kanglei0613'（開發者本機帳號）。
+ *    - Production 必須透過 PG_USER 環境變數覆蓋，否則連線失敗。
+ *    - Risk level: LOW — 設定問題，無安全漏洞（PG_USER 需在部署時設定）。
  */
 
 const { Pool } = require('pg');
@@ -131,6 +171,12 @@ function buildFakeCtx({ metaPg, shardPgMap, redis }) {
 
 // ─── processJob ──────────────────────────────────────────────────────────────
 
+// ⚠️ [NOT PRODUCTION-READY] 無分類重試（No categorized error retry）
+// 所有錯誤（包含 DB 暫時斷線、55P03 lock timeout）都呼叫 markFailed，job 永久消失。
+// Production 應區分：
+//   ConflictError / NotFoundError → permanent fail (user error)
+//   PG error code 55P03 / connection error → transient, retry up to 3 times with jitter
+//   After N retries → push to DLQ (e.g., transfer:dlq Redis list)
 async function processJob(job, repo, redis) {
   const { jobId, fromId, toId, amount } = job;
   const start = Date.now();
@@ -218,8 +264,11 @@ async function runLoop(loopIndex, repo, drainRedis, brpopRedis, ctx) {
 //   worker 啟動時掃描所有 transfer:queue:from:* 的 key，
 //   對每個有 job 的 fromId，把它推進 ready queue，讓 worker loop 可以處理。
 //
-// 注意：
-//   只有 WORKER_INDEX=1 的 worker 執行掃描，避免多個 worker 同時重複推入。
+// ⚠️ [NOT PRODUCTION-READY] WORKER_INDEX=1 是靜態假設（Static single-worker assumption）
+//   只有 WORKER_INDEX='1' 的 worker 執行掃描，避免多個 worker 同時重複推入。
+//   問題：若 WORKER_INDEX 未設定（預設 '?'），此函數永遠 skip，重啟後積壓 job 永久卡住。
+//   改進方向：以 Redis SET NX 搶分散式 lock，第一個搶到的 worker 執行掃描，
+//   與 WORKER_INDEX 無關，適合多機水平擴展場景。
 
 async function recoverStaleQueues(redis) {
   if (String(WORKER_INDEX) !== '1') {

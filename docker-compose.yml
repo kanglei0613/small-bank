@@ -15,13 +15,16 @@
 #   docker-compose down -v             # teardown + wipe volumes
 #
 # Tunable env overrides (pass via .env or shell):
-#   GENERAL_WORKERS   (default 3)
-#   TRANSFER_WORKERS  (default 1)
-#   QUEUE_CONCURRENCY (default 8)
-#   BATCH_SIZE        (default 100)
-#   PG_SHARD_POOL_MAX (default 10)
-#   REJECT_THRESHOLD  (default 500)
-#   MAX_QUEUE_LENGTH  (default 600)
+#   GENERAL_WORKERS          (default 3)
+#   TRANSFER_WORKERS         (default 1)
+#   QUEUE_CONCURRENCY        (default 8)
+#   BATCH_SIZE               (default 100)
+#   PG_SHARD_POOL_MAX        (default 10)
+#   REJECT_THRESHOLD         (default 500)
+#   MAX_QUEUE_LENGTH         (default 600)
+#   QUEUE_DRAIN_SEQUENTIAL   true = sequential drain（推薦，100% 成功率）
+#                            false = concurrent drain（對比壓測用，~1/batchSize 成功率）
+#                            (default true)
 
 x-pg-common: &pg-common
   image: postgres:17
@@ -237,6 +240,9 @@ services:
       QUEUE_CONCURRENCY: "${QUEUE_CONCURRENCY:-8}"
       TRANSFER_QUEUE_BATCH_SIZE: "${BATCH_SIZE:-100}"
       TRANSFER_QUEUE_BLOCK_TIMEOUT_SEC: "1"
+      # sequential=true: 逐一執行（推薦），消除 row-lock 競爭，100% 成功率
+      # sequential=false: Promise.all 並發（對比壓測用），~1/batchSize 成功率
+      QUEUE_DRAIN_SEQUENTIAL: "${QUEUE_DRAIN_SEQUENTIAL:-true}"
     depends_on:
       postgres-s0:
         condition: service_healthy
