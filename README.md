@@ -4,6 +4,10 @@
 ![Node](https://img.shields.io/badge/Node.js-20_LTS-339933?logo=node.js)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-17-4169E1?logo=postgresql)
 ![Redis](https://img.shields.io/badge/Redis-7-DC382D?logo=redis)
+![Vue](https://img.shields.io/badge/Vue-3-4FC08D?logo=vue.js)
+![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?logo=typescript)
+![Vite](https://img.shields.io/badge/Vite-5-646CFF?logo=vite)
+![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker)
 
 # High-Concurrency Transaction System
 
@@ -59,6 +63,7 @@
 - [專案動機](#專案動機)
 - [系統架構](#系統架構)
 - [技術選型](#技術選型)
+- [前端架構](#前端架構)
 - [核心設計：三餘額模型](#核心設計三餘額模型)
 - [跨 Shard 轉帳：Saga Pattern](#跨-shard-轉帳saga-pattern)
 - [API 說明](#api-說明)
@@ -167,10 +172,60 @@ flowchart TD
 | 元件 | 選擇 | 原因 |
 |------|------|------|
 | Runtime | Node.js 20 LTS | 非同步 I/O 適合高並發場景 |
-| Framework | Egg.js | 提供 cluster 管理、middleware、生命週期管理 |
+| Backend Framework | Egg.js | 提供 cluster 管理、middleware、生命週期管理 |
+| Frontend Framework | Vue 3 + TypeScript | Composition API、型別安全、元件化開發 |
+| 前端建構 | Vite 5 | 快速 HMR，原生 ESM，支援 TypeScript 與 Vue SFC |
+| 狀態管理 | Pinia | Vue 3 官方推薦，輕量且支援 TypeScript 型別推導 |
+| 路由 | Vue Router 4 | SPA 路由，支援 history mode |
+| HTTP Client | Axios | 統一 API 請求，設定 baseURL 分離 generalApi / transferApi |
 | Database | PostgreSQL × 5 | ACID 事務保證資金安全 |
 | Cache / Queue | Redis | 高速讀寫，作為 transfer queue 的載體 |
 | 壓測工具 | autocannon | 輕量、支援 pipeline，適合本機壓測 |
+
+---
+
+## 前端架構
+
+前端為獨立的 **Vue 3 SPA**，以 Vite 建構，使用 TypeScript 全面覆蓋型別。
+
+### 技術棧
+
+| 層級 | 技術 | 說明 |
+|------|------|------|
+| 框架 | Vue 3 (Composition API) | `<script setup>` 語法，邏輯與模板分離清晰 |
+| 語言 | TypeScript 5 | 嚴格模式，所有 API 回傳值均有型別定義 |
+| 建構 | Vite 5 | 原生 ESM、快速 HMR，別名 `@/` → `src/` |
+| 狀態 | Pinia | `useAccountStore` 管理當前帳號與餘額快取 |
+| 路由 | Vue Router 4 | history mode，`/account/:id` 動態路由 |
+| HTTP | Axios | `generalApi`（`/api`）與 `transferApi`（`/transfer-api`）分開實例 |
+
+### 目錄結構
+
+```
+frontend/src/
+├── api/
+│   └── index.ts          # 所有 API 呼叫集中管理
+├── stores/
+│   └── account.ts        # Pinia store：帳號、餘額、輪詢狀態
+├── router/
+│   └── index.ts          # 路由定義
+├── types/
+│   └── index.ts          # API 回傳型別（Account、Transfer、TransferJob…）
+├── views/
+│   ├── AccountView.vue   # 帳號總覽：餘額顯示、存提款操作
+│   └── TransfersView.vue # 轉帳紀錄：sync/async 標籤、方向判斷
+└── main.ts               # 應用程式進入點
+```
+
+### 關鍵設計說明
+
+**BigInt 型別轉換**：PostgreSQL `bigint` 欄位（`id`、`from_account_id`、`to_account_id`、`amount`）經 `pg` driver 回傳為 JavaScript `string`。`api/index.ts` 的 `fetchTransfers` 對所有 bigint 欄位一律補 `Number()` 強制轉型，確保嚴格比較（`===`）與轉帳方向判斷正確。
+
+**轉帳模式判斷（sync / async）**：後端 DB 不儲存 `mode` 欄位，前端根據 `from_account_id % 4 === to_account_id % 4` 判斷是否跨 shard，同 shard → `sync`，跨 shard → `async`。
+
+**非同步轉帳狀態追蹤**：提交跨 shard 轉帳後，前端取得 `jobId`，每 1.5 秒 polling `/transfer-jobs/:jobId`，直到狀態變為 `COMPLETED` 或 `FAILED`，再更新餘額顯示。
+
+**雙 Axios 實例**：`generalApi` 指向 `/api`（Egg.js general server，port 7001）、`transferApi` 指向 `/transfer-api`（transfer server，port 7010），由 Vite proxy 在開發環境轉發，生產環境由 Nginx 處理。
 
 ---
 
