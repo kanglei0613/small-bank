@@ -25,10 +25,12 @@
  *     → drain 是在 brpop 返回後才執行，不會有衝突
  *
  * ════════════════════════════════════════════════════════════════
- * ⚠️  架構審查標注（Architecture Review Annotations）2026-05
+ * ⚠️  架構審查標注（Architecture Review Annotations）2026-05-14 v7
  * ════════════════════════════════════════════════════════════════
  *
  * [NOT PRODUCTION-READY] 以下已知問題需在 production 部署前修補：
+ * （架構審查 v7 確認，2026-05-14：所有問題仍為 open；
+ *   v7 無新增問題於此檔案，新增問題 L11/L12 在 redis_transfer_queue.js）
  *
  * 1. drainQueue 使用 Promise.all 批次並行（Batch parallelism breaks per-fromId ordering）
  *    - redis_transfer_queue.drainQueue 對每批 batchSize 個 job 用 Promise.all 並行執行，
@@ -59,10 +61,30 @@
  *    - 修法：監聽 SIGTERM，設定 isShuttingDown flag，等待 in-flight jobs 完成後退出。
  *    - Risk level: MEDIUM — graceful shutdown 缺失，降低 recovery 效率。
  *
- * 5. 硬碼預設使用者名稱（Hardcoded default PG username）
+ * 5. At-most-once delivery（交割語義為「最多一次」—— Risk: MEDIUM）
+ *    - drainQueue 的 popJobs（LRANGE+LTRIM）原子移除 Redis list 中的 job，
+ *      若 worker crash 在 popJobs 之後、handler(job) 成功之前，這批 job 永久消失。
+ *    - saga_log 尚未寫入（RESERVE 尚未執行），recovery_worker 無法接手。
+ *    - recoverStaleQueues 只掃描 list 長度，list 已空故無法恢復。
+ *    - 影響：用戶收到 jobId（queued），但轉帳永不執行，polling timeout 後狀態不明。
+ *    - 詳見 app/lib/queue/redis_transfer_queue.js drainQueue 函數的完整說明與修法。
+ *    - Risk level: MEDIUM — 觸發需要 process crash，但 SIGKILL / OOM 在 production 可能發生。
+ *
+ * 6. 硬碼預設使用者名稱（Hardcoded default PG username）
  *    - pgBase.user 預設為 'kanglei0613'（開發者本機帳號）。
  *    - Production 必須透過 PG_USER 環境變數覆蓋，否則連線失敗。
  *    - Risk level: LOW — 設定問題，無安全漏洞（PG_USER 需在部署時設定）。
+ *
+ * 7. BRPOP block-timeout=0 缺乏 socket 逾時防護（v4 新增 — L7）
+ *    - `runLoop` 使用 blockPopReadyFromId(brpopRedis, 0)，timeout=0 = 永久阻塞。
+ *    - 若 Redis 發生網路分區但 TCP 連線仍存活（OS TCP keepalive 尚未逾時），
+ *      BRPOP 無限掛起，loop 靜默停止處理任何 job，但 process 看似健康。
+ *    - 無 health check endpoint → Docker/Kubernetes 無法偵測此靜默故障。
+ *    - 修法選項：
+ *        (a) ioredis 連線設定 `socket_keepalive: true`，讓 OS 更快偵測死連線
+ *        (b) `Promise.race([brpop, timeout(30000)])`，超時後重建連線
+ *        (c) 加入 health check HTTP server，每次成功 BRPOP 後更新 last-active 時間戳
+ *    - Risk level: LOW — Redis sentinel/cluster + TCP keepalive 調優可縮短影響窗口。
  */
 
 const { Pool } = require('pg');
@@ -237,6 +259,11 @@ async function runLoop(loopIndex, repo, drainRedis, brpopRedis, ctx) {
   // eslint-disable-next-line no-constant-condition
   while (true) {
     try {
+      // ⚠️ [v4 — L7] block-timeout=0（永久阻塞）缺乏 socket 逾時防護
+      // 網路分區且 TCP 連線存活時，此行永久掛起，loop 靜默停止。
+      // 詳見文件頂部的問題 7 說明與修法。
+      // ℹ️  對比 transfers.js startQueueWorker 使用 blockTimeoutSec=1（每秒返回），
+      //    雖然犧牲少量 latency，但對網路異常更具彈性。
       const fromId = await redisTransferQueue.blockPopReadyFromId(brpopRedis, 0);
 
       if (!fromId) continue;

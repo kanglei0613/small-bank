@@ -29,10 +29,13 @@
  *      應以 API response 的 mode 欄位為準。
  *
  * ════════════════════════════════════════════════════════════════
- * ⚠️  架構審查標注（Architecture Review Annotations）2026-05
+ * ⚠️  架構審查標注（Architecture Review Annotations）2026-05-14 v7
  * ════════════════════════════════════════════════════════════════
  *
  * [NOT PRODUCTION-READY] 以下已知問題需在 production 部署前修補：
+ * （v7 確認：所有問題仍為 open；v4 補充：startQueueWorker 的 BRPOP block-timeout=1s 相對於
+ *   queue_worker.js 的 timeout=0 更能對抗網路分區，但單連線問題仍存在，詳見問題 2；
+ *   v7 無新增問題於此檔案，新增問題 L11/L12 在 redis_transfer_queue.js）
  *
  * 1. processJob 無分類重試（No categorized retry — Risk: HIGH）
  *    - 所有錯誤（包含 DB 暫時斷線、lock timeout）都呼叫 markFailed，job 永久消失。

@@ -71,10 +71,14 @@
  *     }
  *
  * ════════════════════════════════════════════════════════════════
- * ⚠️  架構審查標注（Architecture Review Annotations）2026-05
+ * ⚠️  架構審查標注（Architecture Review Annotations）2026-05-14 v7
  * ════════════════════════════════════════════════════════════════
  *
  * [NOT PRODUCTION-READY] 以下問題在 production 環境仍需修補：
+ * （v7 自動化審查確認：C1/C2/C3/C4 及所有 HIGH/MEDIUM 問題仍為 open；
+ *   v5 新增 — L9：transferCrossShard Step 3 catch 區塊缺少 ROLLBACK，
+ *   dirty connection 歸還 pool 可能造成後續請求取到帶未提交 write 的 connection；
+ *   v7 無新增問題於此檔案，新增問題 L11/L12 在 redis_transfer_queue.js）
  *
  * 1. 跨 Shard 轉帳記錄只存 fromShard（KNOWN LIMITATION — Risk: HIGH）
  *    - listByAccountId 在 toShard 上查 `WHERE to_account_id = $1`，
@@ -422,6 +426,52 @@ class TransfersRepo extends baseShardRepo {
       } catch (err) {
         // Step 3 失敗時，把 transfers.status 推到 PENDING_FINALIZE
         // saga_log 維持 CREDITED 不動，讓 recovery_worker 接手 finalize
+        //
+        // ⚠️ [v5 — L9] 缺少 ROLLBACK：Step 3 catch 區塊未呼叫 ROLLBACK（Missing ROLLBACK in Step 3 catch block）
+        //
+        // 問題描述：
+        //   當 finalizeResult.rowCount === 0（JavaScript throw，非 PG error），
+        //   PG 的 BEGIN transaction 仍處於「活躍未提交」狀態。
+        //   此時 `UPDATE transfers SET status = 'PENDING_FINALIZE'` 在活躍 tx 中執行，
+        //   但後續沒有 COMMIT 也沒有 ROLLBACK，`finally { fromClient.release() }` 把
+        //   帶有「未提交 PENDING_FINALIZE write」的 dirty connection 歸還 pool。
+        //
+        // 情境 A（finalizeResult.rowCount === 0 JS throw）：
+        //   - PG transaction 仍 live（accounts 未改動，rowCount=0 表示條件不符無 UPDATE）
+        //   - UPDATE transfers SET PENDING_FINALIZE 在 live tx 中執行 → PG 層成功
+        //   - 無 COMMIT/ROLLBACK → connection 帶未提交 write 歸還 pool
+        //   - pg-pool 不自動 ROLLBACK → dirty connection 可能被下一個請求重用
+        //   - 下一個請求的 BEGIN 會得到 WARNING（already in transaction），
+        //     或若直接 COMMIT 會提交此 PENDING_FINALIZE write（預期外！）
+        //
+        // 情境 B（PG error，如 lock_timeout 55P03）：
+        //   - PG transaction 進入 error 狀態
+        //   - UPDATE transfers SET PENDING_FINALIZE 失敗（"current transaction is aborted"）
+        //   - .catch() 靜默忽略錯誤 → transfers.status 仍為 RESERVED
+        //   - dirty connection（error 狀態）歸還 pool，下一個請求可能拿到此 connection
+        //
+        // 功能影響（Functional impact）：
+        //   saga_log 停在 CREDITED，recovery_worker 正確接手 finalize → 功能不中斷。
+        //   但 dirty connection 在 pool 中傳播是未定義行為，可能造成不相關請求的資料異常。
+        //
+        // 修法（Fix）：
+        //   在 catch 區塊開頭加入 ROLLBACK，清除活躍 tx 後再執行 PENDING_FINALIZE update：
+        //   ```js
+        //   catch (err) {
+        //     await fromClient.query('ROLLBACK').catch(() => {});  // ← 新增
+        //     // 在 ROLLBACK 後，以 autocommit 模式直接執行 UPDATE（不在 tx 內）
+        //     await fromClient.query(
+        //       `UPDATE transfers SET status = 'PENDING_FINALIZE', updated_at = NOW() WHERE id = $1`,
+        //       [transferId]
+        //     ).catch(...);
+        //   }
+        //   ```
+        //   或者：不在 catch 中更新 transfers，完全依賴 recovery_worker 從 saga_log=CREDITED 接手。
+        //   transfers.status=RESERVED 不影響 recovery 邏輯（recovery 以 saga_log.step 為準）。
+        //
+        // Risk level: LOW-MEDIUM — 依賴 pg-pool 是否在 acquire 時清理 dirty connection，行為因版本而異。
+        //
+        // TODO: SHOULD FIX — Add ROLLBACK before the PENDING_FINALIZE update
         await fromClient.query(
           `UPDATE transfers SET status = 'PENDING_FINALIZE', updated_at = NOW() WHERE id = $1`,
           [ transferId ]
@@ -457,6 +507,11 @@ class TransfersRepo extends baseShardRepo {
 
   // CREDITED補償邏輯：把已入帳的 toAccount 扣回來
   // ✅ 加 AND available_balance >= $1 guard，防止餘額變負數
+  //
+  // ⚠️ [v4 — L8] 脆弱的錯誤訊息判斷（Fragile error message check）
+  //   catch 區塊使用 `e.message.startsWith('compensate toAccount failed')` 判斷是否 ROLLBACK。
+  //   若錯誤訊息因重構而改變，ROLLBACK 將被漏呼叫，導致 toClient 停在一個開啟的 tx 中。
+  //   建議改用自定義 Error 類型（如 class CompensateError extends Error），以 instanceof 判斷。
   async _compensateCredited({ toClient, toAccountId, transferAmount, transferId }) {
     try {
       await toClient.query('BEGIN'); // BEGIN
@@ -499,6 +554,9 @@ class TransfersRepo extends baseShardRepo {
 
   // RESERVED補償邏輯：把凍結的 fromAccount reserved 還回 available
   // ✅ 加 AND reserved_balance >= $1 guard，防止重複補償讓 reserved 變負數
+  //
+  // ⚠️ [v4 — L8] 同 _compensateCredited：catch 中 `e.message.startsWith('compensate fromAccount failed')`
+  //   是脆弱的判斷模式，建議改用 instanceof CompensateError。
   async _compensateReserved({ fromClient, fromAccountId, transferAmount, transferId }) {
     try {
       await fromClient.query('BEGIN'); // BEGIN
