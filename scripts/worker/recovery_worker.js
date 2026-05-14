@@ -16,10 +16,12 @@
  *   PG_META_POOL_MAX
  *
  * ════════════════════════════════════════════════════════════════
- * ⚠️  架構審查標注（Architecture Review Annotations）2026-05
+ * ⚠️  架構審查標注（Architecture Review Annotations）2026-05-14 v7
  * ════════════════════════════════════════════════════════════════
  *
  * [NOT PRODUCTION-READY] 以下已知問題需在 production 部署前修補：
+ * （架構審查 v7 確認，2026-05-14：C1/C2/C3/C4 及所有 HIGH/MEDIUM 問題仍為 open；
+ *   v7 無新增問題於此檔案，新增問題 L11/L12 在 redis_transfer_queue.js）
  *
  * 1. 【CRITICAL】recoverFromCredited 可能撤銷已完成的轉帳（Race with queue worker）
  *    詳見 recoverFromCredited 函數內的標注。
@@ -48,6 +50,21 @@
  *
  * 6. 硬碼預設使用者名稱（Hardcoded default PG username）
  *    pgBase.user 預設 'kanglei0613'，production 必須透過 PG_USER 覆蓋。
+ *
+ * 7. 【v4 新增 — M17】recoverShard 缺少 FOR UPDATE SKIP LOCKED（Multiple recovery instance race）
+ *
+ * 8. 【v6 新增 — L10】main loop 四個 shard 依序掃描（Sequential shard scan — Risk: LOW）
+ *    主迴圈以 `for...of` 依序呼叫 `recoverShard`，shard 0 積壓時，shard 1-3 的 recovery 被延遲。
+ *    修法：改用 `Promise.all(shardIds.map(id => recoverShard(id, shardPgMap)))` 並行掃描。
+ *    注意：並行時需確認 PG_SHARD_POOL_MAX 足以支撐 SCAN_BATCH_SIZE × 4 的連線需求。
+ *    Risk level: LOW — 功能正確，但高負載下 recovery lag 較大。
+ *    若部署多個 recovery_worker instance（M5 的修法），recoverShard 不加 FOR UPDATE SKIP LOCKED
+ *    會導致多個 instance 選取相同的 saga row：
+ *      - Instance A 補償成功（saga_compensations 寫入、saga_log=FAILED）
+ *      - Instance B 跳過 toAccount 補償（冪等 ✅），但嘗試補償 fromAccount，
+ *        reserved_balance 已為 0 → rowCount=0 → 誤標 NEEDS_REVIEW（❌ 誤報）
+ *    修法：在 recoverShard SQL 末尾加入 `FOR UPDATE SKIP LOCKED`，
+ *    確保同一 saga 只被一個 instance 處理，詳見 recoverShard 函數標注。
  */
 
 const { Pool } = require('pg');
@@ -118,9 +135,25 @@ function createShardPgMap() {
 // ⚠️ [BAD PRACTICE] INTERVAL 字串插值（Template literal - not parameterized query）
 //   `INTERVAL '${STALE_THRESHOLD} seconds'` — STALE_THRESHOLD 由 parseInt 保護，
 //   但這是不良模式，建議改為：`updated_at < NOW() - ($1 * INTERVAL '1 second')` 並傳入參數。
+//
+// ⚠️ [NOT PRODUCTION-READY — v4 新增 — M17] 缺少 FOR UPDATE SKIP LOCKED
+//   若部署多個 recovery_worker instance，此查詢需改為：
+//   ```sql
+//   SELECT ... FROM saga_log
+//   WHERE step IN (...) AND updated_at < ...
+//   ORDER BY updated_at ASC LIMIT $1
+//   FOR UPDATE SKIP LOCKED   ← 必須加此行
+//   ```
+//   缺少 SKIP LOCKED 時，多個 instance 同時處理同一 saga：
+//     - Instance A 補償成功（冪等保護 toAccount），但繼續補償 fromAccount 時
+//       reserved=0（A 已補過）→ rowCount=0 → NEEDS_REVIEW（誤報）
+//   建議在實施 M5（多 instance）修法前，先加入 SKIP LOCKED。
 async function recoverShard(fromShardId, shardPgMap) {
   const shardPg = shardPgMap[fromShardId];
 
+  // ⚠️ [v4 — M17] 若需部署多個 recovery_worker instance（M5 修法），
+  //   請在 LIMIT $1 後加入 FOR UPDATE SKIP LOCKED，否則多 instance 會同時處理相同的 saga row，
+  //   導致補償競爭並產生誤報的 NEEDS_REVIEW（詳見文件頂部問題 7 說明）。
   const result = await shardPg.query(
     `
       SELECT
@@ -138,6 +171,7 @@ async function recoverShard(fromShardId, shardPgMap) {
         AND updated_at < NOW() - INTERVAL '${STALE_THRESHOLD} seconds'
       ORDER BY updated_at ASC
       LIMIT $1
+      -- TODO [M17]: ADD "FOR UPDATE SKIP LOCKED" HERE when deploying multiple recovery instances
     `,
     [ SCAN_BATCH_SIZE ]
   );
@@ -190,6 +224,59 @@ async function recoverFromReserved(log, shardPgMap) {
   );
 
   if (creditsResult.rowCount > 0) {
+    // ⚠️ [HIGH BUG — 架構審查 2026-05-13 新發現] recoverFromReserved 也存在與 recoverFromCredited 類似的 Race Condition
+    //
+    // 問題描述（Race condition scenario）：
+    //   1. Step 1 commit 成功（saga_log.step = 'RESERVED'），但 job 在 Redis queue 積壓 > 30s。
+    //   2. recovery_worker 掃到 step=RESERVED（STALE_THRESHOLD 觸發），開始執行 recoverFromReserved。
+    //   3. 在 recovery 讀取 saga_credits 之前，queue_worker 突然開始處理此 job，
+    //      完成 Step 2（CREDIT，saga_credits 寫入）+ Step 3（FINALIZE，saga_log.step = 'COMPLETED'）。
+    //   4. recovery 讀到 saga_credits 存在（Step 2 已完成），判斷需要補償。
+    //   5. recovery 呼叫 compensateCredited：
+    //      - 將 saga_log.step 從 'COMPLETED' 改寫為 'COMPENSATING'（錯誤！）
+    //      - toAccount 被扣回 amount（已完成的轉帳被撤銷）
+    //      - fromAccount reserved_balance 已是 0 → rowCount=0 → NEEDS_REVIEW
+    //
+    // 根本修法（Required fix）：
+    //   在 saga_credits 存在時，先查 transfers.status。
+    //   若為 'COMPLETED'，代表 queue_worker 已完成全部步驟，只需同步 saga_log 後返回。
+    //
+    //   應加入的程式碼（在 compensateCredited 呼叫前）：
+    //   ┌─────────────────────────────────────────────────────────────────────
+    //   │ const transferRow = await fromShardPg.query(
+    //   │   'SELECT status FROM transfers WHERE id = $1',
+    //   │   [log.transferId]
+    //   │ );
+    //   │ if (transferRow.rows[0]?.status === 'COMPLETED') {
+    //   │   await fromShardPg.query(
+    //   │     'UPDATE saga_log SET step = $1, updated_at = NOW() WHERE transfer_id = $2',
+    //   │     ['COMPLETED', log.transferId]
+    //   │   );
+    //   │   logger.info('transfer already COMPLETED by queue_worker (RESERVED path), synced saga_log: transferId=%s', log.transferId);
+    //   │   return; // 正確退出，不走補償
+    //   │ }
+    //   └─────────────────────────────────────────────────────────────────────
+    //
+    // 觸發條件：
+    //   job 在 queue 積壓 > 30s，queue_worker 在 recovery 執行期間完成 Steps 2+3。
+    //   觸發機率低於 recoverFromCredited race（需要步驟 1→2→3 在 recovery 執行窗口內全部完成），
+    //   但在高負載、Redis 積壓或 worker 重啟後恢復的場景下仍可能發生。
+    //
+    // ✅ [C4 FIXED] 先查 transfers.status，確認 queue_worker 是否已完成 Steps 2+3
+    const transferRow = await fromShardPg.query(
+      'SELECT status FROM transfers WHERE id = $1',
+      [ log.transferId ]
+    );
+    if (transferRow.rows[0]?.status === 'COMPLETED') {
+      // queue_worker 已完成全部步驟，只需同步 saga_log 後返回，不走補償
+      await fromShardPg.query(
+        'UPDATE saga_log SET step = $1, updated_at = NOW() WHERE transfer_id = $2',
+        [ 'COMPLETED', log.transferId ]
+      );
+      logger.info('transfer already COMPLETED by queue_worker (RESERVED path), synced saga_log: transferId=%s', log.transferId);
+      return;
+    }
+    // 確認非 COMPLETED，才走補償路徑
     logger.info(
       'RESERVED but saga_credits exists, toAccount was credited, compensating both: transferId=%s',
       log.transferId
@@ -347,7 +434,9 @@ async function recoverFromCredited(log, shardPgMap) {
 
   logger.info('CREDITED found, attempting finalize: transferId=%s', log.transferId);
 
-  const client = await fromShardPg.connect();
+  // ✅ [M18 FIXED] 使用 let 而非 const，允許補償路徑提前 release 後設為 null，
+  // 防止 finally 對同一個 client 二次 release（double release 造成 pool 計數失準）。
+  let client = await fromShardPg.connect();
   try {
     await client.query('BEGIN');
     await client.query("SET LOCAL lock_timeout = '500ms'");
@@ -374,16 +463,95 @@ async function recoverFromCredited(log, shardPgMap) {
         log.transferId
       );
 
-      // ⚠️ [CRITICAL BUG] 此處缺少 transfers.status 檢查（Missing status check before compensating）
+      // ⚠️ [LOW BUG — v3 新發現] 此時 `client` 仍持有連線（ROLLBACK 後未 release）。
+      // compensateCredited 內部會透過 fromShardPg.connect() 取得另一條連線，
+      // 導致同一次 recovery 同時持有最多 3 條 fromShardPg 連線（此 client + compensateCredited 兩個 connect）。
+      // 若 SCAN_BATCH_SIZE 大且多 CREDITED 並行，pool 可能提前耗盡，補償失敗。
+      // 修法：在此行之前執行 `client.release(); client = null;`，再呼叫 compensateCredited。
+      //        注意：release 後不可再呼叫 client.query。
+      //
+      // ⚠️ [CRITICAL BUG — 尚未修復] 此處缺少 transfers.status 檢查（Missing status check before compensating）
       //
       // reserved_balance = 0 有兩種可能：
-      //   (A) queue_worker 已完成 Step 3 finalize（transfers.status = 'COMPLETED'）→ 不應補償！
+      //   (A) queue_worker 已完成 Step 3 finalize（transfers.status = 'COMPLETED'）→ 絕對不應補償！
       //   (B) 真的發生 reserved_balance 不足的異常狀態 → 才應走補償路徑
       //
-      // 目前程式碼直接走 compensateCredited，在情境 (A) 下會撤銷已完成的轉帳。
-      // 修法：見上方函數說明的「應加入的程式碼」區塊。
+      // 目前程式碼直接走 compensateCredited，在情境 (A) 下會：
+      //   - toAccount 被扣回 amount（已入帳金額被撤銷）
+      //   - fromAccount reserved 被還原（實際上已銷帳）
+      //   - transfers.status 被改為 'FAILED'（系統記錄與用戶感知矛盾）
+      //   → 用戶收到 COMPLETED 但錢沒有真正轉出！
       //
-      // TODO: Insert transfers.status check here before calling compensateCredited
+      // ── 應加入的修復程式碼（insert before compensateCredited call）───────────────
+      //
+      //   const transferRow = await fromShardPg.query(
+      //     'SELECT status FROM transfers WHERE id = $1',
+      //     [log.transferId]
+      //   );
+      //   if (transferRow.rows[0]?.status === 'COMPLETED') {
+      //     // Case (A)：queue_worker 已完成 finalize，只同步 saga_log 後返回
+      //     await fromShardPg.query(
+      //       'UPDATE saga_log SET step = $1, updated_at = NOW() WHERE transfer_id = $2',
+      //       ['COMPLETED', log.transferId]
+      //     );
+      //     logger.info('transfer already COMPLETED by queue_worker, synced saga_log: transferId=%s', log.transferId);
+      //     return; // ← 正確退出，不走補償
+      //   }
+      //   // 只有在確認非 COMPLETED 時才繼續走補償路徑（Case B）
+      //
+      // ── 觸發條件 ─────────────────────────────────────────────────────────────────
+      //   queue 積壓 > 30s（STALE_THRESHOLD）且 queue_worker 正在執行或剛完成 Step 3 時觸發。
+      //   高負載、worker 重啟、Redis 慢都可能造成此情境。
+      //
+      // ── 暫時緩解 ──────────────────────────────────────────────────────────────────
+      //   將 SAGA_STALE_THRESHOLD_SEC 調高至 120-300s，降低觸發頻率（非根本修法）。
+      //
+      // ✅ [C1 FIXED] 先查 transfers.status，確認 queue_worker 是否已完成 finalize
+      //
+      // ⚠️ [v8 — M18] double client.release() 風險（Double release side effect from C1 fix）
+      //
+      // 問題描述：
+      //   此處 `client.release()` 是第一次 release。
+      //   但本函數的 `finally { client.release() }` 會在任何 return 後再次執行，
+      //   造成 double release（雙重歸還同一條連線到 pool）。
+      //
+      //   在 node-postgres 中，對同一個 PoolClient 呼叫兩次 release()：
+      //   - pool 的可用連線計數可能失準（誤認為歸還了兩條連線）
+      //   - 若 release() 之後的程式碼拋錯，catch block 中 client.query('ROLLBACK')
+      //     在已 release 的 client 上執行，丟出 "Connection already released"（被靜默吞掉）
+      //   - 最終 finally 再次 release 同一個 client，行為為未定義
+      //
+      // 根本修法：
+      //   1. 將 `const client` 改為 `let client`
+      //   2. 此行之後加入 `client = null;`
+      //   3. catch block 改為 `if (client) { try { await client.query('ROLLBACK'); } ... }`
+      //   4. finally 改為 `if (client) client.release();`
+      //
+      // 暫時影響：
+      //   - 功能上 C1 fix 邏輯正確（status check + saga_log 同步正常）
+      //   - double release 在低 SCAN_BATCH_SIZE 下不明顯，pool 較大時 pool 計數容差可吸收
+      //   - 高 SCAN_BATCH_SIZE 或小 pool（PG_SHARD_POOL_MAX=5）下可能造成 pool 連線洩漏
+      //
+      // ✅ [M18 FIXED] 提前 release 後立即設為 null，防止 finally 二次 release。
+      // 設為 null 後不可再呼叫 client.query（後續改用 fromShardPg 直接查詢）。
+      client.release();
+      client = null;
+
+      // ✅ [C1 FIXED] 確認 transfers.status，避免誤補償已完成的轉帳
+      const transferRow = await fromShardPg.query(
+        'SELECT status FROM transfers WHERE id = $1',
+        [ log.transferId ]
+      );
+      if (transferRow.rows[0]?.status === 'COMPLETED') {
+        // Case A：queue_worker 已完成 Step 3，只需同步 saga_log 後返回，不走補償
+        await fromShardPg.query(
+          'UPDATE saga_log SET step = $1, updated_at = NOW() WHERE transfer_id = $2',
+          [ 'COMPLETED', log.transferId ]
+        );
+        logger.info('transfer already COMPLETED by queue_worker, synced saga_log: transferId=%s', log.transferId);
+        return;
+      }
+      // Case B：確認非 COMPLETED，才走補償路徑
       await compensateCredited(log, shardPgMap);
       return;
     }
@@ -402,10 +570,12 @@ async function recoverFromCredited(log, shardPgMap) {
 
     logger.info('CREDITED finalized: transferId=%s', log.transferId);
   } catch (err) {
-    try { await client.query('ROLLBACK'); } catch (e) { void e; }
+    // ✅ [M18 FIXED] 補償路徑提前 release 後 client 已設為 null，catch 需先判斷
+    if (client) { try { await client.query('ROLLBACK'); } catch (e) { void e; } }
     throw err;
   } finally {
-    client.release();
+    // ✅ [M18 FIXED] 補償路徑已提前 release 並設 null，finally 只在 client 仍持有時才 release
+    if (client) client.release();
   }
 }
 
@@ -765,6 +935,31 @@ async function main() {
   // eslint-disable-next-line no-constant-condition
   while (true) {
     try {
+      // ⚠️ [v6 — L10] 四個 shard 依序掃描（Sequential shard scan — Risk: LOW）
+      //
+      // 問題描述：
+      //   for...of 迴圈依序等待每個 shard 的 recoverShard 完成後才掃描下一個。
+      //   若 shard 0 有 SCAN_BATCH_SIZE=50 筆卡住的 saga，每筆 recovery 最壞情況耗時
+      //   數百毫秒（含 DB lock, IO 等待），整輪 recoverShard(0) 可能耗時 5-30 秒。
+      //   在此期間，shard 1、2、3 的卡住 saga 無法被處理，積壓持續加重。
+      //
+      //   在四個 shard 分佈在獨立 PG instance（Docker / 多機）的場景下，
+      //   各 shard 之間沒有資源競爭，應可並行掃描，大幅降低 recovery 延遲。
+      //
+      // 影響：
+      //   單個 shard 的 saga 積壓會阻塞其他 shard 的 recovery，
+      //   在高負載或 worker 重啟後，recovery lag 可能超過 STALE_THRESHOLD * shardCount。
+      //
+      // 修法：
+      //   改用 Promise.all 並行處理所有 shard：
+      //   ```js
+      //   await Promise.all(shardIds.map(shardId => recoverShard(shardId, shardPgMap)));
+      //   ```
+      //   注意：recoverOne 內部各步驟已有自己的 DB 連線（connect/release），
+      //   並行執行時需確認 PG_SHARD_POOL_MAX 足夠支撐 SCAN_BATCH_SIZE × 4 shard 的並發連線。
+      //
+      // Risk level: LOW — 功能不受影響，但在高負載下 recovery 效率偏低。
+      // TODO: CONSIDER IMPROVING — Change to Promise.all for parallel shard recovery
       for (const shardId of shardIds) {
         await recoverShard(shardId, shardPgMap);
       }
