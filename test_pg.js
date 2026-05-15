@@ -18,7 +18,7 @@ async function testShard({ host, db }) {
   });
   try {
     const r = await p.query(
-      'SELECT count(*) FROM pg_stat_activity WHERE datname=$1', [db]
+      'SELECT count(*) FROM pg_stat_activity WHERE datname=$1', [ db ]
     );
     console.log('OK  ' + host + ' (' + db + ') — active conns: ' + r.rows[0].count);
   } catch (e) {
